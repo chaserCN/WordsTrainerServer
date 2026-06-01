@@ -1,0 +1,29 @@
+{
+  "name": "flashgame-server",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "start": "node dist/server.js",
+    "build": "tsc",
+    "migrate": "tsx src/migrate.ts",
+    "test": "node --import tsx --test test/integration.test.ts"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.1057.0",
+    "@aws-sdk/s3-request-presigner": "^3.1057.0",
+    "@fastify/cors": "11.1.0",
+    "dotenv": "16.4.5",
+    "fastify": "5.8.5",
+    "pg": "8.12.0"
+  },
+  "devDependencies": {
+    "@types/node": "20.14.10",
+    "@types/pg": "8.11.6",
+    "tsx": "4.22.4",
+    "typescript": "5.5.3"
+  }
+}
