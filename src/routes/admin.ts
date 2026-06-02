@@ -14,6 +14,7 @@ import {
   requiredString,
   requiredUUID,
 } from "../http.js";
+import { bodyLimits, createRateLimit, endpointRateLimits } from "../limits.js";
 import type { ObjectStorageService } from "../storage.js";
 
 type IdParams = {
@@ -232,8 +233,12 @@ export async function registerAdminRoutes(
   config: AppConfig,
   objectStorage: ObjectStorageService,
 ): Promise<void> {
+  const adminRateLimit = createRateLimit(endpointRateLimits.admin);
+  const mediaUploadRateLimit = createRateLimit(endpointRateLimits.mediaUpload);
+
   app.addHook("preHandler", async (request) => {
     requireAdmin(request, config);
+    await adminRateLimit(request);
   });
 
   app.get("/v1/admin/users", async () => {
@@ -639,7 +644,10 @@ export async function registerAdminRoutes(
     return { media: result.rows[0] };
   });
 
-  app.post("/v1/admin/media/upload", async (request, reply) => {
+  app.post("/v1/admin/media/upload", {
+    bodyLimit: bodyLimits.mediaUpload,
+    preHandler: mediaUploadRateLimit,
+  }, async (request, reply) => {
     if (!Buffer.isBuffer(request.body)) {
       badRequest("binary media body is required");
     }

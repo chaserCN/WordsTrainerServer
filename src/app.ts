@@ -3,6 +3,7 @@ import Fastify from "fastify";
 import type pg from "pg";
 import type { AppConfig } from "./config.js";
 import { HttpError } from "./http.js";
+import { bodyLimits } from "./limits.js";
 import { registerAdminRoutes } from "./routes/admin.js";
 import { registerHealthRoutes } from "./routes/health.js";
 import { registerMediaRoutes } from "./routes/media.js";
@@ -12,7 +13,7 @@ import { ObjectStorageService } from "./storage.js";
 export function buildApp(pool: pg.Pool, config: AppConfig) {
   const app = Fastify({
     logger: true,
-    bodyLimit: 25 * 1024 * 1024,
+    bodyLimit: bodyLimits.defaultJson,
   });
   const objectStorage = new ObjectStorageService(config.objectStorage);
 
@@ -35,6 +36,13 @@ export function buildApp(pool: pg.Pool, config: AppConfig) {
       reply.status(error.statusCode).send({
         error: error.errorCode,
         message: error.message,
+      });
+      return;
+    }
+    if (typeof error === "object" && error != null && "statusCode" in error && error.statusCode === 413) {
+      reply.status(413).send({
+        error: "payload_too_large",
+        message: "request body is too large",
       });
       return;
     }

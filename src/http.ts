@@ -33,6 +33,10 @@ export function unauthorized(message = "Unauthorized"): never {
   throw new HttpError(401, "unauthorized", message);
 }
 
+export function tooManyRequests(message = "Too many requests"): never {
+  throw new HttpError(429, "rate_limited", message);
+}
+
 export function serviceUnavailable(message: string): never {
   throw new HttpError(503, "service_unavailable", message);
 }

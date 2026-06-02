@@ -10,6 +10,7 @@ import {
   requiredString,
   requiredUUID,
 } from "../http.js";
+import { bodyLimits, createRateLimit, endpointRateLimits } from "../limits.js";
 
 type Queryable = Pick<pg.Pool, "query">;
 
@@ -64,6 +65,17 @@ type DeckPreferenceInput = {
   deckId: string;
   isEnabled: boolean;
   updatedAt: string | null;
+};
+
+type SyncTargetValidation = {
+  reviews: ReviewEventInput[];
+  progressItems: ProgressInput[];
+  matchingRecords: MatchingRecordInput[];
+  deckPreferences: DeckPreferenceInput[];
+  rejectedReviewIds: string[];
+  rejectedProgressCardIds: string[];
+  rejectedMatchingRecordDeckIds: string[];
+  rejectedDeckPreferenceDeckIds: string[];
 };
 
 function studyMode(value: unknown, field: string): string {
@@ -587,18 +599,77 @@ async function validateSyncTargets(
   progressItems: ProgressInput[],
   matchingRecords: MatchingRecordInput[],
   deckPreferences: DeckPreferenceInput[],
-): Promise<void> {
-  await validateReviewTargets(client, userId, reviews);
-  await validateProgressTargets(client, userId, progressItems);
-  await validateMatchingTargets(client, userId, matchingRecords);
-  await validateDeckPreferenceTargets(client, userId, deckPreferences);
+): Promise<SyncTargetValidation> {
+  const [
+    allowedReviewTargets,
+    allowedProgressTargets,
+    allowedMatchingTargets,
+    allowedDeckPreferenceTargets,
+  ] = await Promise.all([
+    allowedReviewTargetKeys(client, userId, reviews),
+    allowedProgressTargetKeys(client, userId, progressItems),
+    allowedMatchingTargetKeys(client, userId, matchingRecords),
+    allowedDeckPreferenceTargetKeys(client, userId, deckPreferences),
+  ]);
+
+  const acceptedReviews: ReviewEventInput[] = [];
+  const acceptedProgressItems: ProgressInput[] = [];
+  const acceptedMatchingRecords: MatchingRecordInput[] = [];
+  const acceptedDeckPreferences: DeckPreferenceInput[] = [];
+  const rejectedReviewIds: string[] = [];
+  const rejectedProgressCardIds: string[] = [];
+  const rejectedMatchingRecordDeckIds: string[] = [];
+  const rejectedDeckPreferenceDeckIds: string[] = [];
+
+  for (const review of reviews) {
+    const key = reviewTargetKey(review);
+    if (allowedReviewTargets.has(key)) {
+      acceptedReviews.push(review);
+    } else {
+      rejectedReviewIds.push(review.clientEventId);
+    }
+  }
+  for (const progress of progressItems) {
+    const key = progressTargetKey(progress);
+    if (allowedProgressTargets.has(key)) {
+      acceptedProgressItems.push(progress);
+    } else {
+      rejectedProgressCardIds.push(progress.cardId);
+    }
+  }
+  for (const record of matchingRecords) {
+    const key = matchingTargetKey(record);
+    if (allowedMatchingTargets.has(key)) {
+      acceptedMatchingRecords.push(record);
+    } else {
+      rejectedMatchingRecordDeckIds.push(record.deckId);
+    }
+  }
+  for (const preference of deckPreferences) {
+    if (allowedDeckPreferenceTargets.has(preference.deckId)) {
+      acceptedDeckPreferences.push(preference);
+    } else {
+      rejectedDeckPreferenceDeckIds.push(preference.deckId);
+    }
+  }
+
+  return {
+    reviews: acceptedReviews,
+    progressItems: acceptedProgressItems,
+    matchingRecords: acceptedMatchingRecords,
+    deckPreferences: acceptedDeckPreferences,
+    rejectedReviewIds,
+    rejectedProgressCardIds,
+    rejectedMatchingRecordDeckIds,
+    rejectedDeckPreferenceDeckIds,
+  };
 }
 
-async function validateReviewTargets(
+async function allowedReviewTargetKeys(
   client: Queryable,
   userId: string,
   reviews: ReviewEventInput[],
-): Promise<void> {
+): Promise<Set<string>> {
   const targets = uniqueByKey(
     reviews.map((review) => ({
       deckId: review.deckId,
@@ -608,7 +679,7 @@ async function validateReviewTargets(
     reviewTargetKey,
   );
   if (!targets.length) {
-    return;
+    return new Set();
   }
 
   const result = await client.query<{
@@ -650,21 +721,18 @@ async function validateReviewTargets(
     `,
     [userId, JSON.stringify(reviewTargetRows(targets))],
   );
-  const allowedTargets = new Set(result.rows.map((row) => reviewTargetKey({
+  return new Set(result.rows.map((row) => reviewTargetKey({
     deckId: row.deck_id,
     deckVersionId: row.deck_version_id,
     cardId: row.card_id,
   })));
-  if (targets.some((target) => !allowedTargets.has(reviewTargetKey(target)))) {
-    badRequest("review target is not assigned to this user");
-  }
 }
 
-async function validateProgressTargets(
+async function allowedProgressTargetKeys(
   client: Queryable,
   userId: string,
   progressItems: ProgressInput[],
-): Promise<void> {
+): Promise<Set<string>> {
   const targets = uniqueByKey(
     progressItems.map((progress) => ({
       deckId: progress.deckId,
@@ -673,7 +741,7 @@ async function validateProgressTargets(
     progressTargetKey,
   );
   if (!targets.length) {
-    return;
+    return new Set();
   }
 
   const result = await client.query<{
@@ -705,20 +773,17 @@ async function validateProgressTargets(
     `,
     [userId, JSON.stringify(progressTargetRows(targets))],
   );
-  const allowedTargets = new Set(result.rows.map((row) => progressTargetKey({
+  return new Set(result.rows.map((row) => progressTargetKey({
     deckId: row.deck_id,
     cardId: row.card_id,
   })));
-  if (targets.some((target) => !allowedTargets.has(progressTargetKey(target)))) {
-    badRequest("progress target is not assigned to this user");
-  }
 }
 
-async function validateMatchingTargets(
+async function allowedMatchingTargetKeys(
   client: Queryable,
   userId: string,
   matchingRecords: MatchingRecordInput[],
-): Promise<void> {
+): Promise<Set<string>> {
   const targets = uniqueByKey(
     matchingRecords.map((record) => ({
       deckId: record.deckId,
@@ -727,7 +792,7 @@ async function validateMatchingTargets(
     matchingTargetKey,
   );
   if (!targets.length) {
-    return;
+    return new Set();
   }
 
   const result = await client.query<{
@@ -763,23 +828,20 @@ async function validateMatchingTargets(
     `,
     [userId, JSON.stringify(matchingTargetRows(targets))],
   );
-  const allowedTargets = new Set(result.rows.map((row) => matchingTargetKey({
+  return new Set(result.rows.map((row) => matchingTargetKey({
     deckId: row.deck_id,
     deckVersionId: row.deck_version_id,
   })));
-  if (targets.some((target) => !allowedTargets.has(matchingTargetKey(target)))) {
-    badRequest("matching record target is not assigned to this user");
-  }
 }
 
-async function validateDeckPreferenceTargets(
+async function allowedDeckPreferenceTargetKeys(
   client: Queryable,
   userId: string,
   deckPreferences: DeckPreferenceInput[],
-): Promise<void> {
+): Promise<Set<string>> {
   const deckIds = [...new Set(deckPreferences.map((preference) => preference.deckId))];
   if (!deckIds.length) {
-    return;
+    return new Set();
   }
 
   const result = await client.query<{ deck_id: string }>(
@@ -791,13 +853,12 @@ async function validateDeckPreferenceTargets(
     `,
     [userId, deckIds],
   );
-  const allowedDeckIds = new Set(result.rows.map((row) => row.deck_id));
-  if (deckIds.some((deckId) => !allowedDeckIds.has(deckId))) {
-    badRequest("deck preference target is not assigned to this user");
-  }
+  return new Set(result.rows.map((row) => row.deck_id));
 }
 
 export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, config: AppConfig): Promise<void> {
+  const syncEventsRateLimit = createRateLimit(endpointRateLimits.syncEvents);
+
   app.get("/v1/bootstrap", async (request) => {
     requireHouseholdSync(request, config);
 
@@ -971,9 +1032,13 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
     };
   });
 
-  app.post("/v1/sync/events", async (request) => {
+  app.post("/v1/sync/events", {
+    bodyLimit: bodyLimits.syncEvents,
+    preHandler: syncEventsRateLimit,
+  }, async (request) => {
     requireHouseholdSync(request, config);
     const userId = await selectedSyncUserId(request, pool);
+    const startedAt = Date.now();
     const data = body(request.body);
     const reviews = parseReviews(data.reviews);
     const progressItems = parseProgress(data.progress);
@@ -990,9 +1055,9 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
       const matchingRecordDeckIds: string[] = [];
       const deckPreferenceDeckIds: string[] = [];
 
-      await validateSyncTargets(client, userId, reviews, progressItems, matchingRecords, deckPreferences);
+      const validated = await validateSyncTargets(client, userId, reviews, progressItems, matchingRecords, deckPreferences);
 
-      for (const review of reviews) {
+      for (const review of validated.reviews) {
         const result = await client.query<{ client_event_id: string }>(
           `
           INSERT INTO study_reviews (
@@ -1027,7 +1092,7 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
         }
       }
 
-      for (const progress of progressItems) {
+      for (const progress of validated.progressItems) {
         const result = await client.query<{ card_id: string }>(
           `
           INSERT INTO card_progress (
@@ -1067,7 +1132,7 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
         }
       }
 
-      for (const record of matchingRecords) {
+      for (const record of validated.matchingRecords) {
         const result = await client.query<{ deck_id: string }>(
           `
           INSERT INTO deck_matching_records (
@@ -1099,7 +1164,7 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
         }
       }
 
-      for (const preference of deckPreferences) {
+      for (const preference of validated.deckPreferences) {
         await client.query(
           `
           INSERT INTO user_deck_preferences (
@@ -1121,16 +1186,48 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
 
       await client.query("COMMIT");
 
+      const durationMs = Date.now() - startedAt;
+      request.log.info({
+        userId,
+        durationMs,
+        reviewCount: reviews.length,
+        acceptedReviewCount: acceptedReviewIds.length,
+        duplicateReviewCount: duplicateReviewIds.length,
+        progressCount: progressItems.length,
+        acceptedProgressCount: progressCardIds.length,
+        matchingRecordCount: matchingRecords.length,
+        acceptedMatchingRecordCount: matchingRecordDeckIds.length,
+        deckPreferenceCount: deckPreferences.length,
+        acceptedDeckPreferenceCount: deckPreferenceDeckIds.length,
+        rejectedReviewCount: validated.rejectedReviewIds.length,
+        rejectedProgressCount: validated.rejectedProgressCardIds.length,
+        rejectedMatchingRecordCount: validated.rejectedMatchingRecordDeckIds.length,
+        rejectedDeckPreferenceCount: validated.rejectedDeckPreferenceDeckIds.length,
+      }, "sync events accepted");
+
       return {
         acceptedReviewIds,
         duplicateReviewIds,
         progressCardIds,
         matchingRecordDeckIds,
         deckPreferenceDeckIds,
+        rejectedReviewIds: validated.rejectedReviewIds,
+        rejectedProgressCardIds: validated.rejectedProgressCardIds,
+        rejectedMatchingRecordDeckIds: validated.rejectedMatchingRecordDeckIds,
+        rejectedDeckPreferenceDeckIds: validated.rejectedDeckPreferenceDeckIds,
         serverRevision: await latestRevision(pool),
       };
     } catch (error) {
       await client.query("ROLLBACK");
+      request.log.warn({
+        err: error,
+        userId,
+        durationMs: Date.now() - startedAt,
+        reviewCount: reviews.length,
+        progressCount: progressItems.length,
+        matchingRecordCount: matchingRecords.length,
+        deckPreferenceCount: deckPreferences.length,
+      }, "sync events rejected");
       throw error;
     } finally {
       client.release();

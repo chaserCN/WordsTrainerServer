@@ -10,6 +10,7 @@ import pg from "pg";
 import type { FastifyInstance } from "fastify";
 import { buildApp } from "../src/app.js";
 import { loadConfig, type AppConfig } from "../src/config.js";
+import { bodyLimits, endpointRateLimits } from "../src/limits.js";
 
 const testDatabaseUrl = process.env.TEST_DATABASE_URL ?? process.env.DATABASE_URL;
 const adminApiKey = process.env.ADMIN_API_KEY ?? "test-admin-key";
@@ -238,6 +239,64 @@ test("auth uses build-time config instead of rereading mutable env", async (t) =
       process.env.HOUSEHOLD_SYNC_TOKEN = previousSyncToken;
     }
   }
+});
+
+test("endpoint body limits protect sync JSON while allowing bounded media uploads", async (t) => {
+  const ctx = await createTestApp(t);
+  if (!ctx) return;
+
+  const oversizedSyncPayload = JSON.stringify({
+    reviews: [],
+    padding: "x".repeat(bodyLimits.syncEvents),
+  });
+  const syncResponse = await ctx.app.inject({
+    method: "POST",
+    url: "/v1/sync/events",
+    headers: {
+      authorization: `Bearer ${ctx.syncToken}`,
+      "content-type": "application/json",
+    },
+    payload: oversizedSyncPayload,
+  });
+  assert.equal(syncResponse.statusCode, 413, syncResponse.payload);
+  assert.equal(JSON.parse(syncResponse.payload).error, "payload_too_large");
+
+  const mediaBytes = Buffer.alloc(bodyLimits.defaultJson + 1, 7);
+  const mediaResponse = await ctx.app.inject({
+    method: "POST",
+    url: "/v1/admin/media/upload",
+    headers: {
+      ...ctx.adminAuth,
+      "content-type": "application/octet-stream",
+      "x-file-name": "body-limit.bin",
+    },
+    payload: mediaBytes,
+  });
+  assert.equal(mediaResponse.statusCode, 201, mediaResponse.payload);
+  const media = JSON.parse(mediaResponse.payload);
+  assert.equal(Number(media.media.byte_size), mediaBytes.length);
+});
+
+test("sync events are rate limited per selected user", async (t) => {
+  const ctx = await createTestApp(t);
+  if (!ctx) return;
+
+  const learner = await createUser(ctx, "Rate Limited Learner");
+  for (let index = 0; index < endpointRateLimits.syncEvents.max; index += 1) {
+    await syncJson(ctx, "POST", "/v1/sync/events", learner.token, {}, learner.userId);
+  }
+
+  const limited = await ctx.app.inject({
+    method: "POST",
+    url: "/v1/sync/events",
+    headers: {
+      authorization: `Bearer ${learner.token}`,
+      "x-flashgame-user-id": learner.userId,
+    },
+    payload: {},
+  });
+  assert.equal(limited.statusCode, 429, limited.payload);
+  assert.equal(JSON.parse(limited.payload).error, "rate_limited");
 });
 
 async function runMigrations(pool: pg.Pool): Promise<void> {
@@ -1239,9 +1298,11 @@ test("admin can hide and restore a deck through assignment status without deleti
   assert.equal(archivedBootstrap.statsSummary.activityDays.length, 1);
   assert.equal(archivedBootstrap.progress.length, 1);
 
-  await syncJson(ctx, "POST", "/v1/sync/events", learner.token, {
+  const archivedSync = await syncJson(ctx, "POST", "/v1/sync/events", learner.token, {
     progress: [progressEvent(deck)],
-  }, learner.userId, 400);
+  }, learner.userId);
+  assert.deepEqual(archivedSync.progressCardIds, []);
+  assert.deepEqual(archivedSync.rejectedProgressCardIds, [deck.cardIds[0]]);
 
   const restored = await adminJson(ctx, "POST", `/v1/admin/decks/${deck.deckId}/assignments`, {
     userId: learner.userId,
@@ -1949,51 +2010,46 @@ test("sync data is isolated for different users sharing the same deck", async (t
   assert.equal(inactiveBob.content.cards.length, 0);
   assert.equal(activeAlice.content.cards.length, 2);
 
-  await injectJson(ctx.app, {
-    method: "POST",
-    url: "/v1/sync/events",
-    headers: {
-      authorization: `Bearer ${bob.token}`,
-      "x-flashgame-user-id": bob.userId,
-    },
-    payload: {
-      reviews: [
-        {
-          clientEventId: randomUUID(),
-          deckId: sharedDeck.deckId,
-          deckVersionId: sharedDeck.versionId,
-          cardId: sharedDeck.cardIds[0],
-          mode: "flashcards",
-          outcome: "remembered",
-          reviewedAt: "2026-06-02T08:00:00.000Z",
-          durationMs: 1000,
-          wasNew: false,
-          previousState: "review",
-          newState: "review",
-        },
-      ],
-      progress: [
-        {
-          cardId: sharedDeck.cardIds[0],
-          deckId: sharedDeck.deckId,
-          fsrsData: { state: "review", reps: 2 },
-          dueAt: "2026-06-06T08:00:00.000Z",
-          state: "review",
-          updatedAt: "2026-06-02T08:00:00.000Z",
-        },
-      ],
-      matchingRecords: [
-        {
-          deckId: sharedDeck.deckId,
-          deckVersionId: sharedDeck.versionId,
-          bestDurationSeconds: 12.4,
-          pairCount: 4,
-          achievedAt: "2026-06-02T08:02:00.000Z",
-        },
-      ],
-    },
-    expectedStatus: 400,
-  });
+  const inactiveReviewId = randomUUID();
+  const inactiveSync = await syncJson(ctx, "POST", "/v1/sync/events", bob.token, {
+    reviews: [
+      {
+        clientEventId: inactiveReviewId,
+        deckId: sharedDeck.deckId,
+        deckVersionId: sharedDeck.versionId,
+        cardId: sharedDeck.cardIds[0],
+        mode: "flashcards",
+        outcome: "remembered",
+        reviewedAt: "2026-06-02T08:00:00.000Z",
+        durationMs: 1000,
+        wasNew: false,
+        previousState: "review",
+        newState: "review",
+      },
+    ],
+    progress: [
+      {
+        cardId: sharedDeck.cardIds[0],
+        deckId: sharedDeck.deckId,
+        fsrsData: { state: "review", reps: 2 },
+        dueAt: "2026-06-06T08:00:00.000Z",
+        state: "review",
+        updatedAt: "2026-06-02T08:00:00.000Z",
+      },
+    ],
+    matchingRecords: [
+      {
+        deckId: sharedDeck.deckId,
+        deckVersionId: sharedDeck.versionId,
+        bestDurationSeconds: 12.4,
+        pairCount: 4,
+        achievedAt: "2026-06-02T08:02:00.000Z",
+      },
+    ],
+  }, bob.userId);
+  assert.deepEqual(inactiveSync.rejectedReviewIds, [inactiveReviewId]);
+  assert.deepEqual(inactiveSync.rejectedProgressCardIds, [sharedDeck.cardIds[0]]);
+  assert.deepEqual(inactiveSync.rejectedMatchingRecordDeckIds, [sharedDeck.deckId]);
 });
 
 test("sync rejects reviews, progress, and matching records for unassigned targets", async (t) => {
@@ -2015,25 +2071,38 @@ test("sync rejects reviews, progress, and matching records for unassigned target
   assert.deepEqual(unassignedBootstrap.assignments, []);
   assert.deepEqual(unassignedBootstrap.content.cards, []);
 
-  await syncJson(ctx, "POST", "/v1/sync/events", unassignedLearner.token, {
-    reviews: [reviewEvent(deck)],
-  }, unassignedLearner.userId, 400);
-  await syncJson(ctx, "POST", "/v1/sync/events", unassignedLearner.token, {
-    progress: [progressEvent(deck)],
-  }, unassignedLearner.userId, 400);
-  await syncJson(ctx, "POST", "/v1/sync/events", unassignedLearner.token, {
-    matchingRecords: [matchingRecord(deck)],
-  }, unassignedLearner.userId, 400);
+  const unassignedReview = reviewEvent(deck);
+  const rejectedUnassignedReview = await syncJson(ctx, "POST", "/v1/sync/events", unassignedLearner.token, {
+    reviews: [unassignedReview],
+  }, unassignedLearner.userId);
+  assert.deepEqual(rejectedUnassignedReview.rejectedReviewIds, [unassignedReview.clientEventId]);
 
-  await syncJson(ctx, "POST", "/v1/sync/events", assignedLearner.token, {
-    reviews: [reviewEvent(deck, { cardId: randomUUID() })],
-  }, assignedLearner.userId, 400);
-  await syncJson(ctx, "POST", "/v1/sync/events", assignedLearner.token, {
-    reviews: [reviewEvent(deck, { deckVersionId: randomUUID() })],
-  }, assignedLearner.userId, 400);
-  await syncJson(ctx, "POST", "/v1/sync/events", assignedLearner.token, {
+  const rejectedUnassignedProgress = await syncJson(ctx, "POST", "/v1/sync/events", unassignedLearner.token, {
+    progress: [progressEvent(deck)],
+  }, unassignedLearner.userId);
+  assert.deepEqual(rejectedUnassignedProgress.rejectedProgressCardIds, [deck.cardIds[0]]);
+
+  const rejectedUnassignedMatching = await syncJson(ctx, "POST", "/v1/sync/events", unassignedLearner.token, {
+    matchingRecords: [matchingRecord(deck)],
+  }, unassignedLearner.userId);
+  assert.deepEqual(rejectedUnassignedMatching.rejectedMatchingRecordDeckIds, [deck.deckId]);
+
+  const invalidCardReview = reviewEvent(deck, { cardId: randomUUID() });
+  const rejectedInvalidCardReview = await syncJson(ctx, "POST", "/v1/sync/events", assignedLearner.token, {
+    reviews: [invalidCardReview],
+  }, assignedLearner.userId);
+  assert.deepEqual(rejectedInvalidCardReview.rejectedReviewIds, [invalidCardReview.clientEventId]);
+
+  const invalidVersionReview = reviewEvent(deck, { deckVersionId: randomUUID() });
+  const rejectedInvalidVersionReview = await syncJson(ctx, "POST", "/v1/sync/events", assignedLearner.token, {
+    reviews: [invalidVersionReview],
+  }, assignedLearner.userId);
+  assert.deepEqual(rejectedInvalidVersionReview.rejectedReviewIds, [invalidVersionReview.clientEventId]);
+
+  const rejectedInvalidMatchingVersion = await syncJson(ctx, "POST", "/v1/sync/events", assignedLearner.token, {
     matchingRecords: [matchingRecord(deck, { deckVersionId: randomUUID() })],
-  }, assignedLearner.userId, 400);
+  }, assignedLearner.userId);
+  assert.deepEqual(rejectedInvalidMatchingVersion.rejectedMatchingRecordDeckIds, [deck.deckId]);
 
   const persistedStats = await ctx.pool.query(
     `
@@ -2048,22 +2117,24 @@ test("sync rejects reviews, progress, and matching records for unassigned target
   assert.equal(Number(persistedStats.rows[0].matching_count), 0);
 });
 
-test("sync target validation rejects a mixed batch atomically", async (t) => {
+test("sync target validation partially accepts a mixed batch with explicit rejected ids", async (t) => {
   const ctx = await createTestApp(t);
   if (!ctx) return;
 
   const learner = await createUser(ctx, "Atomic Validation Learner");
   const deck = await createPublishedDeck(ctx, learner.userId, "Atomic validation deck");
   const invalidCardId = randomUUID();
+  const firstReviewId = randomUUID();
+  const secondReviewId = randomUUID();
 
-  await syncJson(ctx, "POST", "/v1/sync/events", learner.token, {
+  const result = await syncJson(ctx, "POST", "/v1/sync/events", learner.token, {
     reviews: [
       reviewEvent(deck, {
-        clientEventId: randomUUID(),
+        clientEventId: firstReviewId,
         cardId: deck.cardIds[0],
       }),
       reviewEvent(deck, {
-        clientEventId: randomUUID(),
+        clientEventId: secondReviewId,
         cardId: deck.cardIds[1],
       }),
     ],
@@ -2085,7 +2156,16 @@ test("sync target validation rejects a mixed batch atomically", async (t) => {
         updatedAt: "2026-06-02T10:02:00.000Z",
       },
     ],
-  }, learner.userId, 400);
+  }, learner.userId);
+
+  assert.deepEqual(result.acceptedReviewIds.sort(), [firstReviewId, secondReviewId].sort());
+  assert.deepEqual(result.rejectedReviewIds, []);
+  assert.deepEqual(result.progressCardIds, [deck.cardIds[0]]);
+  assert.deepEqual(result.rejectedProgressCardIds, [invalidCardId]);
+  assert.deepEqual(result.matchingRecordDeckIds, [deck.deckId]);
+  assert.deepEqual(result.rejectedMatchingRecordDeckIds, []);
+  assert.deepEqual(result.deckPreferenceDeckIds, [deck.deckId]);
+  assert.deepEqual(result.rejectedDeckPreferenceDeckIds, []);
 
   const persistedStats = await ctx.pool.query(
     `
@@ -2097,10 +2177,10 @@ test("sync target validation rejects a mixed batch atomically", async (t) => {
     `,
     [learner.userId],
   );
-  assert.equal(Number(persistedStats.rows[0].review_count), 0);
-  assert.equal(Number(persistedStats.rows[0].progress_count), 0);
-  assert.equal(Number(persistedStats.rows[0].matching_count), 0);
-  assert.equal(Number(persistedStats.rows[0].preference_count), 0);
+  assert.equal(Number(persistedStats.rows[0].review_count), 2);
+  assert.equal(Number(persistedStats.rows[0].progress_count), 1);
+  assert.equal(Number(persistedStats.rows[0].matching_count), 1);
+  assert.equal(Number(persistedStats.rows[0].preference_count), 1);
 });
 
 test("sync ignores stale progress updates for the same user and card", async (t) => {

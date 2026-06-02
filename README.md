@@ -70,6 +70,15 @@ The app uses `X-FlashGame-User-Id` when it needs content or writes statistics
 for a specific child. `GET /v1/bootstrap` may omit that header; the server then
 returns all users and selects the first user when one exists.
 
+Request limits:
+
+- Default JSON body limit: 1 MiB.
+- `POST /v1/sync/events`: 2 MiB body limit and 120 requests/minute per
+  token+selected-user identity.
+- Admin routes: 300 requests/minute per token identity.
+- `POST /v1/admin/media/upload`: 25 MiB body limit and 30 requests/minute per
+  token identity.
+
 Build:
 
 ```bash
@@ -327,7 +336,15 @@ revision-based review deltas if needed.
 ```
 
 Repeated `clientEventId` values are reported as duplicates and do not create
-new review rows. Identical progress snapshots do not advance `serverRevision`.
+new review rows. Invalid/stale targets are reported per element via
+`rejectedReviewIds`, `rejectedProgressCardIds`,
+`rejectedMatchingRecordDeckIds`, and `rejectedDeckPreferenceDeckIds`; valid
+elements in the same request are still written. Malformed payloads still return
+`400` without partial writes.
+
+Identical progress snapshots do not advance `serverRevision`.
+The server logs sync event batches with selected user id, input counts,
+accepted/duplicate counts, rejected element counts, and duration.
 Deck preferences are upserted per user/deck and returned in
 `deckPreferenceDeckIds` when accepted.
 
