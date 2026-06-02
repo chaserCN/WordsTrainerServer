@@ -44,6 +44,16 @@ npm run migrate
 npm run dev
 ```
 
+Required runtime config:
+
+- `DATABASE_URL`: `postgres://` or `postgresql://` URL.
+- `ADMIN_API_KEY`: at least 12 characters.
+- `HOUSEHOLD_SYNC_TOKEN`: at least 16 characters.
+- `PORT`: optional integer, `1...65535`, default `3000`.
+- `UPLOAD_URL_EXPIRES_SECONDS`: optional integer, `1...604800`, default `900`.
+- `OBJECT_STORAGE_ENDPOINT` and `OBJECT_STORAGE_PUBLIC_BASE_URL`, when set,
+  must be `http://` or `https://` URLs.
+
 Admin routes require:
 
 ```http
@@ -70,12 +80,12 @@ npm start
 Run integration tests against an isolated schema in Postgres:
 
 ```bash
-export PATH="/usr/local/opt/node@20/bin:$PATH"
-export TEST_DATABASE_URL="postgres://..."
-export ADMIN_API_KEY="local-test-admin-key"
-export HOUSEHOLD_SYNC_TOKEN="local-test-household-sync-token"
 npm test
 ```
+
+`npm test` loads `.env` and runs through Node 20 automatically when Homebrew
+`node@20` is installed. Set `TEST_DATABASE_URL` only when you want tests to use a
+different database than `DATABASE_URL`.
 
 The tests create and drop their own `fg_test_*` schema. They exercise the
 admin/editor content flow and the iOS sync flow through Fastify HTTP injection,
@@ -86,7 +96,7 @@ Core tables:
 - `users`
 - `study_groups`, `group_members`
 - `media_objects`
-- `decks`, `deck_versions`, `deck_assignments`
+- `decks`, `deck_versions`, `deck_assignments`, `user_deck_preferences`
 - `deck_version_cards`, `deck_version_examples`
 - `deck_version_word_forms`, `deck_version_distractors`
 - `card_progress`, `study_reviews`
@@ -99,6 +109,7 @@ Health:
 
 ```text
 GET /health
+GET /v1/health
 ```
 
 Admin/editor bootstrap endpoints:
@@ -106,6 +117,7 @@ Admin/editor bootstrap endpoints:
 ```text
 GET  /v1/admin/users
 POST /v1/admin/users
+PUT  /v1/admin/users/:userId
 GET  /v1/admin/groups
 POST /v1/admin/groups
 GET  /v1/admin/groups/:groupId
@@ -119,6 +131,7 @@ POST /v1/admin/media/:mediaId/failed
 
 GET  /v1/admin/decks
 POST /v1/admin/decks
+PUT  /v1/admin/decks/:deckId
 POST /v1/admin/decks/:deckId/versions
 GET  /v1/admin/decks/:deckId/versions/:versionId
 PUT  /v1/admin/decks/:deckId/versions/:versionId/cards/:cardId
@@ -136,6 +149,36 @@ After a version is published, the macOS editor must create a new draft version,
 edit that draft, and publish it when ready. This keeps iOS sync deterministic
 because statistics and reviews always point to the exact content version the
 user studied.
+
+User and deck metadata can be edited independently from deck versions:
+
+```text
+PUT /v1/admin/users/:userId
+```
+
+```json
+{
+  "displayName": "Mia",
+  "avatarMediaId": "media-uuid-or-null",
+  "role": "learner"
+}
+```
+
+```text
+PUT /v1/admin/decks/:deckId
+```
+
+```json
+{
+  "title": "English basics",
+  "languageCode": "en",
+  "avatarSystemName": "books.vertical.fill",
+  "avatarMediaId": "media-uuid-or-null"
+}
+```
+
+Both endpoints accept partial bodies. Pass `null` for `avatarMediaId` or
+`avatarSystemName` to clear it.
 
 Media upload flow:
 
@@ -178,6 +221,72 @@ GET /v1/sync/changes?sinceRevision=...
 `GET /v1/sync/changes` and `POST /v1/sync/events` require
 `X-FlashGame-User-Id` so progress is always written to an explicit user.
 
+`GET /v1/bootstrap` accepts optional client-state headers:
+
+- `X-FlashGame-User-Id`: selected learner. If omitted, the server returns the
+  first user alphabetically.
+- `X-FlashGame-Cached-Deck-Version-Ids`: comma-separated published deck version
+  ids already stored locally; content rows for these versions are omitted.
+- `X-FlashGame-Time-Zone`: IANA time zone used to build `dailyUsage.day_key`.
+  If omitted, the server uses `UTC`.
+
+Bootstrap includes `dailyUsage` rows:
+
+```json
+[
+  {
+    "deck_id": "deck-uuid",
+    "day_key": "2026-06-01",
+    "new_cards_studied": 1
+  }
+]
+```
+
+Assignment rows include user-level deck preferences:
+
+```json
+{
+  "deck_id": "deck-uuid",
+  "assignment_status": "active",
+  "user_enabled": false,
+  "preference_updated_at": "2026-06-01T12:00:00.000Z"
+}
+```
+
+Effective deck activity on the client is:
+
+```text
+assignment_status == "active" && user_enabled != false
+```
+
+Bootstrap also includes `statsSummary` for dashboard statistics so clients do
+not need raw review history for activity and weak-card views:
+
+```json
+{
+  "activityDays": [
+    {
+      "day_key": "2026-06-01",
+      "reviewed_count": 3,
+      "passed_count": 2
+    }
+  ],
+  "weakCards": [
+    {
+      "card_id": "card-uuid",
+      "deck_id": "deck-uuid",
+      "failed_count": 2,
+      "reviewed_count": 5,
+      "last_failed_at": "2026-06-01T12:00:00.000Z"
+    }
+  ]
+}
+```
+
+`GET /v1/bootstrap` keeps `reviews: []` for response-shape compatibility.
+Raw review history is not part of full bootstrap; use `/v1/sync/changes` for
+revision-based review deltas if needed.
+
 `POST /v1/sync/events` accepts idempotent study events:
 
 ```json
@@ -206,12 +315,21 @@ GET /v1/sync/changes?sinceRevision=...
       "state": "review",
       "updatedAt": "2026-06-01T12:00:01Z"
     }
+  ],
+  "deckPreferences": [
+    {
+      "deckId": "deck-uuid",
+      "isEnabled": false,
+      "updatedAt": "2026-06-01T12:00:02Z"
+    }
   ]
 }
 ```
 
 Repeated `clientEventId` values are reported as duplicates and do not create
 new review rows. Identical progress snapshots do not advance `serverRevision`.
+Deck preferences are upserted per user/deck and returned in
+`deckPreferenceDeckIds` when accepted.
 
 ## Next Implementation Steps
 

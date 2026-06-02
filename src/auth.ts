@@ -1,7 +1,9 @@
 import { timingSafeEqual } from "node:crypto";
 import type { FastifyRequest } from "fastify";
-import { loadConfig } from "./config.js";
+import type { AppConfig } from "./config.js";
 import { optionalUUID, unauthorized } from "./http.js";
+
+export type AuthConfig = Pick<AppConfig, "adminApiKey" | "householdSyncToken">;
 
 export function bearerToken(request: FastifyRequest): string {
   const authorization = request.headers.authorization;
@@ -15,17 +17,17 @@ export function bearerToken(request: FastifyRequest): string {
   return token;
 }
 
-export function requireAdmin(request: FastifyRequest): void {
+export function requireAdmin(request: FastifyRequest, config: AuthConfig): void {
   const token = bearerToken(request);
-  const expected = loadConfig().adminApiKey;
+  const expected = config.adminApiKey;
   if (!constantTimeEqual(token, expected)) {
     unauthorized("Invalid admin token");
   }
 }
 
-export function requireHouseholdSync(request: FastifyRequest): void {
+export function requireHouseholdSync(request: FastifyRequest, config: AuthConfig): void {
   const token = bearerToken(request);
-  const expected = loadConfig().householdSyncToken;
+  const expected = config.householdSyncToken;
   if (!constantTimeEqual(token, expected)) {
     unauthorized("Invalid household sync token");
   }

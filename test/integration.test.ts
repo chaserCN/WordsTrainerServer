@@ -1,3 +1,4 @@
+import "dotenv/config";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
@@ -8,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import pg from "pg";
 import type { FastifyInstance } from "fastify";
 import { buildApp } from "../src/app.js";
+import { loadConfig, type AppConfig } from "../src/config.js";
 
 const testDatabaseUrl = process.env.TEST_DATABASE_URL ?? process.env.DATABASE_URL;
 const adminApiKey = process.env.ADMIN_API_KEY ?? "test-admin-key";
@@ -30,12 +32,55 @@ type PublishedDeck = {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const migrationsDir = path.resolve(__dirname, "../db/migrations");
+const configEnvKeys = [
+  "DATABASE_URL",
+  "HOST",
+  "PORT",
+  "ADMIN_API_KEY",
+  "HOUSEHOLD_SYNC_TOKEN",
+  "LOCAL_MEDIA_ROOT",
+  "OBJECT_STORAGE_BUCKET",
+  "OBJECT_STORAGE_REGION",
+  "OBJECT_STORAGE_ENDPOINT",
+  "OBJECT_STORAGE_ACCESS_KEY_ID",
+  "OBJECT_STORAGE_SECRET_ACCESS_KEY",
+  "OBJECT_STORAGE_PUBLIC_BASE_URL",
+  "OBJECT_STORAGE_FORCE_PATH_STYLE",
+  "UPLOAD_URL_EXPIRES_SECONDS",
+] as const;
+
+function withConfigEnv<T>(values: Partial<Record<(typeof configEnvKeys)[number], string>>, action: () => T): T {
+  const previous = new Map(configEnvKeys.map((key) => [key, process.env[key]]));
+  for (const key of configEnvKeys) {
+    delete process.env[key];
+  }
+  for (const [key, value] of Object.entries(values)) {
+    if (value != null) {
+      process.env[key] = value;
+    }
+  }
+  try {
+    return action();
+  } finally {
+    for (const key of configEnvKeys) {
+      const value = previous.get(key);
+      if (value == null) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
+    }
+  }
+}
 
 function quotedIdentifier(value: string): string {
   return `"${value.replaceAll('"', '""')}"`;
 }
 
-async function createTestApp(t: TestContext): Promise<TestApp | null> {
+async function createTestApp(
+  t: TestContext,
+  options: { objectStorage?: AppConfig["objectStorage"] } = {},
+): Promise<TestApp | null> {
   if (!testDatabaseUrl) {
     t.skip("TEST_DATABASE_URL or DATABASE_URL is required for integration tests");
     return null;
@@ -64,7 +109,7 @@ async function createTestApp(t: TestContext): Promise<TestApp | null> {
     host: "127.0.0.1",
     port: 0,
     localMediaRoot,
-    objectStorage: null,
+    objectStorage: options.objectStorage ?? null,
   });
 
   t.after(async () => {
@@ -83,6 +128,117 @@ async function createTestApp(t: TestContext): Promise<TestApp | null> {
     syncToken: householdSyncToken,
   };
 }
+
+test("loadConfig validates production-critical environment", () => {
+  const config = withConfigEnv({
+    DATABASE_URL: "postgres://user:pass@localhost:5432/flashgame",
+    ADMIN_API_KEY: "admin-key-with-length",
+    HOUSEHOLD_SYNC_TOKEN: "household-token-with-length",
+    PORT: "4321",
+    OBJECT_STORAGE_BUCKET: "flashgame-media",
+    OBJECT_STORAGE_REGION: "auto",
+    OBJECT_STORAGE_ENDPOINT: "https://object-storage.example.test",
+    OBJECT_STORAGE_ACCESS_KEY_ID: "access-key",
+    OBJECT_STORAGE_SECRET_ACCESS_KEY: "secret-key",
+    OBJECT_STORAGE_PUBLIC_BASE_URL: "https://cdn.example.test/assets",
+    UPLOAD_URL_EXPIRES_SECONDS: "120",
+  }, () => loadConfig());
+
+  assert.equal(config.databaseUrl, "postgres://user:pass@localhost:5432/flashgame");
+  assert.equal(config.port, 4321);
+  assert.equal(config.objectStorage?.endpoint, "https://object-storage.example.test");
+  assert.equal(config.objectStorage?.publicBaseUrl, "https://cdn.example.test/assets");
+  assert.equal(config.objectStorage?.uploadUrlExpiresSeconds, 120);
+
+  assert.throws(
+    () => withConfigEnv({
+      DATABASE_URL: "not-a-postgres-url",
+      ADMIN_API_KEY: "admin-key-with-length",
+      HOUSEHOLD_SYNC_TOKEN: "household-token-with-length",
+    }, () => loadConfig()),
+    /DATABASE_URL must be a valid URL/,
+  );
+  assert.throws(
+    () => withConfigEnv({
+      DATABASE_URL: "postgres://user:pass@localhost:5432/flashgame",
+      ADMIN_API_KEY: "short",
+      HOUSEHOLD_SYNC_TOKEN: "household-token-with-length",
+    }, () => loadConfig()),
+    /ADMIN_API_KEY must be at least 12 characters long/,
+  );
+  assert.throws(
+    () => withConfigEnv({
+      DATABASE_URL: "postgres://user:pass@localhost:5432/flashgame",
+      ADMIN_API_KEY: "admin-key-with-length",
+      HOUSEHOLD_SYNC_TOKEN: "household-token-with-length",
+      OBJECT_STORAGE_BUCKET: "flashgame-media",
+      OBJECT_STORAGE_ACCESS_KEY_ID: "access-key",
+      OBJECT_STORAGE_SECRET_ACCESS_KEY: "secret-key",
+      UPLOAD_URL_EXPIRES_SECONDS: "999999999",
+    }, () => loadConfig()),
+    /UPLOAD_URL_EXPIRES_SECONDS must be an integer >= 1 and <= 604800/,
+  );
+});
+
+test("health endpoints report database readiness", async (t) => {
+  const ctx = await createTestApp(t);
+  if (!ctx) return;
+
+  assert.deepEqual(await injectJson(ctx.app, { method: "GET", url: "/health" }), {
+    ok: true,
+    database: "ok",
+  });
+  assert.deepEqual(await injectJson(ctx.app, { method: "GET", url: "/v1/health" }), {
+    ok: true,
+    database: "ok",
+  });
+});
+
+test("auth uses build-time config instead of rereading mutable env", async (t) => {
+  const ctx = await createTestApp(t);
+  if (!ctx) return;
+
+  const previousAdminKey = process.env.ADMIN_API_KEY;
+  const previousSyncToken = process.env.HOUSEHOLD_SYNC_TOKEN;
+  try {
+    process.env.ADMIN_API_KEY = "changed-admin-key";
+    process.env.HOUSEHOLD_SYNC_TOKEN = "changed-household-sync-token";
+
+    await injectJson(ctx.app, {
+      method: "GET",
+      url: "/v1/admin/users",
+      headers: ctx.adminAuth,
+    });
+    await injectJson(ctx.app, {
+      method: "GET",
+      url: "/v1/admin/users",
+      headers: { authorization: `Bearer ${process.env.ADMIN_API_KEY}` },
+      expectedStatus: 401,
+    });
+    await injectJson(ctx.app, {
+      method: "GET",
+      url: "/v1/bootstrap",
+      headers: { authorization: `Bearer ${ctx.syncToken}` },
+    });
+    await injectJson(ctx.app, {
+      method: "GET",
+      url: "/v1/bootstrap",
+      headers: { authorization: `Bearer ${process.env.HOUSEHOLD_SYNC_TOKEN}` },
+      expectedStatus: 401,
+    });
+  } finally {
+    if (previousAdminKey == null) {
+      delete process.env.ADMIN_API_KEY;
+    } else {
+      process.env.ADMIN_API_KEY = previousAdminKey;
+    }
+    if (previousSyncToken == null) {
+      delete process.env.HOUSEHOLD_SYNC_TOKEN;
+    } else {
+      process.env.HOUSEHOLD_SYNC_TOKEN = previousSyncToken;
+    }
+  }
+});
 
 async function runMigrations(pool: pg.Pool): Promise<void> {
   const client = await pool.connect();
@@ -422,10 +578,145 @@ test("admin can upload local media and mobile can download it by media id", asyn
   const download = await ctx.app.inject({
     method: "GET",
     url: `/v1/media/${upload.media.id}`,
+    headers: {
+      authorization: `Bearer ${ctx.syncToken}`,
+    },
   });
   assert.equal(download.statusCode, 200);
   assert.equal(download.headers["content-type"], "audio/mpeg");
   assert.deepEqual(download.rawPayload, body);
+
+  const anonymousDownload = await ctx.app.inject({
+    method: "GET",
+    url: `/v1/media/${upload.media.id}`,
+  });
+  assert.equal(anonymousDownload.statusCode, 401);
+
+  const wrongTokenDownload = await ctx.app.inject({
+    method: "GET",
+    url: `/v1/media/${upload.media.id}`,
+    headers: {
+      authorization: "Bearer wrong-household-token",
+    },
+  });
+  assert.equal(wrongTokenDownload.statusCode, 401);
+});
+
+test("mobile bootstrap skips content for cached deck versions", async (t) => {
+  const ctx = await createTestApp(t);
+  if (!ctx) return;
+
+  const learner = await createUser(ctx, "Cached Content Learner");
+  const deck = await createPublishedDeck(ctx, learner.userId, "Cached content deck");
+
+  const fullBootstrap = await syncJson(ctx, "GET", "/v1/bootstrap", learner.token, undefined, learner.userId);
+  assert.equal(fullBootstrap.assignments.length, 1);
+  assert.equal(fullBootstrap.assignments[0].current_version_id, deck.versionId);
+  assert.equal(fullBootstrap.content.cards.length, 2);
+  assert.equal(fullBootstrap.content.examples.length, 2);
+
+  const cachedBootstrapResponse = await ctx.app.inject({
+    method: "GET",
+    url: "/v1/bootstrap",
+    headers: {
+      authorization: `Bearer ${ctx.syncToken}`,
+      "x-flashgame-user-id": learner.userId,
+      "x-flashgame-cached-deck-version-ids": deck.versionId,
+    },
+  });
+  assert.equal(cachedBootstrapResponse.statusCode, 200, cachedBootstrapResponse.payload);
+  const cachedBootstrap = JSON.parse(cachedBootstrapResponse.payload);
+  assert.equal(cachedBootstrap.assignments.length, 1);
+  assert.equal(cachedBootstrap.assignments[0].current_version_id, deck.versionId);
+  assert.deepEqual(cachedBootstrap.content.cards, []);
+  assert.deepEqual(cachedBootstrap.content.examples, []);
+  assert.deepEqual(cachedBootstrap.content.forms, []);
+  assert.deepEqual(cachedBootstrap.content.distractors, []);
+});
+
+test("admin can create object storage upload urls and mobile downloads ready media through storage redirect", async (t) => {
+  const objectStorage: AppConfig["objectStorage"] = {
+    bucket: "flashgame-test",
+    region: "auto",
+    endpoint: "https://object-storage.test",
+    accessKeyId: "test-access-key",
+    secretAccessKey: "test-secret-key",
+    publicBaseUrl: "https://cdn.example.test/assets",
+    forcePathStyle: true,
+    uploadUrlExpiresSeconds: 600,
+  };
+  const ctx = await createTestApp(t, { objectStorage });
+  if (!ctx) return;
+
+  const uploadResponse = await adminJson(ctx, "POST", "/v1/admin/media/upload-url", {
+    fileName: "avatar.png",
+    mimeType: "image/png",
+    sha256: "a".repeat(64),
+    byteSize: 123,
+    width: 80,
+    height: 60,
+  }, 201);
+
+  assert.equal(uploadResponse.media.mime_type, "image/png");
+  assert.equal(uploadResponse.media.upload_status, "pending");
+  assert.equal(Number(uploadResponse.media.byte_size), 123);
+  assert.match(uploadResponse.media.storage_key, /^media\/\d{4}\/\d{2}\/.+-avatar\.png$/);
+  assert.equal(uploadResponse.upload.method, "PUT");
+  assert.equal(uploadResponse.upload.headers["Content-Type"], "image/png");
+  assert.equal(uploadResponse.upload.expiresInSeconds, 600);
+  assert.match(uploadResponse.upload.url, /^https:\/\/object-storage\.test\/flashgame-test\/media\//);
+  assert.equal(
+    uploadResponse.upload.publicUrl,
+    `https://cdn.example.test/assets/${uploadResponse.media.storage_key}`,
+  );
+
+  const pendingDownload = await ctx.app.inject({
+    method: "GET",
+    url: `/v1/media/${uploadResponse.media.id}`,
+    headers: {
+      authorization: `Bearer ${ctx.syncToken}`,
+    },
+  });
+  assert.equal(pendingDownload.statusCode, 404);
+
+  const complete = await adminJson(ctx, "POST", `/v1/admin/media/${uploadResponse.media.id}/complete`, {
+    byteSize: 456,
+    width: 120,
+    height: 90,
+  });
+  assert.equal(complete.media.upload_status, "ready");
+  assert.equal(Number(complete.media.byte_size), 456);
+  assert.equal(Number(complete.media.width), 120);
+  assert.equal(Number(complete.media.height), 90);
+
+  const redirectDownload = await ctx.app.inject({
+    method: "GET",
+    url: `/v1/media/${uploadResponse.media.id}`,
+    headers: {
+      authorization: `Bearer ${ctx.syncToken}`,
+    },
+  });
+  assert.equal(redirectDownload.statusCode, 302);
+  assert.equal(
+    redirectDownload.headers.location,
+    `https://cdn.example.test/assets/${uploadResponse.media.storage_key}`,
+  );
+
+  const failedUpload = await adminJson(ctx, "POST", "/v1/admin/media/upload-url", {
+    fileName: "broken.mp3",
+    mimeType: "audio/mpeg",
+  }, 201);
+  const failed = await adminJson(ctx, "POST", `/v1/admin/media/${failedUpload.media.id}/failed`);
+  assert.equal(failed.media.upload_status, "failed");
+
+  const failedDownload = await ctx.app.inject({
+    method: "GET",
+    url: `/v1/media/${failedUpload.media.id}`,
+    headers: {
+      authorization: `Bearer ${ctx.syncToken}`,
+    },
+  });
+  assert.equal(failedDownload.statusCode, 404);
 });
 
 test("admin/editor can create, edit, publish, and assign usable deck content", async (t) => {
@@ -434,6 +725,14 @@ test("admin/editor can create, edit, publish, and assign usable deck content", a
 
   const learner = await createUser(ctx, "Mia Learner");
   const deck = await createPublishedDeck(ctx, learner.userId);
+  const userAvatarMediaId = await createMedia(ctx, "user-avatar");
+
+  const updatedUser = await adminJson(ctx, "PUT", `/v1/admin/users/${learner.userId}`, {
+    displayName: "Mia Updated",
+    avatarMediaId: userAvatarMediaId,
+  });
+  assert.equal(updatedUser.user.display_name, "Mia Updated");
+  assert.equal(updatedUser.user.avatar_media_id, userAvatarMediaId);
 
   const versionDetail = await adminJson(ctx, "GET", `/v1/admin/decks/${deck.deckId}/versions/${deck.versionId}`);
   assert.equal(versionDetail.cards.length, 2);
@@ -457,6 +756,8 @@ test("admin/editor can create, edit, publish, and assign usable deck content", a
 
   const bootstrap = await syncJson(ctx, "GET", "/v1/bootstrap", learner.token);
   assert.equal(bootstrap.user.id, learner.userId);
+  assert.equal(bootstrap.user.display_name, "Mia Updated");
+  assert.equal(bootstrap.user.avatar_media_id, userAvatarMediaId);
   assert.equal(bootstrap.users.length, 1);
   assert.equal(bootstrap.assignments.length, 1);
   assert.equal(bootstrap.assignments[0].title, "Spanish cafe basics");
@@ -468,6 +769,549 @@ test("admin/editor can create, edit, publish, and assign usable deck content", a
   assert.equal(bootstrap.content.cards[0].deck_version_id, deck.versionId);
   assert.ok(bootstrap.media.length >= 2);
   assert.ok(bootstrap.media.every((media: any) => typeof media.byte_size === "number"));
+
+  const deckAvatarMediaId = await createMedia(ctx, "renamed-deck-avatar");
+  const updatedDeck = await adminJson(ctx, "PUT", `/v1/admin/decks/${deck.deckId}`, {
+    title: "Spanish cafe essentials",
+    avatarSystemName: "sparkles",
+    avatarMediaId: deckAvatarMediaId,
+  });
+  assert.equal(updatedDeck.deck.title, "Spanish cafe essentials");
+  assert.equal(updatedDeck.deck.avatar_system_name, "sparkles");
+  assert.equal(updatedDeck.deck.avatar_media_id, deckAvatarMediaId);
+
+  const metadataChanges = await syncJson(
+    ctx,
+    "GET",
+    `/v1/sync/changes?sinceRevision=${bootstrap.serverRevision}`,
+    learner.token,
+    undefined,
+    learner.userId,
+  );
+  assert.equal(metadataChanges.assignments.length, 1);
+  assert.equal(metadataChanges.assignments[0].title, "Spanish cafe essentials");
+  assert.equal(metadataChanges.assignments[0].avatar_system_name, "sparkles");
+  assert.equal(metadataChanges.assignments[0].avatar_media_id, deckAvatarMediaId);
+});
+
+test("admin can edit user and deck metadata with partial updates and clears", async (t) => {
+  const ctx = await createTestApp(t);
+  if (!ctx) return;
+
+  const firstUserAvatarId = await createMedia(ctx, "first-user-avatar");
+  const secondUserAvatarId = await createMedia(ctx, "second-user-avatar");
+  const user = await adminJson(ctx, "POST", "/v1/admin/users", {
+    displayName: "Metadata Learner",
+    role: "learner",
+    avatarMediaId: firstUserAvatarId,
+  }, 201);
+  const userId = user.user.id;
+
+  const renamedUser = await adminJson(ctx, "PUT", `/v1/admin/users/${userId}`, {
+    displayName: "Renamed Learner",
+  });
+  assert.equal(renamedUser.user.display_name, "Renamed Learner");
+  assert.equal(renamedUser.user.role, "learner");
+  assert.equal(renamedUser.user.avatar_media_id, firstUserAvatarId);
+
+  const reavatarUser = await adminJson(ctx, "PUT", `/v1/admin/users/${userId}`, {
+    role: "editor",
+    avatarMediaId: secondUserAvatarId,
+  });
+  assert.equal(reavatarUser.user.display_name, "Renamed Learner");
+  assert.equal(reavatarUser.user.role, "editor");
+  assert.equal(reavatarUser.user.avatar_media_id, secondUserAvatarId);
+
+  const clearedUserAvatar = await adminJson(ctx, "PUT", `/v1/admin/users/${userId}`, {
+    avatarMediaId: null,
+  });
+  assert.equal(clearedUserAvatar.user.avatar_media_id, null);
+
+  await adminJson(ctx, "PUT", `/v1/admin/users/${userId}`, {}, 400);
+  await adminJson(ctx, "PUT", `/v1/admin/users/${userId}`, { role: "coach" }, 400);
+  await adminJson(ctx, "PUT", `/v1/admin/users/${randomUUID()}`, { displayName: "Missing" }, 404);
+
+  const deckAvatarId = await createMedia(ctx, "metadata-deck-avatar");
+  const newDeckAvatarId = await createMedia(ctx, "metadata-new-deck-avatar");
+  const deck = await adminJson(ctx, "POST", "/v1/admin/decks", {
+    title: "Metadata deck",
+    languageCode: "en",
+    avatarSystemName: "books.vertical.fill",
+    avatarMediaId: deckAvatarId,
+  }, 201);
+  const version = await adminJson(ctx, "POST", `/v1/admin/decks/${deck.deck.id}/versions`, {
+    manifest: {},
+  }, 201);
+  await adminJson(ctx, "POST", `/v1/admin/decks/${deck.deck.id}/publish`, {
+    versionId: version.version.id,
+  });
+  await adminJson(ctx, "POST", `/v1/admin/decks/${deck.deck.id}/assignments`, {
+    userId,
+  }, 201);
+
+  const baseline = await syncJson(ctx, "GET", "/v1/bootstrap", ctx.syncToken, undefined, userId);
+  assert.equal(baseline.assignments[0].title, "Metadata deck");
+  assert.equal(baseline.assignments[0].language_code, "en");
+  assert.equal(baseline.assignments[0].avatar_system_name, "books.vertical.fill");
+  assert.equal(baseline.assignments[0].avatar_media_id, deckAvatarId);
+
+  const relanguagedDeck = await adminJson(ctx, "PUT", `/v1/admin/decks/${deck.deck.id}`, {
+    languageCode: "es",
+  });
+  assert.equal(relanguagedDeck.deck.title, "Metadata deck");
+  assert.equal(relanguagedDeck.deck.language_code, "es");
+  assert.equal(relanguagedDeck.deck.avatar_system_name, "books.vertical.fill");
+  assert.equal(relanguagedDeck.deck.avatar_media_id, deckAvatarId);
+
+  const clearedDeckMedia = await adminJson(ctx, "PUT", `/v1/admin/decks/${deck.deck.id}`, {
+    title: "Renamed metadata deck",
+    avatarSystemName: null,
+    avatarMediaId: null,
+  });
+  assert.equal(clearedDeckMedia.deck.title, "Renamed metadata deck");
+  assert.equal(clearedDeckMedia.deck.language_code, "es");
+  assert.equal(clearedDeckMedia.deck.avatar_system_name, null);
+  assert.equal(clearedDeckMedia.deck.avatar_media_id, null);
+
+  const reavatarDeck = await adminJson(ctx, "PUT", `/v1/admin/decks/${deck.deck.id}`, {
+    avatarSystemName: "sparkles",
+    avatarMediaId: newDeckAvatarId,
+  });
+  assert.equal(reavatarDeck.deck.title, "Renamed metadata deck");
+  assert.equal(reavatarDeck.deck.avatar_system_name, "sparkles");
+  assert.equal(reavatarDeck.deck.avatar_media_id, newDeckAvatarId);
+
+  const metadataChanges = await syncJson(
+    ctx,
+    "GET",
+    `/v1/sync/changes?sinceRevision=${baseline.serverRevision}`,
+    ctx.syncToken,
+    undefined,
+    userId,
+  );
+  assert.equal(metadataChanges.assignments.length, 1);
+  assert.equal(metadataChanges.assignments[0].title, "Renamed metadata deck");
+  assert.equal(metadataChanges.assignments[0].language_code, "es");
+  assert.equal(metadataChanges.assignments[0].avatar_system_name, "sparkles");
+  assert.equal(metadataChanges.assignments[0].avatar_media_id, newDeckAvatarId);
+
+  await adminJson(ctx, "PUT", `/v1/admin/decks/${deck.deck.id}`, {}, 400);
+  await adminJson(ctx, "PUT", `/v1/admin/decks/${deck.deck.id}`, { avatarMediaId: "not-a-uuid" }, 400);
+  await adminJson(ctx, "PUT", `/v1/admin/decks/${randomUUID()}`, { title: "Missing deck" }, 404);
+});
+
+test("admin can delete draft cards and examples with dependent content", async (t) => {
+  const ctx = await createTestApp(t);
+  if (!ctx) return;
+
+  const learner = await createUser(ctx, "Delete Learner");
+  const deck = await adminJson(ctx, "POST", "/v1/admin/decks", {
+    title: "Delete editing deck",
+    languageCode: "en",
+  }, 201);
+  const version = await adminJson(ctx, "POST", `/v1/admin/decks/${deck.deck.id}/versions`, {
+    manifest: {},
+  }, 201);
+  const keptCardId = randomUUID();
+  const deletedCardId = randomUUID();
+  const deletedExampleId = randomUUID();
+  const cascadingExampleId = randomUUID();
+
+  await adminJson(ctx, "PUT", `/v1/admin/decks/${deck.deck.id}/versions/${version.version.id}/cards/${keptCardId}`, {
+    lemma: "keep",
+    displayWord: "keep",
+    translation: "оставить",
+    sortOrder: 1,
+  });
+  await adminJson(ctx, "PUT", `/v1/admin/decks/${deck.deck.id}/versions/${version.version.id}/cards/${deletedCardId}`, {
+    lemma: "remove",
+    displayWord: "remove",
+    translation: "удалить",
+    sortOrder: 2,
+  });
+  await adminJson(
+    ctx,
+    "PUT",
+    `/v1/admin/decks/${deck.deck.id}/versions/${version.version.id}/cards/${keptCardId}/examples/${deletedExampleId}`,
+    {
+      template: "I will {{blank}} this example.",
+      answer: "keep",
+      translation: "Я оставлю этот пример.",
+    },
+  );
+  await adminJson(
+    ctx,
+    "PUT",
+    `/v1/admin/decks/${deck.deck.id}/versions/${version.version.id}/cards/${deletedCardId}/examples/${cascadingExampleId}`,
+    {
+      template: "Please {{blank}} this card.",
+      answer: "remove",
+      translation: "Пожалуйста, удали эту карточку.",
+    },
+  );
+  await adminJson(ctx, "PUT", `/v1/admin/decks/${deck.deck.id}/versions/${version.version.id}/cards/${deletedCardId}/forms`, {
+    forms: [{ formKey: "base", text: "remove" }],
+  });
+  await adminJson(
+    ctx,
+    "PUT",
+    `/v1/admin/decks/${deck.deck.id}/versions/${version.version.id}/examples/${deletedExampleId}/distractors`,
+    {
+      distractors: [{ text: "discard", priority: 1 }],
+    },
+  );
+  await adminJson(
+    ctx,
+    "PUT",
+    `/v1/admin/decks/${deck.deck.id}/versions/${version.version.id}/examples/${cascadingExampleId}/distractors`,
+    {
+      distractors: [{ text: "retain", priority: 1 }],
+    },
+  );
+
+  const deletedExample = await adminJson(
+    ctx,
+    "DELETE",
+    `/v1/admin/decks/${deck.deck.id}/versions/${version.version.id}/examples/${deletedExampleId}`,
+  );
+  assert.equal(deletedExample.deletedExampleId, deletedExampleId);
+
+  const afterExampleDelete = await adminJson(ctx, "GET", `/v1/admin/decks/${deck.deck.id}/versions/${version.version.id}`);
+  assert.equal(afterExampleDelete.cards.length, 2);
+  assert.equal(afterExampleDelete.examples.length, 1);
+  assert.equal(afterExampleDelete.examples[0].example_id, cascadingExampleId);
+  assert.equal(afterExampleDelete.distractors.length, 1);
+  assert.equal(afterExampleDelete.distractors[0].example_id, cascadingExampleId);
+
+  const deletedCard = await adminJson(
+    ctx,
+    "DELETE",
+    `/v1/admin/decks/${deck.deck.id}/versions/${version.version.id}/cards/${deletedCardId}`,
+  );
+  assert.equal(deletedCard.deletedCardId, deletedCardId);
+
+  const afterCardDelete = await adminJson(ctx, "GET", `/v1/admin/decks/${deck.deck.id}/versions/${version.version.id}`);
+  assert.deepEqual(afterCardDelete.cards.map((card: any) => card.card_id), [keptCardId]);
+  assert.deepEqual(afterCardDelete.examples, []);
+  assert.deepEqual(afterCardDelete.forms, []);
+  assert.deepEqual(afterCardDelete.distractors, []);
+
+  await adminJson(ctx, "DELETE", `/v1/admin/decks/${deck.deck.id}/versions/${version.version.id}/cards/${deletedCardId}`, undefined, 404);
+  await adminJson(ctx, "DELETE", `/v1/admin/decks/${deck.deck.id}/versions/${version.version.id}/examples/${deletedExampleId}`, undefined, 404);
+
+  await adminJson(ctx, "POST", `/v1/admin/decks/${deck.deck.id}/publish`, {
+    versionId: version.version.id,
+  });
+  await adminJson(ctx, "POST", `/v1/admin/decks/${deck.deck.id}/assignments`, {
+    userId: learner.userId,
+  }, 201);
+
+  await adminJson(ctx, "DELETE", `/v1/admin/decks/${deck.deck.id}/versions/${version.version.id}/cards/${keptCardId}`, undefined, 400);
+  const bootstrap = await syncJson(ctx, "GET", "/v1/bootstrap", learner.token, undefined, learner.userId);
+  assert.equal(bootstrap.content.cards.length, 1);
+  assert.equal(bootstrap.content.cards[0].card_id, keptCardId);
+  assert.deepEqual(bootstrap.content.examples, []);
+});
+
+test("admin can remove a published card by publishing a new draft version without it", async (t) => {
+  const ctx = await createTestApp(t);
+  if (!ctx) return;
+
+  const learner = await createUser(ctx, "Version Delete Learner");
+  const deck = await createPublishedDeck(ctx, learner.userId, "Versioned delete deck");
+  const keptCardId = deck.cardIds[0];
+  const removedCardId = deck.cardIds[1];
+
+  const baseline = await syncJson(ctx, "GET", "/v1/bootstrap", learner.token, undefined, learner.userId);
+  assert.equal(baseline.assignments[0].version_number, 1);
+  assert.deepEqual(
+    baseline.content.cards.map((card: any) => card.card_id).sort(),
+    [keptCardId, removedCardId].sort(),
+  );
+
+  await adminJson(
+    ctx,
+    "DELETE",
+    `/v1/admin/decks/${deck.deckId}/versions/${deck.versionId}/cards/${removedCardId}`,
+    undefined,
+    400,
+  );
+
+  const nextVersion = await adminJson(ctx, "POST", `/v1/admin/decks/${deck.deckId}/versions`, {
+    manifest: { source: "delete-card-refresh" },
+  }, 201);
+  const nextVersionId = nextVersion.version.id;
+  await adminJson(ctx, "PUT", `/v1/admin/decks/${deck.deckId}/versions/${nextVersionId}/cards/${keptCardId}`, {
+    status: "active",
+    lemma: "pedir",
+    displayWord: "pido",
+    partOfSpeech: "verb",
+    translation: "I order",
+    shortDefinition: "First-person cafe ordering phrase.",
+    sortOrder: 1,
+  });
+  await adminJson(
+    ctx,
+    "PUT",
+    `/v1/admin/decks/${deck.deckId}/versions/${nextVersionId}/cards/${keptCardId}/examples/${randomUUID()}`,
+    {
+      template: "Yo {{blank}} agua.",
+      answer: "pido",
+      translation: "I order water.",
+      sortOrder: 1,
+    },
+  );
+  const published = await adminJson(ctx, "POST", `/v1/admin/decks/${deck.deckId}/publish`, {
+    versionId: nextVersionId,
+  });
+  assert.equal(published.version.version_number, 2);
+  assert.equal(published.deck.current_version_id, nextVersionId);
+
+  const changes = await syncJson(
+    ctx,
+    "GET",
+    `/v1/sync/changes?sinceRevision=${baseline.serverRevision}`,
+    learner.token,
+    undefined,
+    learner.userId,
+  );
+  assert.equal(changes.assignments.length, 1);
+  assert.equal(changes.assignments[0].version_number, 2);
+  assert.equal(changes.content.cards.length, 1);
+  assert.equal(changes.content.cards[0].deck_version_id, nextVersionId);
+  assert.equal(changes.content.cards[0].card_id, keptCardId);
+  assert.notEqual(changes.content.cards[0].card_id, removedCardId);
+  assert.equal(changes.content.examples.length, 1);
+  assert.equal(changes.content.examples[0].card_id, keptCardId);
+
+  const refreshed = await syncJson(ctx, "GET", "/v1/bootstrap", learner.token, undefined, learner.userId);
+  assert.equal(refreshed.assignments[0].version_number, 2);
+  assert.deepEqual(refreshed.content.cards.map((card: any) => card.card_id), [keptCardId]);
+});
+
+test("admin can edit published card content through a new version while preserving card progress", async (t) => {
+  const ctx = await createTestApp(t);
+  if (!ctx) return;
+
+  const learner = await createUser(ctx, "Version Edit Learner");
+  const deck = await createPublishedDeck(ctx, learner.userId, "Versioned edit deck");
+  const editedCardId = deck.cardIds[0];
+  const staleExampleId = deck.exampleIds[0];
+
+  await syncJson(ctx, "POST", "/v1/sync/events", learner.token, {
+    progress: [
+      progressEvent(deck, {
+        cardId: editedCardId,
+        fsrsData: { state: "review", reps: 4, due: "2026-06-05T09:30:00.000Z" },
+        dueAt: "2026-06-05T09:30:00.000Z",
+        state: "review",
+      }),
+    ],
+  }, learner.userId);
+
+  const baseline = await syncJson(ctx, "GET", "/v1/bootstrap", learner.token, undefined, learner.userId);
+  assert.equal(baseline.content.cards.find((card: any) => card.card_id === editedCardId).display_word, "pido");
+  assert.equal(baseline.progress.find((progress: any) => progress.card_id === editedCardId).state, "review");
+
+  await adminJson(
+    ctx,
+    "PUT",
+    `/v1/admin/decks/${deck.deckId}/versions/${deck.versionId}/cards/${editedCardId}`,
+    {
+      lemma: "pedir",
+      displayWord: "direct edit blocked",
+      translation: "blocked",
+    },
+    400,
+  );
+  await adminJson(
+    ctx,
+    "DELETE",
+    `/v1/admin/decks/${deck.deckId}/versions/${deck.versionId}/examples/${staleExampleId}`,
+    undefined,
+    400,
+  );
+
+  const nextVersion = await adminJson(ctx, "POST", `/v1/admin/decks/${deck.deckId}/versions`, {
+    manifest: { source: "edit-card-refresh" },
+  }, 201);
+  const nextVersionId = nextVersion.version.id;
+  const newExampleId = randomUUID();
+  await adminJson(ctx, "PUT", `/v1/admin/decks/${deck.deckId}/versions/${nextVersionId}/cards/${editedCardId}`, {
+    status: "active",
+    lemma: "pedir",
+    displayWord: "pido actualizado",
+    partOfSpeech: "verb",
+    translation: "I order, updated",
+    shortDefinition: "Updated first-person ordering phrase.",
+    sortOrder: 1,
+  });
+  await adminJson(
+    ctx,
+    "PUT",
+    `/v1/admin/decks/${deck.deckId}/versions/${nextVersionId}/cards/${editedCardId}/examples/${newExampleId}`,
+    {
+      template: "Yo {{blank}} una limonada.",
+      answer: "pido",
+      translation: "I order a lemonade.",
+      sortOrder: 1,
+    },
+  );
+  await adminJson(ctx, "POST", `/v1/admin/decks/${deck.deckId}/publish`, {
+    versionId: nextVersionId,
+  });
+
+  const changes = await syncJson(
+    ctx,
+    "GET",
+    `/v1/sync/changes?sinceRevision=${baseline.serverRevision}`,
+    learner.token,
+    undefined,
+    learner.userId,
+  );
+  assert.equal(changes.assignments[0].version_number, 2);
+  assert.equal(changes.content.cards.length, 1);
+  assert.equal(changes.content.cards[0].card_id, editedCardId);
+  assert.equal(changes.content.cards[0].display_word, "pido actualizado");
+  assert.deepEqual(changes.content.examples.map((example: any) => example.example_id), [newExampleId]);
+  assert.ok(!changes.content.examples.some((example: any) => example.example_id === staleExampleId));
+  assert.deepEqual(changes.content.forms, []);
+  assert.deepEqual(changes.content.distractors, []);
+
+  const refreshed = await syncJson(ctx, "GET", "/v1/bootstrap", learner.token, undefined, learner.userId);
+  assert.equal(refreshed.content.cards[0].card_id, editedCardId);
+  assert.equal(refreshed.content.cards[0].display_word, "pido actualizado");
+  assert.equal(refreshed.progress.find((progress: any) => progress.card_id === editedCardId).state, "review");
+
+  const progressUpdate = await syncJson(ctx, "POST", "/v1/sync/events", learner.token, {
+    progress: [
+      progressEvent(deck, {
+        cardId: editedCardId,
+        fsrsData: { state: "review", reps: 5, due: "2026-06-06T09:30:00.000Z" },
+        dueAt: "2026-06-06T09:30:00.000Z",
+        state: "review",
+      }),
+    ],
+  }, learner.userId);
+  assert.deepEqual(progressUpdate.progressCardIds, [editedCardId]);
+});
+
+test("admin can hide and restore a deck through assignment status without deleting history", async (t) => {
+  const ctx = await createTestApp(t);
+  if (!ctx) return;
+
+  const learner = await createUser(ctx, "Archive Assignment Learner");
+  const deck = await createPublishedDeck(ctx, learner.userId, "Assignment archive deck");
+  await syncJson(ctx, "POST", "/v1/sync/events", learner.token, {
+    reviews: [reviewEvent(deck)],
+    progress: [progressEvent(deck)],
+  }, learner.userId);
+
+  const activeBootstrap = await syncJson(ctx, "GET", "/v1/bootstrap", learner.token, undefined, learner.userId);
+  assert.equal(activeBootstrap.assignments[0].assignment_status, "active");
+  assert.equal(activeBootstrap.content.cards.length, 2);
+  assert.deepEqual(activeBootstrap.reviews, []);
+  assert.equal(activeBootstrap.statsSummary.activityDays.length, 1);
+  assert.equal(activeBootstrap.progress.length, 1);
+
+  const archived = await adminJson(ctx, "POST", `/v1/admin/decks/${deck.deckId}/assignments`, {
+    userId: learner.userId,
+    status: "archived",
+  }, 201);
+  assert.equal(archived.assignment.status, "archived");
+
+  const archivedChanges = await syncJson(
+    ctx,
+    "GET",
+    `/v1/sync/changes?sinceRevision=${activeBootstrap.serverRevision}`,
+    learner.token,
+    undefined,
+    learner.userId,
+  );
+  assert.equal(archivedChanges.assignments.length, 1);
+  assert.equal(archivedChanges.assignments[0].assignment_status, "archived");
+  assert.deepEqual(archivedChanges.content.cards, []);
+
+  const archivedBootstrap = await syncJson(ctx, "GET", "/v1/bootstrap", learner.token, undefined, learner.userId);
+  assert.equal(archivedBootstrap.assignments[0].assignment_status, "archived");
+  assert.deepEqual(archivedBootstrap.content.cards, []);
+  assert.deepEqual(archivedBootstrap.reviews, []);
+  assert.equal(archivedBootstrap.statsSummary.activityDays.length, 1);
+  assert.equal(archivedBootstrap.progress.length, 1);
+
+  await syncJson(ctx, "POST", "/v1/sync/events", learner.token, {
+    progress: [progressEvent(deck)],
+  }, learner.userId, 400);
+
+  const restored = await adminJson(ctx, "POST", `/v1/admin/decks/${deck.deckId}/assignments`, {
+    userId: learner.userId,
+    status: "active",
+  }, 201);
+  assert.equal(restored.assignment.status, "active");
+
+  const restoredBootstrap = await syncJson(ctx, "GET", "/v1/bootstrap", learner.token, undefined, learner.userId);
+  assert.equal(restoredBootstrap.assignments[0].assignment_status, "active");
+  assert.equal(restoredBootstrap.content.cards.length, 2);
+  assert.deepEqual(restoredBootstrap.reviews, []);
+  assert.equal(restoredBootstrap.statsSummary.activityDays.length, 1);
+  assert.equal(restoredBootstrap.progress.length, 1);
+});
+
+test("learner deck preference syncs across devices without changing assignment", async (t) => {
+  const ctx = await createTestApp(t);
+  if (!ctx) return;
+
+  const learner = await createUser(ctx, "Deck Preference Learner");
+  const deck = await createPublishedDeck(ctx, learner.userId, "Preference deck");
+
+  const firstDeviceBootstrap = await syncJson(ctx, "GET", "/v1/bootstrap", learner.token, undefined, learner.userId);
+  assert.equal(firstDeviceBootstrap.assignments[0].assignment_status, "active");
+  assert.equal(firstDeviceBootstrap.assignments[0].user_enabled, true);
+  assert.equal(firstDeviceBootstrap.content.cards.length, 2);
+
+  const disabled = await syncJson(ctx, "POST", "/v1/sync/events", learner.token, {
+    deckPreferences: [
+      {
+        deckId: deck.deckId,
+        isEnabled: false,
+        updatedAt: "2026-06-02T12:00:00.000Z",
+      },
+    ],
+  }, learner.userId);
+  assert.deepEqual(disabled.deckPreferenceDeckIds, [deck.deckId]);
+
+  const secondDeviceBootstrap = await syncJson(ctx, "GET", "/v1/bootstrap", learner.token, undefined, learner.userId);
+  assert.equal(secondDeviceBootstrap.assignments[0].assignment_status, "active");
+  assert.equal(secondDeviceBootstrap.assignments[0].user_enabled, false);
+  assert.equal(secondDeviceBootstrap.content.cards.length, 2);
+
+  const changes = await syncJson(
+    ctx,
+    "GET",
+    `/v1/sync/changes?sinceRevision=${firstDeviceBootstrap.serverRevision}`,
+    learner.token,
+    undefined,
+    learner.userId,
+  );
+  assert.equal(changes.assignments.length, 1);
+  assert.equal(changes.assignments[0].assignment_status, "active");
+  assert.equal(changes.assignments[0].user_enabled, false);
+  assert.deepEqual(changes.content.cards, []);
+
+  const enabled = await syncJson(ctx, "POST", "/v1/sync/events", learner.token, {
+    deckPreferences: [
+      {
+        deckId: deck.deckId,
+        isEnabled: true,
+        updatedAt: "2026-06-02T13:00:00.000Z",
+      },
+    ],
+  }, learner.userId);
+  assert.deepEqual(enabled.deckPreferenceDeckIds, [deck.deckId]);
+
+  const restored = await syncJson(ctx, "GET", "/v1/bootstrap", learner.token, undefined, learner.userId);
+  assert.equal(restored.assignments[0].assignment_status, "active");
+  assert.equal(restored.assignments[0].user_enabled, true);
 });
 
 test("admin can manage study groups and member roles", async (t) => {
@@ -526,6 +1370,108 @@ test("admin can manage study groups and member roles", async (t) => {
   const deleted = await adminJson(ctx, "DELETE", `/v1/admin/groups/${group.group.id}/members/${child.userId}`);
   assert.equal(deleted.deletedMember.user_id, child.userId);
   await adminJson(ctx, "DELETE", `/v1/admin/groups/${group.group.id}/members/${child.userId}`, undefined, 404);
+});
+
+test("admin can clone assignments, create a test learner, inspect state, and reset study data", async (t) => {
+  const ctx = await createTestApp(t);
+  if (!ctx) return;
+
+  const child = await createUser(ctx, "Child Workflow Learner");
+  const deck = await createPublishedDeck(ctx, child.userId, "Workflow deck");
+  const manualTarget = await createUser(ctx, "Manual Sandbox");
+
+  const cloned = await adminJson(ctx, "POST", `/v1/admin/users/${manualTarget.userId}/clone-assignments`, {
+    sourceUserId: child.userId,
+  }, 201);
+  assert.equal(cloned.assignments.length, 1);
+  assert.equal(cloned.assignments[0].user_id, manualTarget.userId);
+  assert.equal(cloned.assignments[0].deck_id, deck.deckId);
+  assert.equal(cloned.assignments[0].status, "active");
+
+  const manualBootstrap = await syncJson(ctx, "GET", "/v1/bootstrap", manualTarget.token, undefined, manualTarget.userId);
+  assert.equal(manualBootstrap.assignments.length, 1);
+  assert.equal(manualBootstrap.assignments[0].deck_id, deck.deckId);
+  assert.deepEqual(manualBootstrap.progress, []);
+  assert.deepEqual(manualBootstrap.reviews, []);
+  assert.deepEqual(manualBootstrap.matchingRecords, []);
+
+  const testLearner = await adminJson(ctx, "POST", `/v1/admin/users/${child.userId}/test-learner`, {
+    displayName: "Child Workflow Sandbox",
+  }, 201);
+  assert.equal(testLearner.user.display_name, "Child Workflow Sandbox");
+  assert.equal(testLearner.user.role, "learner");
+  assert.notEqual(testLearner.user.id, child.userId);
+  assert.equal(testLearner.assignments.length, 1);
+  assert.equal(testLearner.assignments[0].deck_id, deck.deckId);
+
+  const eventsPayload = {
+    reviews: [reviewEvent(deck)],
+    progress: [progressEvent(deck)],
+    matchingRecords: [matchingRecord(deck)],
+  };
+  const syncResult = await syncJson(
+    ctx,
+    "POST",
+    "/v1/sync/events",
+    ctx.syncToken,
+    eventsPayload,
+    testLearner.user.id,
+  );
+  assert.equal(syncResult.acceptedReviewIds.length, 1);
+  assert.deepEqual(syncResult.progressCardIds, [deck.cardIds[0]]);
+  assert.deepEqual(syncResult.matchingRecordDeckIds, [deck.deckId]);
+
+  const detail = await adminJson(ctx, "GET", `/v1/admin/users/${testLearner.user.id}`);
+  assert.equal(detail.assignments.length, 1);
+  assert.equal(Number(detail.stats.assignment_count), 1);
+  assert.equal(Number(detail.stats.active_assignment_count), 1);
+  assert.equal(Number(detail.stats.review_count), 1);
+  assert.equal(Number(detail.stats.progress_count), 1);
+  assert.equal(Number(detail.stats.matching_record_count), 1);
+
+  const dryRun = await adminJson(ctx, "POST", `/v1/admin/users/${testLearner.user.id}/reset-study-data`, {
+    deckId: deck.deckId,
+    dryRun: true,
+  });
+  assert.equal(dryRun.dryRun, true);
+  assert.deepEqual(dryRun.deleted, {
+    reviews: 1,
+    progress: 1,
+    matchingRecords: 1,
+  });
+
+  const detailAfterDryRun = await adminJson(ctx, "GET", `/v1/admin/users/${testLearner.user.id}`);
+  assert.equal(Number(detailAfterDryRun.stats.review_count), 1);
+  assert.equal(Number(detailAfterDryRun.stats.progress_count), 1);
+  assert.equal(Number(detailAfterDryRun.stats.matching_record_count), 1);
+
+  const reset = await adminJson(ctx, "POST", `/v1/admin/users/${testLearner.user.id}/reset-study-data`, {
+    deckId: deck.deckId,
+  });
+  assert.equal(reset.dryRun, false);
+  assert.deepEqual(reset.deleted, {
+    reviews: 1,
+    progress: 1,
+    matchingRecords: 1,
+  });
+
+  const detailAfterReset = await adminJson(ctx, "GET", `/v1/admin/users/${testLearner.user.id}`);
+  assert.equal(Number(detailAfterReset.stats.review_count), 0);
+  assert.equal(Number(detailAfterReset.stats.progress_count), 0);
+  assert.equal(Number(detailAfterReset.stats.matching_record_count), 0);
+  assert.equal(detailAfterReset.assignments.length, 1);
+
+  const bootstrapAfterReset = await syncJson(ctx, "GET", "/v1/bootstrap", ctx.syncToken, undefined, testLearner.user.id);
+  assert.equal(bootstrapAfterReset.assignments.length, 1);
+  assert.deepEqual(bootstrapAfterReset.progress, []);
+  assert.deepEqual(bootstrapAfterReset.reviews, []);
+  assert.deepEqual(bootstrapAfterReset.matchingRecords, []);
+
+  const childDetail = await adminJson(ctx, "GET", `/v1/admin/users/${child.userId}`);
+  assert.equal(Number(childDetail.stats.assignment_count), 1);
+  assert.equal(Number(childDetail.stats.review_count), 0);
+  assert.equal(Number(childDetail.stats.progress_count), 0);
+  assert.equal(Number(childDetail.stats.matching_record_count), 0);
 });
 
 test("admin endpoints reject invalid roles, ids, and missing parent records", async (t) => {
@@ -690,10 +1636,18 @@ test("mobile sync supports user switching, idempotent reviews, progress updates,
   const bootstrapAfterSync = await syncJson(ctx, "GET", "/v1/bootstrap", child.token, undefined, child.userId);
   assert.equal(bootstrapAfterSync.progress.length, 1);
   assert.equal(bootstrapAfterSync.progress[0].card_id, deck.cardIds[0]);
-  assert.equal(bootstrapAfterSync.reviews.length, 1);
-  assert.equal(bootstrapAfterSync.reviews[0].client_event_id, clientEventId);
+  assert.deepEqual(bootstrapAfterSync.reviews, []);
   assert.equal(bootstrapAfterSync.matchingRecords.length, 1);
   assert.equal(bootstrapAfterSync.matchingRecords[0].deck_id, deck.deckId);
+  assert.equal(bootstrapAfterSync.dailyUsage.length, 1);
+  assert.equal(bootstrapAfterSync.dailyUsage[0].deck_id, deck.deckId);
+  assert.equal(bootstrapAfterSync.dailyUsage[0].day_key, "2026-06-01");
+  assert.equal(bootstrapAfterSync.dailyUsage[0].new_cards_studied, 1);
+  assert.equal(bootstrapAfterSync.statsSummary.activityDays.length, 1);
+  assert.equal(bootstrapAfterSync.statsSummary.activityDays[0].day_key, "2026-06-01");
+  assert.equal(bootstrapAfterSync.statsSummary.activityDays[0].reviewed_count, 1);
+  assert.equal(bootstrapAfterSync.statsSummary.activityDays[0].passed_count, 1);
+  assert.deepEqual(bootstrapAfterSync.statsSummary.weakCards, []);
 
   const changes = await syncJson(
     ctx,
@@ -1092,6 +2046,111 @@ test("sync rejects reviews, progress, and matching records for unassigned target
   assert.equal(Number(persistedStats.rows[0].review_count), 0);
   assert.equal(Number(persistedStats.rows[0].progress_count), 0);
   assert.equal(Number(persistedStats.rows[0].matching_count), 0);
+});
+
+test("sync target validation rejects a mixed batch atomically", async (t) => {
+  const ctx = await createTestApp(t);
+  if (!ctx) return;
+
+  const learner = await createUser(ctx, "Atomic Validation Learner");
+  const deck = await createPublishedDeck(ctx, learner.userId, "Atomic validation deck");
+  const invalidCardId = randomUUID();
+
+  await syncJson(ctx, "POST", "/v1/sync/events", learner.token, {
+    reviews: [
+      reviewEvent(deck, {
+        clientEventId: randomUUID(),
+        cardId: deck.cardIds[0],
+      }),
+      reviewEvent(deck, {
+        clientEventId: randomUUID(),
+        cardId: deck.cardIds[1],
+      }),
+    ],
+    progress: [
+      progressEvent(deck, {
+        cardId: deck.cardIds[0],
+        updatedAt: "2026-06-02T10:00:00.000Z",
+      }),
+      progressEvent(deck, {
+        cardId: invalidCardId,
+        updatedAt: "2026-06-02T10:01:00.000Z",
+      }),
+    ],
+    matchingRecords: [matchingRecord(deck)],
+    deckPreferences: [
+      {
+        deckId: deck.deckId,
+        isEnabled: false,
+        updatedAt: "2026-06-02T10:02:00.000Z",
+      },
+    ],
+  }, learner.userId, 400);
+
+  const persistedStats = await ctx.pool.query(
+    `
+    SELECT
+      (SELECT COUNT(*) FROM study_reviews WHERE user_id = $1) AS review_count,
+      (SELECT COUNT(*) FROM card_progress WHERE user_id = $1) AS progress_count,
+      (SELECT COUNT(*) FROM deck_matching_records WHERE user_id = $1) AS matching_count,
+      (SELECT COUNT(*) FROM user_deck_preferences WHERE user_id = $1) AS preference_count
+    `,
+    [learner.userId],
+  );
+  assert.equal(Number(persistedStats.rows[0].review_count), 0);
+  assert.equal(Number(persistedStats.rows[0].progress_count), 0);
+  assert.equal(Number(persistedStats.rows[0].matching_count), 0);
+  assert.equal(Number(persistedStats.rows[0].preference_count), 0);
+});
+
+test("sync ignores stale progress updates for the same user and card", async (t) => {
+  const ctx = await createTestApp(t);
+  if (!ctx) return;
+
+  const learner = await createUser(ctx, "Stale Progress Learner");
+  const deck = await createPublishedDeck(ctx, learner.userId, "Stale progress deck");
+
+  const first = await syncJson(ctx, "POST", "/v1/sync/events", learner.token, {
+    progress: [
+      progressEvent(deck, {
+        fsrsData: { state: "review", reps: 2, due: "2026-06-07T09:30:00.000Z" },
+        dueAt: "2026-06-07T09:30:00.000Z",
+        state: "review",
+        updatedAt: "2026-06-02T09:30:01.000Z",
+      }),
+    ],
+  }, learner.userId);
+  assert.deepEqual(first.progressCardIds, [deck.cardIds[0]]);
+
+  const stale = await syncJson(ctx, "POST", "/v1/sync/events", learner.token, {
+    progress: [
+      progressEvent(deck, {
+        fsrsData: { state: "review", reps: 1, due: "2026-06-03T09:30:00.000Z" },
+        dueAt: "2026-06-03T09:30:00.000Z",
+        state: "review",
+        updatedAt: "2026-06-01T09:30:01.000Z",
+      }),
+    ],
+  }, learner.userId);
+  assert.deepEqual(stale.progressCardIds, []);
+  assert.equal(stale.serverRevision, first.serverRevision);
+
+  const progress = await ctx.pool.query(
+    `
+    SELECT fsrs_data, due_at, updated_at
+    FROM card_progress
+    WHERE user_id = $1 AND card_id = $2
+    `,
+    [learner.userId, deck.cardIds[0]],
+  );
+  assert.equal(progress.rowCount, 1);
+  assert.equal(progress.rows[0].fsrs_data.reps, 2);
+  assert.equal(progress.rows[0].due_at.toISOString(), "2026-06-07T09:30:00.000Z");
+  assert.equal(progress.rows[0].updated_at.toISOString(), "2026-06-02T09:30:01.000Z");
+
+  const bootstrap = await syncJson(ctx, "GET", "/v1/bootstrap", learner.token, undefined, learner.userId);
+  assert.equal(bootstrap.progress.length, 1);
+  assert.equal(bootstrap.progress[0].fsrs_data.reps, 2);
 });
 
 test("sync accepts iOS study mode names and stores canonical review modes", async (t) => {

@@ -1,10 +1,9 @@
 import pg from "pg";
-import { loadConfig } from "./config.js";
+import { loadConfig, type AppConfig } from "./config.js";
 
 const { Pool } = pg;
 
-export function createPool(): pg.Pool {
-  const config = loadConfig();
+export function createPool(config: Pick<AppConfig, "databaseUrl"> = loadConfig()): pg.Pool {
   return new Pool({
     connectionString: config.databaseUrl,
     max: 10,

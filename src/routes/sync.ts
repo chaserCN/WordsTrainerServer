@@ -1,6 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import type pg from "pg";
 import { requireHouseholdSync, selectedUserHeader } from "../auth.js";
+import type { AppConfig } from "../config.js";
 import {
   badRequest,
   optionalNumber,
@@ -15,6 +16,9 @@ type Queryable = Pick<pg.Pool, "query">;
 type ChangesQuery = {
   sinceRevision?: string;
 };
+
+const cachedDeckVersionIdsHeader = "x-flashgame-cached-deck-version-ids";
+const clientTimeZoneHeader = "x-flashgame-time-zone";
 
 type UserRow = {
   id: string;
@@ -54,6 +58,12 @@ type MatchingRecordInput = {
   bestDurationSeconds: number;
   pairCount: number;
   achievedAt: string;
+};
+
+type DeckPreferenceInput = {
+  deckId: string;
+  isEnabled: boolean;
+  updatedAt: string | null;
 };
 
 function studyMode(value: unknown, field: string): string {
@@ -118,7 +128,7 @@ async function assignedDeckRows(
   sinceRevision?: string,
 ): Promise<pg.QueryResult["rows"]> {
   const revisionFilter = sinceRevision
-    ? "AND (deck_assignments.server_revision > $2 OR deck_versions.server_revision > $2)"
+    ? "AND (deck_assignments.server_revision > $2 OR deck_versions.server_revision > $2 OR user_deck_preferences.server_revision > $2)"
     : "";
   const params = sinceRevision ? [userId, sinceRevision] : [userId];
   const result = await pool.query(
@@ -137,10 +147,16 @@ async function assignedDeckRows(
            deck_versions.status AS version_status,
            deck_versions.manifest,
            deck_versions.server_revision AS version_revision,
-           deck_versions.published_at
+           deck_versions.published_at,
+           COALESCE(user_deck_preferences.is_enabled, true) AS user_enabled,
+           user_deck_preferences.updated_at AS preference_updated_at,
+           user_deck_preferences.server_revision AS preference_revision
     FROM deck_assignments
     JOIN decks ON decks.id = deck_assignments.deck_id
     LEFT JOIN deck_versions ON deck_versions.id = COALESCE(deck_assignments.deck_version_id, decks.current_version_id)
+    LEFT JOIN user_deck_preferences
+      ON user_deck_preferences.user_id = deck_assignments.user_id
+      AND user_deck_preferences.deck_id = deck_assignments.deck_id
     WHERE deck_assignments.user_id = $1
       ${revisionFilter}
     ORDER BY decks.title
@@ -154,16 +170,24 @@ async function assignedContentRows(
   pool: pg.Pool,
   userId: string,
   sinceRevision?: string,
+  cachedDeckVersionIds: string[] = [],
 ): Promise<{
   cards: pg.QueryResult["rows"];
   examples: pg.QueryResult["rows"];
   forms: pg.QueryResult["rows"];
   distractors: pg.QueryResult["rows"];
 }> {
-  const revisionFilter = sinceRevision
-    ? "AND (deck_assignments.server_revision > $2 OR deck_versions.server_revision > $2)"
-    : "";
-  const params = sinceRevision ? [userId, sinceRevision] : [userId];
+  const filters: string[] = [];
+  const params: unknown[] = [userId];
+  if (sinceRevision) {
+    params.push(sinceRevision);
+    filters.push(`AND (deck_assignments.server_revision > $${params.length} OR deck_versions.server_revision > $${params.length})`);
+  }
+  if (cachedDeckVersionIds.length) {
+    params.push(cachedDeckVersionIds);
+    filters.push(`AND NOT (deck_versions.id = ANY($${params.length}::uuid[]))`);
+  }
+  const contentFilters = filters.join("\n        ");
   const assignedVersions = `
     WITH assigned_versions AS (
       SELECT deck_versions.id
@@ -173,7 +197,7 @@ async function assignedContentRows(
       WHERE deck_assignments.user_id = $1
         AND deck_assignments.status = 'active'
         AND deck_versions.status = 'published'
-        ${revisionFilter}
+        ${contentFilters}
     )
   `;
   const [cards, examples, forms, distractors] = await Promise.all([
@@ -226,6 +250,75 @@ async function assignedContentRows(
   };
 }
 
+async function dailyUsageRows(pool: pg.Pool, userId: string, timeZone: string): Promise<pg.QueryResult["rows"]> {
+  const result = await pool.query(
+    `
+    SELECT
+      study_reviews.deck_id,
+      to_char(study_reviews.reviewed_at AT TIME ZONE $2, 'YYYY-MM-DD') AS day_key,
+      COUNT(*)::int AS new_cards_studied
+    FROM study_reviews
+    JOIN deck_assignments ON deck_assignments.user_id = study_reviews.user_id
+      AND deck_assignments.deck_id = study_reviews.deck_id
+      AND deck_assignments.status = 'active'
+    WHERE study_reviews.user_id = $1
+      AND study_reviews.was_new = true
+      AND study_reviews.outcome IN ('remembered', 'correct')
+    GROUP BY study_reviews.deck_id, day_key
+    ORDER BY day_key, study_reviews.deck_id
+    `,
+    [userId, timeZone],
+  );
+  return result.rows;
+}
+
+async function statsSummaryRows(pool: pg.Pool, userId: string, timeZone: string): Promise<{
+  activityDays: pg.QueryResult["rows"];
+  weakCards: pg.QueryResult["rows"];
+}> {
+  const [activityDays, weakCards] = await Promise.all([
+    pool.query(
+      `
+      SELECT
+        to_char(study_reviews.reviewed_at AT TIME ZONE $2, 'YYYY-MM-DD') AS day_key,
+        COUNT(*)::int AS reviewed_count,
+        COUNT(*) FILTER (WHERE study_reviews.outcome IN ('remembered', 'correct'))::int AS passed_count
+      FROM study_reviews
+      WHERE study_reviews.user_id = $1
+      GROUP BY day_key
+      ORDER BY day_key
+      `,
+      [userId, timeZone],
+    ),
+    pool.query(
+      `
+      SELECT
+        study_reviews.card_id,
+        study_reviews.deck_id,
+        COUNT(*) FILTER (WHERE study_reviews.outcome IN ('forgot', 'incorrect'))::int AS failed_count,
+        COUNT(*)::int AS reviewed_count,
+        MAX(study_reviews.reviewed_at) FILTER (WHERE study_reviews.outcome IN ('forgot', 'incorrect')) AS last_failed_at
+      FROM study_reviews
+      JOIN deck_assignments ON deck_assignments.user_id = study_reviews.user_id
+        AND deck_assignments.deck_id = study_reviews.deck_id
+        AND deck_assignments.status = 'active'
+      WHERE study_reviews.user_id = $1
+      GROUP BY study_reviews.card_id, study_reviews.deck_id
+      HAVING COUNT(*) FILTER (WHERE study_reviews.outcome IN ('forgot', 'incorrect')) > 0
+      ORDER BY failed_count DESC,
+               (COUNT(*) FILTER (WHERE study_reviews.outcome IN ('forgot', 'incorrect'))::float / COUNT(*)::float) DESC,
+               last_failed_at DESC
+      LIMIT 100
+      `,
+      [userId],
+    ),
+  ]);
+  return {
+    activityDays: activityDays.rows,
+    weakCards: weakCards.rows,
+  };
+}
+
 function parseRevision(value: unknown): bigint {
   if (typeof value !== "string" || value.trim() === "") {
     return 0n;
@@ -237,12 +330,38 @@ function parseRevision(value: unknown): bigint {
   return BigInt(trimmed);
 }
 
+function cachedDeckVersionIds(request: { headers: Record<string, unknown> }): string[] {
+  const rawValue = request.headers[cachedDeckVersionIdsHeader];
+  if (rawValue == null || rawValue === "") {
+    return [];
+  }
+  const text = Array.isArray(rawValue) ? rawValue.join(",") : String(rawValue);
+  const ids = text
+    .split(",")
+    .map((value) => value.trim())
+    .filter((value) => value.length > 0);
+  return [...new Set(ids.map((id) => requiredUUID(id, "cachedDeckVersionIds")))];
+}
+
+function clientTimeZone(request: { headers: Record<string, unknown> }): string {
+  const rawValue = request.headers[clientTimeZoneHeader];
+  if (rawValue == null || rawValue === "") {
+    return "UTC";
+  }
+  const value = (Array.isArray(rawValue) ? rawValue[0] : String(rawValue)).trim();
+  if (!/^[A-Za-z0-9_+\-./]{1,64}$/.test(value)) {
+    badRequest("x-flashgame-time-zone must be a valid time zone name");
+  }
+  return value;
+}
+
 async function latestRevision(pool: pg.Pool): Promise<string> {
   const result = await pool.query<{ revision: string }>(
     `
     SELECT GREATEST(
       COALESCE((SELECT MAX(server_revision) FROM deck_versions), 0),
       COALESCE((SELECT MAX(server_revision) FROM deck_assignments), 0),
+      COALESCE((SELECT MAX(server_revision) FROM user_deck_preferences), 0),
       COALESCE((SELECT MAX(server_revision) FROM card_progress), 0),
       COALESCE((SELECT MAX(server_revision) FROM study_reviews), 0),
       COALESCE((SELECT MAX(server_revision) FROM deck_matching_records), 0)
@@ -382,103 +501,317 @@ function parseMatchingRecords(value: unknown): MatchingRecordInput[] {
   });
 }
 
-async function requireReviewTarget(
+function parseDeckPreferences(value: unknown): DeckPreferenceInput[] {
+  if (value == null) {
+    return [];
+  }
+  if (!Array.isArray(value)) {
+    badRequest("deckPreferences must be an array");
+  }
+  return value.map((item, index) => {
+    const preference = body(item);
+    const isEnabled = preference.isEnabled;
+    if (typeof isEnabled !== "boolean") {
+      badRequest(`deckPreferences[${index}].isEnabled must be a boolean`);
+    }
+    return {
+      deckId: requiredUUID(preference.deckId, `deckPreferences[${index}].deckId`),
+      isEnabled,
+      updatedAt: optionalTimestamp(preference.updatedAt, `deckPreferences[${index}].updatedAt`),
+    };
+  });
+}
+
+type ReviewTarget = {
+  deckId: string;
+  deckVersionId: string | null;
+  cardId: string;
+};
+
+type ProgressTarget = {
+  deckId: string;
+  cardId: string;
+};
+
+type MatchingTarget = {
+  deckId: string;
+  deckVersionId: string | null;
+};
+
+function nullableKey(value: string | null): string {
+  return value ?? "<effective>";
+}
+
+function reviewTargetKey(target: ReviewTarget): string {
+  return `${target.deckId}:${nullableKey(target.deckVersionId)}:${target.cardId}`;
+}
+
+function progressTargetKey(target: ProgressTarget): string {
+  return `${target.deckId}:${target.cardId}`;
+}
+
+function matchingTargetKey(target: MatchingTarget): string {
+  return `${target.deckId}:${nullableKey(target.deckVersionId)}`;
+}
+
+function uniqueByKey<T>(items: T[], key: (item: T) => string): T[] {
+  return [...new Map(items.map((item) => [key(item), item])).values()];
+}
+
+function reviewTargetRows(targets: ReviewTarget[]): Array<{ deck_id: string; deck_version_id: string | null; card_id: string }> {
+  return targets.map((target) => ({
+    deck_id: target.deckId,
+    deck_version_id: target.deckVersionId,
+    card_id: target.cardId,
+  }));
+}
+
+function progressTargetRows(targets: ProgressTarget[]): Array<{ deck_id: string; card_id: string }> {
+  return targets.map((target) => ({
+    deck_id: target.deckId,
+    card_id: target.cardId,
+  }));
+}
+
+function matchingTargetRows(targets: MatchingTarget[]): Array<{ deck_id: string; deck_version_id: string | null }> {
+  return targets.map((target) => ({
+    deck_id: target.deckId,
+    deck_version_id: target.deckVersionId,
+  }));
+}
+
+async function validateSyncTargets(
   client: Queryable,
   userId: string,
-  review: ReviewEventInput,
+  reviews: ReviewEventInput[],
+  progressItems: ProgressInput[],
+  matchingRecords: MatchingRecordInput[],
+  deckPreferences: DeckPreferenceInput[],
 ): Promise<void> {
-  const result = await client.query(
-    `
-    SELECT deck_versions.id
-    FROM deck_assignments
-    JOIN decks ON decks.id = deck_assignments.deck_id
-    JOIN deck_versions ON deck_versions.deck_id = decks.id
-    JOIN deck_version_cards ON deck_version_cards.deck_version_id = deck_versions.id
-    WHERE deck_assignments.user_id::text = $1
-      AND deck_assignments.deck_id::text = $2
-      AND deck_assignments.status = 'active'
-      AND deck_versions.status = 'published'
-      AND deck_version_cards.card_id::text = $3
-      AND (
-        ($4::text IS NOT NULL AND deck_versions.id::text = $4)
-        OR ($4::text IS NULL AND deck_versions.id = COALESCE(deck_assignments.deck_version_id, decks.current_version_id))
-      )
-    LIMIT 1
-    `,
-    [userId, review.deckId, review.cardId, review.deckVersionId],
+  await validateReviewTargets(client, userId, reviews);
+  await validateProgressTargets(client, userId, progressItems);
+  await validateMatchingTargets(client, userId, matchingRecords);
+  await validateDeckPreferenceTargets(client, userId, deckPreferences);
+}
+
+async function validateReviewTargets(
+  client: Queryable,
+  userId: string,
+  reviews: ReviewEventInput[],
+): Promise<void> {
+  const targets = uniqueByKey(
+    reviews.map((review) => ({
+      deckId: review.deckId,
+      deckVersionId: review.deckVersionId,
+      cardId: review.cardId,
+    })),
+    reviewTargetKey,
   );
-  if (!result.rowCount) {
+  if (!targets.length) {
+    return;
+  }
+
+  const result = await client.query<{
+    deck_id: string;
+    deck_version_id: string | null;
+    card_id: string;
+  }>(
+    `
+    WITH input_targets AS (
+      SELECT DISTINCT
+        deck_id::uuid AS deck_id,
+        deck_version_id::uuid AS deck_version_id,
+        card_id::uuid AS card_id
+      FROM jsonb_to_recordset($2::jsonb)
+        AS target(deck_id text, deck_version_id text, card_id text)
+    )
+    SELECT input_targets.deck_id::text,
+           input_targets.deck_version_id::text,
+           input_targets.card_id::text
+    FROM input_targets
+    JOIN deck_assignments
+      ON deck_assignments.user_id = $1
+      AND deck_assignments.deck_id = input_targets.deck_id
+      AND deck_assignments.status = 'active'
+    JOIN decks ON decks.id = deck_assignments.deck_id
+    JOIN deck_versions
+      ON deck_versions.deck_id = decks.id
+      AND deck_versions.status = 'published'
+      AND (
+        (input_targets.deck_version_id IS NOT NULL AND deck_versions.id = input_targets.deck_version_id)
+        OR (
+          input_targets.deck_version_id IS NULL
+          AND deck_versions.id = COALESCE(deck_assignments.deck_version_id, decks.current_version_id)
+        )
+      )
+    JOIN deck_version_cards
+      ON deck_version_cards.deck_version_id = deck_versions.id
+      AND deck_version_cards.card_id = input_targets.card_id
+    `,
+    [userId, JSON.stringify(reviewTargetRows(targets))],
+  );
+  const allowedTargets = new Set(result.rows.map((row) => reviewTargetKey({
+    deckId: row.deck_id,
+    deckVersionId: row.deck_version_id,
+    cardId: row.card_id,
+  })));
+  if (targets.some((target) => !allowedTargets.has(reviewTargetKey(target)))) {
     badRequest("review target is not assigned to this user");
   }
 }
 
-async function requireProgressTarget(
+async function validateProgressTargets(
   client: Queryable,
   userId: string,
-  progress: ProgressInput,
+  progressItems: ProgressInput[],
 ): Promise<void> {
-  const result = await client.query(
-    `
-    SELECT 1
-    FROM deck_assignments
-    JOIN decks ON decks.id = deck_assignments.deck_id
-    JOIN deck_versions ON deck_versions.id = COALESCE(deck_assignments.deck_version_id, decks.current_version_id)
-    JOIN deck_version_cards ON deck_version_cards.deck_version_id = deck_versions.id
-    WHERE deck_assignments.user_id::text = $1
-      AND deck_assignments.deck_id::text = $2
-      AND deck_assignments.status = 'active'
-      AND deck_versions.status = 'published'
-      AND deck_version_cards.card_id::text = $3
-    LIMIT 1
-    `,
-    [userId, progress.deckId, progress.cardId],
+  const targets = uniqueByKey(
+    progressItems.map((progress) => ({
+      deckId: progress.deckId,
+      cardId: progress.cardId,
+    })),
+    progressTargetKey,
   );
-  if (!result.rowCount) {
+  if (!targets.length) {
+    return;
+  }
+
+  const result = await client.query<{
+    deck_id: string;
+    card_id: string;
+  }>(
+    `
+    WITH input_targets AS (
+      SELECT DISTINCT
+        deck_id::uuid AS deck_id,
+        card_id::uuid AS card_id
+      FROM jsonb_to_recordset($2::jsonb)
+        AS target(deck_id text, card_id text)
+    )
+    SELECT input_targets.deck_id::text,
+           input_targets.card_id::text
+    FROM input_targets
+    JOIN deck_assignments
+      ON deck_assignments.user_id = $1
+      AND deck_assignments.deck_id = input_targets.deck_id
+      AND deck_assignments.status = 'active'
+    JOIN decks ON decks.id = deck_assignments.deck_id
+    JOIN deck_versions
+      ON deck_versions.id = COALESCE(deck_assignments.deck_version_id, decks.current_version_id)
+      AND deck_versions.status = 'published'
+    JOIN deck_version_cards
+      ON deck_version_cards.deck_version_id = deck_versions.id
+      AND deck_version_cards.card_id = input_targets.card_id
+    `,
+    [userId, JSON.stringify(progressTargetRows(targets))],
+  );
+  const allowedTargets = new Set(result.rows.map((row) => progressTargetKey({
+    deckId: row.deck_id,
+    cardId: row.card_id,
+  })));
+  if (targets.some((target) => !allowedTargets.has(progressTargetKey(target)))) {
     badRequest("progress target is not assigned to this user");
   }
 }
 
-async function requireMatchingTarget(
+async function validateMatchingTargets(
   client: Queryable,
   userId: string,
-  record: MatchingRecordInput,
+  matchingRecords: MatchingRecordInput[],
 ): Promise<void> {
-  const result = await client.query(
+  const targets = uniqueByKey(
+    matchingRecords.map((record) => ({
+      deckId: record.deckId,
+      deckVersionId: record.deckVersionId,
+    })),
+    matchingTargetKey,
+  );
+  if (!targets.length) {
+    return;
+  }
+
+  const result = await client.query<{
+    deck_id: string;
+    deck_version_id: string | null;
+  }>(
     `
-    SELECT 1
-    FROM deck_assignments
-    JOIN decks ON decks.id = deck_assignments.deck_id
-    JOIN deck_versions ON deck_versions.deck_id = decks.id
-    WHERE deck_assignments.user_id::text = $1
-      AND deck_assignments.deck_id::text = $2
+    WITH input_targets AS (
+      SELECT DISTINCT
+        deck_id::uuid AS deck_id,
+        deck_version_id::uuid AS deck_version_id
+      FROM jsonb_to_recordset($2::jsonb)
+        AS target(deck_id text, deck_version_id text)
+    )
+    SELECT input_targets.deck_id::text,
+           input_targets.deck_version_id::text
+    FROM input_targets
+    JOIN deck_assignments
+      ON deck_assignments.user_id = $1
+      AND deck_assignments.deck_id = input_targets.deck_id
       AND deck_assignments.status = 'active'
+    JOIN decks ON decks.id = deck_assignments.deck_id
+    JOIN deck_versions
+      ON deck_versions.deck_id = decks.id
       AND deck_versions.status = 'published'
       AND (
-        ($3::text IS NOT NULL AND deck_versions.id::text = $3)
-        OR ($3::text IS NULL AND deck_versions.id = COALESCE(deck_assignments.deck_version_id, decks.current_version_id))
+        (input_targets.deck_version_id IS NOT NULL AND deck_versions.id = input_targets.deck_version_id)
+        OR (
+          input_targets.deck_version_id IS NULL
+          AND deck_versions.id = COALESCE(deck_assignments.deck_version_id, decks.current_version_id)
+        )
       )
-    LIMIT 1
     `,
-    [userId, record.deckId, record.deckVersionId],
+    [userId, JSON.stringify(matchingTargetRows(targets))],
   );
-  if (!result.rowCount) {
+  const allowedTargets = new Set(result.rows.map((row) => matchingTargetKey({
+    deckId: row.deck_id,
+    deckVersionId: row.deck_version_id,
+  })));
+  if (targets.some((target) => !allowedTargets.has(matchingTargetKey(target)))) {
     badRequest("matching record target is not assigned to this user");
   }
 }
 
-export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool): Promise<void> {
+async function validateDeckPreferenceTargets(
+  client: Queryable,
+  userId: string,
+  deckPreferences: DeckPreferenceInput[],
+): Promise<void> {
+  const deckIds = [...new Set(deckPreferences.map((preference) => preference.deckId))];
+  if (!deckIds.length) {
+    return;
+  }
+
+  const result = await client.query<{ deck_id: string }>(
+    `
+    SELECT deck_id::text
+    FROM deck_assignments
+    WHERE user_id = $1
+      AND deck_id = ANY($2::uuid[])
+    `,
+    [userId, deckIds],
+  );
+  const allowedDeckIds = new Set(result.rows.map((row) => row.deck_id));
+  if (deckIds.some((deckId) => !allowedDeckIds.has(deckId))) {
+    badRequest("deck preference target is not assigned to this user");
+  }
+}
+
+export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, config: AppConfig): Promise<void> {
   app.get("/v1/bootstrap", async (request) => {
-    requireHouseholdSync(request);
+    requireHouseholdSync(request, config);
 
     const users = await allUserRows(pool);
     const requestedUserId = selectedUserHeader(request);
     const requestedUserExists = requestedUserId && users.some((user) => user.id === requestedUserId);
     const userId = requestedUserExists ? requestedUserId : users[0]?.id ?? null;
+    const cachedVersions = cachedDeckVersionIds(request);
+    const timeZone = clientTimeZone(request);
 
-    const [assignments, content, media, progress, reviews, matchingRecords, reviewsRevision] = userId
+    const [assignments, content, media, progress, matchingRecords, dailyUsage, statsSummary, reviewsRevision] = userId
       ? await Promise.all([
           assignedDeckRows(pool, userId),
-          assignedContentRows(pool, userId),
+          assignedContentRows(pool, userId, undefined, cachedVersions),
           pool.query(
             `
             SELECT media_objects.id,
@@ -547,21 +880,14 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool): P
           pool.query(
             `
             SELECT *
-            FROM study_reviews
-            WHERE user_id = $1
-            ORDER BY server_revision
-            `,
-            [userId],
-          ),
-          pool.query(
-            `
-            SELECT *
             FROM deck_matching_records
             WHERE user_id = $1
             ORDER BY server_revision
             `,
             [userId],
           ),
+          dailyUsageRows(pool, userId, timeZone),
+          statsSummaryRows(pool, userId, timeZone),
           pool.query<{ revision: string }>(
             `
             SELECT COALESCE(MAX(server_revision), 0)::text AS revision
@@ -577,7 +903,8 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool): P
           { rows: [] },
           { rows: [] },
           { rows: [] },
-          { rows: [] },
+          [],
+          { activityDays: [], weakCards: [] },
           { rows: [{ revision: "0" }] },
         ];
 
@@ -588,15 +915,17 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool): P
       content,
       media: media.rows,
       progress: progress.rows,
-      reviews: reviews.rows,
+      reviews: [],
       matchingRecords: matchingRecords.rows,
+      dailyUsage,
+      statsSummary,
       reviewsRevision: reviewsRevision.rows[0]?.revision ?? "0",
       serverRevision: await latestRevision(pool),
     };
   });
 
   app.get<{ Querystring: ChangesQuery }>("/v1/sync/changes", async (request) => {
-    requireHouseholdSync(request);
+    requireHouseholdSync(request, config);
     const userId = await selectedSyncUserId(request, pool);
     const sinceRevision = parseRevision(request.query.sinceRevision).toString();
 
@@ -643,12 +972,13 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool): P
   });
 
   app.post("/v1/sync/events", async (request) => {
-    requireHouseholdSync(request);
+    requireHouseholdSync(request, config);
     const userId = await selectedSyncUserId(request, pool);
     const data = body(request.body);
     const reviews = parseReviews(data.reviews);
     const progressItems = parseProgress(data.progress);
     const matchingRecords = parseMatchingRecords(data.matchingRecords);
+    const deckPreferences = parseDeckPreferences(data.deckPreferences);
 
     const client = await pool.connect();
     try {
@@ -658,9 +988,11 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool): P
       const duplicateReviewIds: string[] = [];
       const progressCardIds: string[] = [];
       const matchingRecordDeckIds: string[] = [];
+      const deckPreferenceDeckIds: string[] = [];
+
+      await validateSyncTargets(client, userId, reviews, progressItems, matchingRecords, deckPreferences);
 
       for (const review of reviews) {
-        await requireReviewTarget(client, userId, review);
         const result = await client.query<{ client_event_id: string }>(
           `
           INSERT INTO study_reviews (
@@ -696,7 +1028,6 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool): P
       }
 
       for (const progress of progressItems) {
-        await requireProgressTarget(client, userId, progress);
         const result = await client.query<{ card_id: string }>(
           `
           INSERT INTO card_progress (
@@ -711,11 +1042,14 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool): P
             state = excluded.state,
             updated_at = excluded.updated_at,
             server_revision = nextval('server_revision_seq')
-          WHERE card_progress.deck_id IS DISTINCT FROM excluded.deck_id
-             OR card_progress.fsrs_data IS DISTINCT FROM excluded.fsrs_data
-             OR card_progress.due_at IS DISTINCT FROM excluded.due_at
-             OR card_progress.state IS DISTINCT FROM excluded.state
-             OR card_progress.updated_at IS DISTINCT FROM excluded.updated_at
+          WHERE (
+              card_progress.deck_id IS DISTINCT FROM excluded.deck_id
+              OR card_progress.fsrs_data IS DISTINCT FROM excluded.fsrs_data
+              OR card_progress.due_at IS DISTINCT FROM excluded.due_at
+              OR card_progress.state IS DISTINCT FROM excluded.state
+              OR card_progress.updated_at IS DISTINCT FROM excluded.updated_at
+            )
+            AND excluded.updated_at >= card_progress.updated_at
           RETURNING card_id
           `,
           [
@@ -734,7 +1068,6 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool): P
       }
 
       for (const record of matchingRecords) {
-        await requireMatchingTarget(client, userId, record);
         const result = await client.query<{ deck_id: string }>(
           `
           INSERT INTO deck_matching_records (
@@ -766,6 +1099,26 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool): P
         }
       }
 
+      for (const preference of deckPreferences) {
+        await client.query(
+          `
+          INSERT INTO user_deck_preferences (
+            user_id, deck_id, is_enabled, updated_at
+          ) VALUES (
+            $1, $2, $3, COALESCE($4::timestamptz, now())
+          )
+          ON CONFLICT (user_id, deck_id) DO UPDATE SET
+            is_enabled = excluded.is_enabled,
+            updated_at = excluded.updated_at,
+            server_revision = nextval('server_revision_seq')
+          WHERE user_deck_preferences.is_enabled IS DISTINCT FROM excluded.is_enabled
+            AND excluded.updated_at >= user_deck_preferences.updated_at
+          `,
+          [userId, preference.deckId, preference.isEnabled, preference.updatedAt],
+        );
+        deckPreferenceDeckIds.push(preference.deckId);
+      }
+
       await client.query("COMMIT");
 
       return {
@@ -773,6 +1126,7 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool): P
         duplicateReviewIds,
         progressCardIds,
         matchingRecordDeckIds,
+        deckPreferenceDeckIds,
         serverRevision: await latestRevision(pool),
       };
     } catch (error) {

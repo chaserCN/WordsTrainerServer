@@ -3,7 +3,7 @@ import { loadConfig } from "./config.js";
 import { closePool, createPool } from "./db.js";
 
 const config = loadConfig();
-const pool = createPool();
+const pool = createPool(config);
 const app = buildApp(pool, config);
 
 const shutdown = async () => {

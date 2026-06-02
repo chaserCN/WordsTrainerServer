@@ -4,6 +4,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type pg from "pg";
 import { requireAdmin } from "../auth.js";
+import type { AppConfig } from "../config.js";
 import {
   badRequest,
   notFound,
@@ -79,6 +80,16 @@ function optionalInteger(value: unknown, field: string, defaultValue: number): n
     badRequest(`${field} must be an integer`);
   }
   return numberValue;
+}
+
+function optionalBoolean(value: unknown, field: string, defaultValue: boolean): boolean {
+  if (value == null) {
+    return defaultValue;
+  }
+  if (typeof value !== "boolean") {
+    badRequest(`${field} must be a boolean`);
+  }
+  return value;
 }
 
 function requireSingleBlank(template: string): void {
@@ -180,6 +191,34 @@ async function requireDeck(client: Queryable, deckId: string): Promise<void> {
   }
 }
 
+async function cloneUserAssignments(
+  client: Queryable,
+  sourceUserId: string,
+  targetUserId: string,
+): Promise<pg.QueryResultRow[]> {
+  if (sourceUserId === targetUserId) {
+    badRequest("sourceUserId and target user must be different");
+  }
+  await requireUser(client, sourceUserId);
+  await requireUser(client, targetUserId);
+  const result = await client.query(
+    `
+    INSERT INTO deck_assignments (user_id, deck_id, deck_version_id, status, server_revision)
+    SELECT $2, deck_id, deck_version_id, status, nextval('server_revision_seq')
+    FROM deck_assignments
+    WHERE user_id = $1
+    ON CONFLICT (user_id, deck_id) DO UPDATE SET
+      deck_version_id = excluded.deck_version_id,
+      status = excluded.status,
+      server_revision = nextval('server_revision_seq'),
+      updated_at = now()
+    RETURNING user_id, deck_id, deck_version_id, status, server_revision, assigned_at, updated_at
+    `,
+    [sourceUserId, targetUserId],
+  );
+  return result.rows;
+}
+
 async function requireGroup(client: Queryable, groupId: string): Promise<void> {
   const result = await client.query("SELECT 1 FROM study_groups WHERE id = $1", [groupId]);
   if (!result.rowCount) {
@@ -190,11 +229,11 @@ async function requireGroup(client: Queryable, groupId: string): Promise<void> {
 export async function registerAdminRoutes(
   app: FastifyInstance,
   pool: pg.Pool,
+  config: AppConfig,
   objectStorage: ObjectStorageService,
-  localMediaRoot: string,
 ): Promise<void> {
   app.addHook("preHandler", async (request) => {
-    requireAdmin(request);
+    requireAdmin(request, config);
   });
 
   app.get("/v1/admin/users", async () => {
@@ -227,6 +266,218 @@ export async function registerAdminRoutes(
     );
     reply.status(201);
     return { user: result.rows[0] };
+  });
+
+  app.put<{ Params: IdParams }>("/v1/admin/users/:userId", async (request) => {
+    const userId = requiredUUID(request.params.userId, "userId");
+    const data = body(request.body);
+    const hasDisplayName = Object.hasOwn(data, "displayName");
+    const hasRole = Object.hasOwn(data, "role");
+    const hasAvatarMediaId = Object.hasOwn(data, "avatarMediaId");
+
+    if (!hasDisplayName && !hasRole && !hasAvatarMediaId) {
+      badRequest("at least one user field is required");
+    }
+
+    const displayName = hasDisplayName ? requiredString(data.displayName, "displayName") : null;
+    const role = hasRole ? appRole(data.role, "role") : null;
+    const avatarMediaId = hasAvatarMediaId ? optionalUUID(data.avatarMediaId, "avatarMediaId") : null;
+
+    const result = await pool.query(
+      `
+      UPDATE users
+      SET display_name = CASE WHEN $2 THEN $3 ELSE display_name END,
+          role = CASE WHEN $4 THEN $5::app_role ELSE role END,
+          avatar_media_id = CASE WHEN $6 THEN $7::uuid ELSE avatar_media_id END,
+          updated_at = now()
+      WHERE id = $1
+      RETURNING id, display_name, role, avatar_media_id, created_at, updated_at
+      `,
+      [userId, hasDisplayName, displayName, hasRole, role, hasAvatarMediaId, avatarMediaId],
+    );
+    if (!result.rowCount) {
+      notFound("user not found");
+    }
+    return { user: result.rows[0] };
+  });
+
+  app.get<{ Params: IdParams }>("/v1/admin/users/:userId", async (request) => {
+    const userId = requiredUUID(request.params.userId, "userId");
+    const [user, assignments, stats] = await Promise.all([
+      pool.query(
+        `
+        SELECT id, display_name, role, avatar_media_id, created_at, updated_at
+        FROM users
+        WHERE id = $1
+        `,
+        [userId],
+      ),
+      pool.query(
+        `
+        SELECT deck_assignments.user_id,
+               deck_assignments.deck_id,
+               deck_assignments.deck_version_id,
+               deck_assignments.status,
+               deck_assignments.server_revision,
+               deck_assignments.assigned_at,
+               deck_assignments.updated_at,
+               decks.title,
+               decks.avatar_system_name,
+               decks.avatar_media_id,
+               decks.language_code,
+               decks.current_version_id,
+               assigned_versions.version_number AS assigned_version_number,
+               assigned_versions.status AS assigned_version_status,
+               current_versions.version_number AS current_version_number,
+               current_versions.status AS current_version_status
+        FROM deck_assignments
+        JOIN decks ON decks.id = deck_assignments.deck_id
+        LEFT JOIN deck_versions AS assigned_versions ON assigned_versions.id = deck_assignments.deck_version_id
+        LEFT JOIN deck_versions AS current_versions ON current_versions.id = decks.current_version_id
+        WHERE deck_assignments.user_id = $1
+        ORDER BY decks.title
+        `,
+        [userId],
+      ),
+      pool.query(
+        `
+        SELECT
+          (SELECT COUNT(*) FROM deck_assignments WHERE user_id = $1) AS assignment_count,
+          (SELECT COUNT(*) FROM deck_assignments WHERE user_id = $1 AND status = 'active') AS active_assignment_count,
+          (SELECT COUNT(*) FROM card_progress WHERE user_id = $1) AS progress_count,
+          (SELECT COUNT(*) FROM study_reviews WHERE user_id = $1) AS review_count,
+          (SELECT COUNT(*) FROM deck_matching_records WHERE user_id = $1) AS matching_record_count
+        `,
+        [userId],
+      ),
+    ]);
+    if (!user.rowCount) {
+      notFound("user not found");
+    }
+    return {
+      user: user.rows[0],
+      assignments: assignments.rows,
+      stats: stats.rows[0],
+    };
+  });
+
+  app.post<{ Params: IdParams }>("/v1/admin/users/:userId/clone-assignments", async (request, reply) => {
+    const targetUserId = requiredUUID(request.params.userId, "userId");
+    const data = body(request.body);
+    const sourceUserId = requiredUUID(data.sourceUserId, "sourceUserId");
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const assignments = await cloneUserAssignments(client, sourceUserId, targetUserId);
+      await client.query("COMMIT");
+      reply.status(201);
+      return { assignments };
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  });
+
+  app.post<{ Params: IdParams }>("/v1/admin/users/:userId/test-learner", async (request, reply) => {
+    const sourceUserId = requiredUUID(request.params.userId, "userId");
+    const data = body(request.body ?? {});
+    const requestedDisplayName = Object.hasOwn(data, "displayName")
+      ? requiredString(data.displayName, "displayName")
+      : null;
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const sourceUser = await client.query(
+        `
+        SELECT id, display_name, avatar_media_id
+        FROM users
+        WHERE id = $1
+        `,
+        [sourceUserId],
+      );
+      if (!sourceUser.rowCount) {
+        notFound("user not found");
+      }
+      const displayName = requestedDisplayName ?? `${sourceUser.rows[0].display_name} Test`;
+      const user = await client.query(
+        `
+        INSERT INTO users (display_name, role, avatar_media_id)
+        VALUES ($1, 'learner', $2)
+        RETURNING id, display_name, role, avatar_media_id, created_at, updated_at
+        `,
+        [displayName, sourceUser.rows[0].avatar_media_id],
+      );
+      const assignments = await cloneUserAssignments(client, sourceUserId, user.rows[0].id);
+      await client.query("COMMIT");
+      reply.status(201);
+      return {
+        user: user.rows[0],
+        assignments,
+      };
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  });
+
+  app.post<{ Params: IdParams }>("/v1/admin/users/:userId/reset-study-data", async (request) => {
+    const userId = requiredUUID(request.params.userId, "userId");
+    const data = body(request.body ?? {});
+    const deckId = optionalUUID(data.deckId, "deckId");
+    const dryRun = optionalBoolean(data.dryRun, "dryRun", false);
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await requireUser(client, userId);
+      if (deckId) {
+        await requireDeck(client, deckId);
+      }
+      const params = [userId, deckId];
+      const counts = await client.query(
+        `
+        SELECT
+          (SELECT COUNT(*) FROM study_reviews WHERE user_id = $1 AND ($2::uuid IS NULL OR deck_id = $2)) AS review_count,
+          (SELECT COUNT(*) FROM card_progress WHERE user_id = $1 AND ($2::uuid IS NULL OR deck_id = $2)) AS progress_count,
+          (SELECT COUNT(*) FROM deck_matching_records WHERE user_id = $1 AND ($2::uuid IS NULL OR deck_id = $2)) AS matching_record_count
+        `,
+        params,
+      );
+      if (!dryRun) {
+        await client.query(
+          "DELETE FROM study_reviews WHERE user_id = $1 AND ($2::uuid IS NULL OR deck_id = $2)",
+          params,
+        );
+        await client.query(
+          "DELETE FROM card_progress WHERE user_id = $1 AND ($2::uuid IS NULL OR deck_id = $2)",
+          params,
+        );
+        await client.query(
+          "DELETE FROM deck_matching_records WHERE user_id = $1 AND ($2::uuid IS NULL OR deck_id = $2)",
+          params,
+        );
+      }
+      await client.query("COMMIT");
+      return {
+        dryRun,
+        deleted: {
+          reviews: Number(counts.rows[0].review_count),
+          progress: Number(counts.rows[0].progress_count),
+          matchingRecords: Number(counts.rows[0].matching_record_count),
+        },
+      };
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
   });
 
   app.get("/v1/admin/groups", async () => {
@@ -403,8 +654,8 @@ export async function registerAdminRoutes(
     const fileNameHeader = request.headers["x-file-name"];
     const fileName = Array.isArray(fileNameHeader) ? fileNameHeader[0] : fileNameHeader ?? null;
     const storageKey = mediaStorageKey(fileName);
-    const absolutePath = path.resolve(localMediaRoot, storageKey);
-    const root = path.resolve(localMediaRoot);
+    const absolutePath = path.resolve(config.localMediaRoot, storageKey);
+    const root = path.resolve(config.localMediaRoot);
     if (!absolutePath.startsWith(`${root}${path.sep}`)) {
       badRequest("invalid media storage key");
     }
@@ -549,6 +800,71 @@ export async function registerAdminRoutes(
     );
     reply.status(201);
     return { deck: result.rows[0] };
+  });
+
+  app.put<{ Params: IdParams }>("/v1/admin/decks/:deckId", async (request) => {
+    const deckId = requiredUUID(request.params.deckId, "deckId");
+    const data = body(request.body);
+    const hasTitle = Object.hasOwn(data, "title");
+    const hasLanguageCode = Object.hasOwn(data, "languageCode");
+    const hasAvatarSystemName = Object.hasOwn(data, "avatarSystemName");
+    const hasAvatarMediaId = Object.hasOwn(data, "avatarMediaId");
+
+    if (!hasTitle && !hasLanguageCode && !hasAvatarSystemName && !hasAvatarMediaId) {
+      badRequest("at least one deck field is required");
+    }
+
+    const title = hasTitle ? requiredString(data.title, "title") : null;
+    const languageCode = hasLanguageCode ? requiredString(data.languageCode, "languageCode") : null;
+    const avatarSystemName = hasAvatarSystemName ? optionalString(data.avatarSystemName, "avatarSystemName") : null;
+    const avatarMediaId = hasAvatarMediaId ? optionalUUID(data.avatarMediaId, "avatarMediaId") : null;
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const result = await client.query(
+        `
+        UPDATE decks
+        SET title = CASE WHEN $2 THEN $3 ELSE title END,
+            language_code = CASE WHEN $4 THEN $5 ELSE language_code END,
+            avatar_system_name = CASE WHEN $6 THEN $7 ELSE avatar_system_name END,
+            avatar_media_id = CASE WHEN $8 THEN $9::uuid ELSE avatar_media_id END,
+            updated_at = now()
+        WHERE id = $1
+        RETURNING id, title, avatar_system_name, avatar_media_id, language_code, current_version_id, created_at, updated_at
+        `,
+        [
+          deckId,
+          hasTitle,
+          title,
+          hasLanguageCode,
+          languageCode,
+          hasAvatarSystemName,
+          avatarSystemName,
+          hasAvatarMediaId,
+          avatarMediaId,
+        ],
+      );
+      if (!result.rowCount) {
+        notFound("deck not found");
+      }
+      await client.query(
+        `
+        UPDATE deck_assignments
+        SET server_revision = nextval('server_revision_seq'),
+            updated_at = now()
+        WHERE deck_id = $1
+        `,
+        [deckId],
+      );
+      await client.query("COMMIT");
+      return { deck: result.rows[0] };
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
   });
 
   app.post<{ Params: IdParams }>("/v1/admin/decks/:deckId/versions", async (request, reply) => {

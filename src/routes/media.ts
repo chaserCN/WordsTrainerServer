@@ -2,7 +2,10 @@ import type { FastifyInstance } from "fastify";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import type pg from "pg";
+import { requireHouseholdSync } from "../auth.js";
+import type { AppConfig } from "../config.js";
 import { badRequest, notFound, requiredUUID } from "../http.js";
+import type { ObjectStorageService } from "../storage.js";
 
 type IdParams = {
   mediaId?: string;
@@ -11,9 +14,11 @@ type IdParams = {
 export async function registerMediaRoutes(
   app: FastifyInstance,
   pool: pg.Pool,
-  localMediaRoot: string,
+  config: AppConfig,
+  objectStorage: ObjectStorageService,
 ): Promise<void> {
   app.get<{ Params: IdParams }>("/v1/media/:mediaId", async (request, reply) => {
+    requireHouseholdSync(request, config);
     const mediaId = requiredUUID(request.params.mediaId, "mediaId");
     const result = await pool.query<{
       storage_key: string;
@@ -36,7 +41,7 @@ export async function registerMediaRoutes(
       badRequest("media is stored externally");
     }
 
-    const root = path.resolve(localMediaRoot);
+    const root = path.resolve(config.localMediaRoot);
     const filePath = path.resolve(root, media.storage_key);
     if (!filePath.startsWith(`${root}${path.sep}`)) {
       badRequest("invalid media storage key");
@@ -51,7 +56,12 @@ export async function registerMediaRoutes(
       reply.header("Cache-Control", "public, max-age=31536000, immutable");
       return data;
     } catch {
-      notFound("media file not found");
+      const downloadUrl = await objectStorage.createDownloadUrl(media.storage_key);
+      if (!downloadUrl) {
+        notFound("media file not found");
+      }
+      reply.header("Cache-Control", "private, max-age=300");
+      return reply.redirect(downloadUrl);
     }
   });
 }

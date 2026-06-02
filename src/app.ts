@@ -42,9 +42,9 @@ export function buildApp(pool: pg.Pool, config: AppConfig) {
   });
 
   app.register((instance) => registerHealthRoutes(instance, pool));
-  app.register((instance) => registerMediaRoutes(instance, pool, config.localMediaRoot));
-  app.register((instance) => registerSyncRoutes(instance, pool));
-  app.register((instance) => registerAdminRoutes(instance, pool, objectStorage, config.localMediaRoot));
+  app.register((instance) => registerMediaRoutes(instance, pool, config, objectStorage));
+  app.register((instance) => registerSyncRoutes(instance, pool, config));
+  app.register((instance) => registerAdminRoutes(instance, pool, config, objectStorage));
 
   return app;
 }
