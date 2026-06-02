@@ -1,5 +1,7 @@
 import type { FastifyInstance } from "fastify";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdir, writeFile } from "node:fs/promises";
+import path from "node:path";
 import type pg from "pg";
 import { requireAdmin } from "../auth.js";
 import {
@@ -189,6 +191,7 @@ export async function registerAdminRoutes(
   app: FastifyInstance,
   pool: pg.Pool,
   objectStorage: ObjectStorageService,
+  localMediaRoot: string,
 ): Promise<void> {
   app.addHook("preHandler", async (request) => {
     requireAdmin(request);
@@ -380,6 +383,41 @@ export async function registerAdminRoutes(
       RETURNING id, storage_key, sha256, mime_type, byte_size, width, height, upload_status, created_at, updated_at
       `,
       [storageKey, sha256, mimeType, byteSize, width, height],
+    );
+    reply.status(201);
+    return { media: result.rows[0] };
+  });
+
+  app.post("/v1/admin/media/upload", async (request, reply) => {
+    if (!Buffer.isBuffer(request.body)) {
+      badRequest("binary media body is required");
+    }
+    const bytes = request.body;
+    if (bytes.length === 0) {
+      badRequest("media body must not be empty");
+    }
+    const contentType = String(request.headers["content-type"] ?? "").split(";")[0]?.trim();
+    if (!contentType) {
+      badRequest("Content-Type header is required");
+    }
+    const fileNameHeader = request.headers["x-file-name"];
+    const fileName = Array.isArray(fileNameHeader) ? fileNameHeader[0] : fileNameHeader ?? null;
+    const storageKey = mediaStorageKey(fileName);
+    const absolutePath = path.resolve(localMediaRoot, storageKey);
+    const root = path.resolve(localMediaRoot);
+    if (!absolutePath.startsWith(`${root}${path.sep}`)) {
+      badRequest("invalid media storage key");
+    }
+    await mkdir(path.dirname(absolutePath), { recursive: true });
+    await writeFile(absolutePath, bytes);
+
+    const result = await pool.query(
+      `
+      INSERT INTO media_objects (storage_key, sha256, mime_type, byte_size)
+      VALUES ($1, $2, $3, $4)
+      RETURNING id, storage_key, sha256, mime_type, byte_size, width, height, upload_status, created_at, updated_at
+      `,
+      [storageKey, createHash("sha256").update(bytes).digest("hex"), contentType, bytes.length],
     );
     reply.status(201);
     return { media: result.rows[0] };

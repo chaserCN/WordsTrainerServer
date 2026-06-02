@@ -472,12 +472,10 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool): P
 
     const users = await allUserRows(pool);
     const requestedUserId = selectedUserHeader(request);
-    const userId = requestedUserId ?? users[0]?.id ?? null;
-    if (requestedUserId && !users.some((user) => user.id === requestedUserId)) {
-      badRequest("selected user not found");
-    }
+    const requestedUserExists = requestedUserId && users.some((user) => user.id === requestedUserId);
+    const userId = requestedUserExists ? requestedUserId : users[0]?.id ?? null;
 
-    const [assignments, content, media, progress, reviewsRevision] = userId
+    const [assignments, content, media, progress, reviews, matchingRecords, reviewsRevision] = userId
       ? await Promise.all([
           assignedDeckRows(pool, userId),
           assignedContentRows(pool, userId),
@@ -487,9 +485,9 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool): P
                    media_objects.storage_key,
                    media_objects.sha256,
                    media_objects.mime_type,
-                   media_objects.byte_size,
-                   media_objects.width,
-                   media_objects.height,
+                   media_objects.byte_size::int AS byte_size,
+                   media_objects.width::int AS width,
+                   media_objects.height::int AS height,
                    media_objects.updated_at
             FROM media_objects
             WHERE media_objects.id IN (
@@ -546,6 +544,24 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool): P
             `,
             [userId],
           ),
+          pool.query(
+            `
+            SELECT *
+            FROM study_reviews
+            WHERE user_id = $1
+            ORDER BY server_revision
+            `,
+            [userId],
+          ),
+          pool.query(
+            `
+            SELECT *
+            FROM deck_matching_records
+            WHERE user_id = $1
+            ORDER BY server_revision
+            `,
+            [userId],
+          ),
           pool.query<{ revision: string }>(
             `
             SELECT COALESCE(MAX(server_revision), 0)::text AS revision
@@ -560,6 +576,8 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool): P
           emptyContent(),
           { rows: [] },
           { rows: [] },
+          { rows: [] },
+          { rows: [] },
           { rows: [{ revision: "0" }] },
         ];
 
@@ -570,6 +588,8 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool): P
       content,
       media: media.rows,
       progress: progress.rows,
+      reviews: reviews.rows,
+      matchingRecords: matchingRecords.rows,
       reviewsRevision: reviewsRevision.rows[0]?.revision ?? "0",
       serverRevision: await latestRevision(pool),
     };

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { readdir, readFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import test, { type TestContext } from "node:test";
 import { fileURLToPath } from "node:url";
@@ -55,16 +56,19 @@ async function createTestApp(t: TestContext): Promise<TestApp | null> {
   });
   await runMigrations(pool);
 
+  const localMediaRoot = await mkdtemp(path.join(os.tmpdir(), "flashgame-media-"));
   const app = buildApp(pool, {
     databaseUrl: testDatabaseUrl,
     adminApiKey,
     householdSyncToken,
     host: "127.0.0.1",
     port: 0,
+    localMediaRoot,
     objectStorage: null,
   });
 
   t.after(async () => {
+    await rm(localMediaRoot, { recursive: true, force: true });
     await app.close();
     await pool.end();
     const cleanupPool = new pg.Pool({ connectionString: testDatabaseUrl });
@@ -380,6 +384,48 @@ test("mobile bootstrap and sync are usable when server has no assigned content",
     400,
   );
   assert.equal(badSelectedUser.error, "bad_request");
+
+  const staleSelectedUser = await syncJson(
+    ctx,
+    "GET",
+    "/v1/bootstrap",
+    learner.token,
+    undefined,
+    randomUUID(),
+  );
+  assert.equal(staleSelectedUser.user.id, learner.userId);
+  assert.equal(staleSelectedUser.users.length, 1);
+});
+
+test("admin can upload local media and mobile can download it by media id", async (t) => {
+  const ctx = await createTestApp(t);
+  if (!ctx) return;
+
+  const body = Buffer.from("fake mp3 bytes");
+  const uploadResponse = await ctx.app.inject({
+    method: "POST",
+    url: "/v1/admin/media/upload",
+    headers: {
+      ...ctx.adminAuth,
+      "content-type": "audio/mpeg",
+      "x-file-name": "word.mp3",
+    },
+    payload: body,
+  });
+  assert.equal(uploadResponse.statusCode, 201, uploadResponse.payload);
+  const upload = JSON.parse(uploadResponse.payload);
+
+  assert.equal(upload.media.mime_type, "audio/mpeg");
+  assert.equal(Number(upload.media.byte_size), body.length);
+  assert.match(upload.media.storage_key, /^media\/\d{4}\/\d{2}\/.+-word\.mp3$/);
+
+  const download = await ctx.app.inject({
+    method: "GET",
+    url: `/v1/media/${upload.media.id}`,
+  });
+  assert.equal(download.statusCode, 200);
+  assert.equal(download.headers["content-type"], "audio/mpeg");
+  assert.deepEqual(download.rawPayload, body);
 });
 
 test("admin/editor can create, edit, publish, and assign usable deck content", async (t) => {
@@ -421,6 +467,7 @@ test("admin/editor can create, edit, publish, and assign usable deck content", a
   assert.equal(bootstrap.content.distractors.length, 2);
   assert.equal(bootstrap.content.cards[0].deck_version_id, deck.versionId);
   assert.ok(bootstrap.media.length >= 2);
+  assert.ok(bootstrap.media.every((media: any) => typeof media.byte_size === "number"));
 });
 
 test("admin can manage study groups and member roles", async (t) => {
@@ -639,6 +686,14 @@ test("mobile sync supports user switching, idempotent reviews, progress updates,
   assert.equal(Number(persistedStats.rows[0].review_count), 1);
   assert.equal(Number(persistedStats.rows[0].progress_count), 1);
   assert.equal(Number(persistedStats.rows[0].matching_count), 1);
+
+  const bootstrapAfterSync = await syncJson(ctx, "GET", "/v1/bootstrap", child.token, undefined, child.userId);
+  assert.equal(bootstrapAfterSync.progress.length, 1);
+  assert.equal(bootstrapAfterSync.progress[0].card_id, deck.cardIds[0]);
+  assert.equal(bootstrapAfterSync.reviews.length, 1);
+  assert.equal(bootstrapAfterSync.reviews[0].client_event_id, clientEventId);
+  assert.equal(bootstrapAfterSync.matchingRecords.length, 1);
+  assert.equal(bootstrapAfterSync.matchingRecords[0].deck_id, deck.deckId);
 
   const changes = await syncJson(
     ctx,

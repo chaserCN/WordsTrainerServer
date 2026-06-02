@@ -6,6 +6,7 @@ export type AppConfig = {
   port: number;
   adminApiKey: string;
   householdSyncToken: string;
+  localMediaRoot: string;
   objectStorage: ObjectStorageConfig | null;
 };
 
@@ -78,6 +79,7 @@ export function loadConfig(): AppConfig {
     port: Number(process.env.PORT ?? 3000),
     adminApiKey,
     householdSyncToken,
+    localMediaRoot: optionalEnv("LOCAL_MEDIA_ROOT") ?? "uploads",
     objectStorage: loadObjectStorageConfig(),
   };
 }
