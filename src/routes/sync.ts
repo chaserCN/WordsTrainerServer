@@ -892,7 +892,7 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
               UNION
               SELECT users.avatar_media_id
               FROM users
-              WHERE users.id = $1 AND users.avatar_media_id IS NOT NULL
+              WHERE users.avatar_media_id IS NOT NULL
               UNION
               SELECT deck_version_cards.image_media_id
               FROM deck_assignments
