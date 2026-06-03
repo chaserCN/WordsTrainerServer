@@ -171,6 +171,7 @@ CREATE TABLE card_progress (
     due_at timestamptz,
     state text,
     updated_at timestamptz NOT NULL DEFAULT now(),
+    modified_by_device_id uuid,
     server_revision bigint NOT NULL DEFAULT nextval('server_revision_seq'),
     PRIMARY KEY (user_id, card_id)
 );
@@ -187,11 +188,14 @@ CREATE TABLE study_reviews (
     card_id uuid NOT NULL,
     mode study_mode NOT NULL,
     outcome review_outcome NOT NULL,
+    source text NOT NULL DEFAULT 'deck_session'
+        CHECK (source IN ('today_queue', 'deck_session', 'weak_cards', 'today_practice')),
     reviewed_at timestamptz NOT NULL,
     duration_ms integer,
     was_new boolean NOT NULL,
     previous_state text,
     new_state text,
+    modified_by_device_id uuid,
     server_revision bigint NOT NULL DEFAULT nextval('server_revision_seq'),
     created_at timestamptz NOT NULL DEFAULT now(),
     UNIQUE (user_id, client_event_id)
@@ -209,6 +213,7 @@ CREATE TABLE deck_matching_records (
     best_duration_seconds real NOT NULL,
     pair_count integer NOT NULL,
     achieved_at timestamptz NOT NULL,
+    modified_by_device_id uuid,
     server_revision bigint NOT NULL DEFAULT nextval('server_revision_seq'),
     PRIMARY KEY (user_id, deck_id)
 );

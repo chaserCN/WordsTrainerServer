@@ -18,7 +18,12 @@ type ChangesQuery = {
   sinceRevision?: string;
 };
 
+type BootstrapQuery = {
+  sinceRevision?: string;
+};
+
 const cachedDeckVersionIdsHeader = "x-flashgame-cached-deck-version-ids";
+const clientDeviceIdHeader = "x-flashgame-device-id";
 const clientTimeZoneHeader = "x-flashgame-time-zone";
 const timeZoneAliases = new Map<string, string>([
   ["Europe/Kiev", "Europe/Kyiv"],
@@ -40,6 +45,7 @@ type ReviewEventInput = {
   cardId: string;
   mode: string;
   outcome: string;
+  source: string;
   reviewedAt: string;
   durationMs: number | null;
   wasNew: boolean;
@@ -107,6 +113,14 @@ function reviewOutcome(value: unknown, field: string): string {
   return outcome;
 }
 
+function reviewSource(value: unknown, field: string): string {
+  const source = optionalString(value, field) ?? "deck_session";
+  if (!["today_queue", "deck_session", "weak_cards", "today_practice"].includes(source)) {
+    badRequest(`${field} must be a valid review source`);
+  }
+  return source;
+}
+
 function optionalTimestamp(value: unknown, field: string): string | null {
   const text = optionalString(value, field);
   if (text == null) {
@@ -116,6 +130,10 @@ function optionalTimestamp(value: unknown, field: string): string | null {
     badRequest(`${field} must be a valid timestamp`);
   }
   return text;
+}
+
+function requestDeviceId(value: string | string[] | undefined): string | null {
+  return optionalUUID(Array.isArray(value) ? value[0] : value, clientDeviceIdHeader);
 }
 
 function requiredTimestamp(value: unknown, field: string): string {
@@ -138,14 +156,24 @@ function optionalNonNegativeInteger(value: unknown, field: string): number | nul
 }
 
 async function assignedDeckRows(
-  pool: pg.Pool,
+  pool: Queryable,
   userId: string,
   sinceRevision?: string,
+  excludingDeviceId?: string | null,
 ): Promise<pg.QueryResult["rows"]> {
   const revisionFilter = sinceRevision
-    ? "AND (deck_assignments.server_revision > $2 OR deck_versions.server_revision > $2 OR user_deck_preferences.server_revision > $2)"
+    ? `AND (
+        deck_assignments.server_revision > $2
+        OR deck_versions.server_revision > $2
+        OR (
+          user_deck_preferences.server_revision > $2
+          AND ($3::uuid IS NULL
+            OR user_deck_preferences.modified_by_device_id IS NULL
+            OR user_deck_preferences.modified_by_device_id <> $3::uuid)
+        )
+      )`
     : "";
-  const params = sinceRevision ? [userId, sinceRevision] : [userId];
+  const params = sinceRevision ? [userId, sinceRevision, excludingDeviceId ?? null] : [userId];
   const result = await pool.query(
     `
     SELECT deck_assignments.user_id,
@@ -182,7 +210,7 @@ async function assignedDeckRows(
 }
 
 async function assignedContentRows(
-  pool: pg.Pool,
+  pool: Queryable,
   userId: string,
   sinceRevision?: string,
   cachedDeckVersionIds: string[] = [],
@@ -265,12 +293,12 @@ async function assignedContentRows(
   };
 }
 
-async function dailyUsageRows(pool: pg.Pool, userId: string, timeZone: string): Promise<pg.QueryResult["rows"]> {
+async function dailyUsageRows(pool: Queryable, userId: string, timeZone: string): Promise<pg.QueryResult["rows"]> {
   const result = await pool.query(
     `
     SELECT
       study_reviews.deck_id,
-      to_char(study_reviews.reviewed_at AT TIME ZONE $2, 'YYYY-MM-DD') AS day_key,
+      to_char((study_reviews.reviewed_at AT TIME ZONE $2) - interval '4 hours', 'YYYY-MM-DD') AS day_key,
       COUNT(*)::int AS new_cards_studied
     FROM study_reviews
     JOIN deck_assignments ON deck_assignments.user_id = study_reviews.user_id
@@ -287,7 +315,7 @@ async function dailyUsageRows(pool: pg.Pool, userId: string, timeZone: string): 
   return result.rows;
 }
 
-async function statsSummaryRows(pool: pg.Pool, userId: string, timeZone: string): Promise<{
+async function statsSummaryRows(pool: Queryable, userId: string, timeZone: string): Promise<{
   activityDays: pg.QueryResult["rows"];
   weakCards: pg.QueryResult["rows"];
 }> {
@@ -295,7 +323,7 @@ async function statsSummaryRows(pool: pg.Pool, userId: string, timeZone: string)
     pool.query(
       `
       SELECT
-        to_char(study_reviews.reviewed_at AT TIME ZONE $2, 'YYYY-MM-DD') AS day_key,
+        to_char((study_reviews.reviewed_at AT TIME ZONE $2) - interval '4 hours', 'YYYY-MM-DD') AS day_key,
         COUNT(*)::int AS reviewed_count,
         COUNT(*) FILTER (WHERE study_reviews.outcome IN ('remembered', 'correct'))::int AS passed_count
       FROM study_reviews
@@ -376,7 +404,7 @@ function clientTimeZone(request: { headers: Record<string, unknown> }): string {
   }
 }
 
-async function latestRevision(pool: pg.Pool): Promise<string> {
+async function latestRevision(pool: Queryable): Promise<string> {
   const result = await pool.query<{ revision: string }>(
     `
     SELECT GREATEST(
@@ -392,7 +420,7 @@ async function latestRevision(pool: pg.Pool): Promise<string> {
   return result.rows[0]?.revision ?? "0";
 }
 
-async function allUserRows(pool: pg.Pool): Promise<UserRow[]> {
+async function allUserRows(pool: Queryable): Promise<UserRow[]> {
   const result = await pool.query<UserRow>(
     `
     SELECT id, display_name, avatar_media_id, role, created_at, updated_at
@@ -453,6 +481,7 @@ function parseReviews(value: unknown): ReviewEventInput[] {
       cardId: requiredUUID(review.cardId, `reviews[${index}].cardId`),
       mode: studyMode(review.mode, `reviews[${index}].mode`),
       outcome: reviewOutcome(review.outcome, `reviews[${index}].outcome`),
+      source: reviewSource(review.source, `reviews[${index}].source`),
       reviewedAt: requiredTimestamp(review.reviewedAt, `reviews[${index}].reviewedAt`),
       durationMs: optionalNonNegativeInteger(review.durationMs, `reviews[${index}].durationMs`),
       wasNew: review.wasNew,
@@ -867,167 +896,206 @@ async function allowedDeckPreferenceTargetKeys(
 
 export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, config: AppConfig): Promise<void> {
   const syncEventsRateLimit = createRateLimit(endpointRateLimits.syncEvents);
+  const syncReadRateLimit = createRateLimit(endpointRateLimits.syncReads);
 
-  app.get("/v1/bootstrap", async (request) => {
+  app.get<{ Querystring: BootstrapQuery }>("/v1/bootstrap", {
+    preHandler: syncReadRateLimit,
+  }, async (request) => {
     requireHouseholdSync(request, config);
 
-    const users = await allUserRows(pool);
-    const requestedUserId = selectedUserHeader(request);
-    const requestedUserExists = requestedUserId && users.some((user) => user.id === requestedUserId);
-    const userId = requestedUserExists ? requestedUserId : users[0]?.id ?? null;
-    const cachedVersions = cachedDeckVersionIds(request);
-    const timeZone = clientTimeZone(request);
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
 
-    const [assignments, content, media, progress, matchingRecords, dailyUsage, statsSummary, reviewsRevision] = userId
-      ? await Promise.all([
-          assignedDeckRows(pool, userId),
-          assignedContentRows(pool, userId, undefined, cachedVersions),
-          pool.query(
-            `
-            SELECT media_objects.id,
-                   media_objects.storage_key,
-                   media_objects.sha256,
-                   media_objects.mime_type,
-                   media_objects.byte_size::int AS byte_size,
-                   media_objects.width::int AS width,
-                   media_objects.height::int AS height,
-                   media_objects.updated_at
-            FROM media_objects
-            WHERE media_objects.id IN (
-              SELECT decks.avatar_media_id
-              FROM deck_assignments
-              JOIN decks ON decks.id = deck_assignments.deck_id
-              WHERE deck_assignments.user_id = $1 AND decks.avatar_media_id IS NOT NULL
-              UNION
-              SELECT users.avatar_media_id
-              FROM users
-              WHERE users.avatar_media_id IS NOT NULL
-              UNION
-              SELECT deck_version_cards.image_media_id
-              FROM deck_assignments
-              JOIN decks ON decks.id = deck_assignments.deck_id
-              JOIN deck_version_cards ON deck_version_cards.deck_version_id = COALESCE(deck_assignments.deck_version_id, decks.current_version_id)
-              WHERE deck_assignments.user_id = $1 AND deck_version_cards.image_media_id IS NOT NULL
-              UNION
-              SELECT deck_version_cards.audio_word_media_id
-              FROM deck_assignments
-              JOIN decks ON decks.id = deck_assignments.deck_id
-              JOIN deck_version_cards ON deck_version_cards.deck_version_id = COALESCE(deck_assignments.deck_version_id, decks.current_version_id)
-              WHERE deck_assignments.user_id = $1 AND deck_version_cards.audio_word_media_id IS NOT NULL
-              UNION
-              SELECT deck_version_examples.image_media_id
-              FROM deck_assignments
-              JOIN decks ON decks.id = deck_assignments.deck_id
-              JOIN deck_version_examples ON deck_version_examples.deck_version_id = COALESCE(deck_assignments.deck_version_id, decks.current_version_id)
-              WHERE deck_assignments.user_id = $1 AND deck_version_examples.image_media_id IS NOT NULL
-              UNION
-              SELECT deck_version_examples.audio_example_media_id
-              FROM deck_assignments
-              JOIN decks ON decks.id = deck_assignments.deck_id
-              JOIN deck_version_examples ON deck_version_examples.deck_version_id = COALESCE(deck_assignments.deck_version_id, decks.current_version_id)
-              WHERE deck_assignments.user_id = $1 AND deck_version_examples.audio_example_media_id IS NOT NULL
-            )
-            ORDER BY media_objects.storage_key
-            `,
-            [userId],
-          ),
-          pool.query(
-            `
-            SELECT user_id,
-                   card_id,
-                   deck_id,
-                   fsrs_data,
-                   due_at,
-                   state,
-                   updated_at,
-                   server_revision
-            FROM card_progress
-            WHERE user_id = $1
-            ORDER BY updated_at DESC
-            `,
-            [userId],
-          ),
-          pool.query(
-            `
-            SELECT *
-            FROM deck_matching_records
-            WHERE user_id = $1
-            ORDER BY server_revision
-            `,
-            [userId],
-          ),
-          dailyUsageRows(pool, userId, timeZone),
-          statsSummaryRows(pool, userId, timeZone),
-          pool.query<{ revision: string }>(
-            `
-            SELECT COALESCE(MAX(server_revision), 0)::text AS revision
-            FROM study_reviews
-            WHERE user_id = $1
-            `,
-            [userId],
-          ),
-        ])
-      : [
-          [],
-          emptyContent(),
-          { rows: [] },
-          { rows: [] },
-          { rows: [] },
-          [],
-          { activityDays: [], weakCards: [] },
-          { rows: [{ revision: "0" }] },
-        ];
+      const users = await allUserRows(client);
+      const requestedUserId = selectedUserHeader(request);
+      const requestedUserExists = requestedUserId && users.some((user) => user.id === requestedUserId);
+      const userId = requestedUserExists ? requestedUserId : users[0]?.id ?? null;
+      const cachedVersions = cachedDeckVersionIds(request);
+      const timeZone = clientTimeZone(request);
+      const sinceRevision = parseRevision(request.query.sinceRevision).toString();
+      const deviceId = requestDeviceId(request.headers[clientDeviceIdHeader]);
 
-    return {
-      user: users.find((user) => user.id === userId) ?? null,
-      users,
-      assignments,
-      content,
-      media: media.rows,
-      progress: progress.rows,
-      reviews: [],
-      matchingRecords: matchingRecords.rows,
-      dailyUsage,
-      statsSummary,
-      reviewsRevision: reviewsRevision.rows[0]?.revision ?? "0",
-      serverRevision: await latestRevision(pool),
-    };
+      const [assignments, content, media, progress, matchingRecords, reviews, dailyUsage, statsSummary, reviewsRevision] = userId
+        ? [
+            await assignedDeckRows(client, userId),
+            await assignedContentRows(client, userId, undefined, cachedVersions),
+            await client.query(
+              `
+              SELECT media_objects.id,
+                     media_objects.storage_key,
+                     media_objects.sha256,
+                     media_objects.mime_type,
+                     media_objects.byte_size::int AS byte_size,
+                     media_objects.width::int AS width,
+                     media_objects.height::int AS height,
+                     media_objects.updated_at
+              FROM media_objects
+              WHERE media_objects.id IN (
+                SELECT decks.avatar_media_id
+                FROM deck_assignments
+                JOIN decks ON decks.id = deck_assignments.deck_id
+                WHERE deck_assignments.user_id = $1 AND decks.avatar_media_id IS NOT NULL
+                UNION
+                SELECT users.avatar_media_id
+                FROM users
+                WHERE users.avatar_media_id IS NOT NULL
+                UNION
+                SELECT deck_version_cards.image_media_id
+                FROM deck_assignments
+                JOIN decks ON decks.id = deck_assignments.deck_id
+                JOIN deck_version_cards ON deck_version_cards.deck_version_id = COALESCE(deck_assignments.deck_version_id, decks.current_version_id)
+                WHERE deck_assignments.user_id = $1 AND deck_version_cards.image_media_id IS NOT NULL
+                UNION
+                SELECT deck_version_cards.audio_word_media_id
+                FROM deck_assignments
+                JOIN decks ON decks.id = deck_assignments.deck_id
+                JOIN deck_version_cards ON deck_version_cards.deck_version_id = COALESCE(deck_assignments.deck_version_id, decks.current_version_id)
+                WHERE deck_assignments.user_id = $1 AND deck_version_cards.audio_word_media_id IS NOT NULL
+                UNION
+                SELECT deck_version_examples.image_media_id
+                FROM deck_assignments
+                JOIN decks ON decks.id = deck_assignments.deck_id
+                JOIN deck_version_examples ON deck_version_examples.deck_version_id = COALESCE(deck_assignments.deck_version_id, decks.current_version_id)
+                WHERE deck_assignments.user_id = $1 AND deck_version_examples.image_media_id IS NOT NULL
+                UNION
+                SELECT deck_version_examples.audio_example_media_id
+                FROM deck_assignments
+                JOIN decks ON decks.id = deck_assignments.deck_id
+                JOIN deck_version_examples ON deck_version_examples.deck_version_id = COALESCE(deck_assignments.deck_version_id, decks.current_version_id)
+                WHERE deck_assignments.user_id = $1 AND deck_version_examples.audio_example_media_id IS NOT NULL
+              )
+              ORDER BY media_objects.storage_key
+              `,
+              [userId],
+            ),
+            await client.query(
+              `
+              SELECT user_id,
+                     card_id,
+                     deck_id,
+                     fsrs_data,
+                     due_at,
+                     state,
+                     updated_at,
+                     server_revision
+              FROM card_progress
+              WHERE user_id = $1
+              ORDER BY updated_at DESC
+              `,
+              [userId],
+            ),
+            await client.query(
+              `
+              SELECT *
+              FROM deck_matching_records
+              WHERE user_id = $1
+              ORDER BY server_revision
+              `,
+              [userId],
+            ),
+            await client.query(
+              `
+              SELECT *
+              FROM study_reviews
+              WHERE user_id = $1
+                AND server_revision > $2
+                AND ($3::uuid IS NULL OR modified_by_device_id IS NULL OR modified_by_device_id <> $3::uuid)
+              ORDER BY server_revision
+              `,
+              [userId, sinceRevision, deviceId],
+            ),
+            await dailyUsageRows(client, userId, timeZone),
+            await statsSummaryRows(client, userId, timeZone),
+            await client.query<{ revision: string }>(
+              `
+              SELECT COALESCE(MAX(server_revision), 0)::text AS revision
+              FROM study_reviews
+              WHERE user_id = $1
+              `,
+              [userId],
+            ),
+          ]
+        : [
+            [],
+            emptyContent(),
+            { rows: [] },
+            { rows: [] },
+            { rows: [] },
+            { rows: [] },
+            [],
+            { activityDays: [], weakCards: [] },
+            { rows: [{ revision: "0" }] },
+          ];
+
+      const serverRevision = await latestRevision(client);
+      await client.query("COMMIT");
+
+      return {
+        user: users.find((user) => user.id === userId) ?? null,
+        users,
+        assignments,
+        content,
+        media: media.rows,
+        progress: progress.rows,
+        reviews: reviews.rows,
+        matchingRecords: matchingRecords.rows,
+        dailyUsage,
+        statsSummary,
+        reviewsRevision: reviewsRevision.rows[0]?.revision ?? "0",
+        serverRevision,
+      };
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
   });
 
-  app.get<{ Querystring: ChangesQuery }>("/v1/sync/changes", async (request) => {
+  app.get<{ Querystring: ChangesQuery }>("/v1/sync/changes", {
+    preHandler: syncReadRateLimit,
+  }, async (request) => {
     requireHouseholdSync(request, config);
     const userId = await selectedSyncUserId(request, pool);
     const sinceRevision = parseRevision(request.query.sinceRevision).toString();
+    const deviceId = requestDeviceId(request.headers[clientDeviceIdHeader]);
 
     const [assignments, content, progress, reviews, matchingRecords] = await Promise.all([
-      assignedDeckRows(pool, userId, sinceRevision),
+      assignedDeckRows(pool, userId, sinceRevision, deviceId),
       assignedContentRows(pool, userId, sinceRevision),
       pool.query(
         `
         SELECT *
         FROM card_progress
-        WHERE user_id = $1 AND server_revision > $2
+        WHERE user_id = $1
+          AND server_revision > $2
+          AND ($3::uuid IS NULL OR modified_by_device_id IS NULL OR modified_by_device_id <> $3::uuid)
         ORDER BY server_revision
         `,
-        [userId, sinceRevision],
+        [userId, sinceRevision, deviceId],
       ),
       pool.query(
         `
         SELECT *
         FROM study_reviews
-        WHERE user_id = $1 AND server_revision > $2
+        WHERE user_id = $1
+          AND server_revision > $2
+          AND ($3::uuid IS NULL OR modified_by_device_id IS NULL OR modified_by_device_id <> $3::uuid)
         ORDER BY server_revision
         `,
-        [userId, sinceRevision],
+        [userId, sinceRevision, deviceId],
       ),
       pool.query(
         `
         SELECT *
         FROM deck_matching_records
-        WHERE user_id = $1 AND server_revision > $2
+        WHERE user_id = $1
+          AND server_revision > $2
+          AND ($3::uuid IS NULL OR modified_by_device_id IS NULL OR modified_by_device_id <> $3::uuid)
         ORDER BY server_revision
         `,
-        [userId, sinceRevision],
+        [userId, sinceRevision, deviceId],
       ),
     ]);
 
@@ -1047,6 +1115,7 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
   }, async (request) => {
     requireHouseholdSync(request, config);
     const userId = await selectedSyncUserId(request, pool);
+    const deviceId = requestDeviceId(request.headers[clientDeviceIdHeader]);
     const startedAt = Date.now();
     const data = body(request.body);
     const reviews = parseReviews(data.reviews);
@@ -1071,10 +1140,11 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
           `
           INSERT INTO study_reviews (
             user_id, client_event_id, deck_id, deck_version_id, card_id,
-            mode, outcome, reviewed_at, duration_ms, was_new, previous_state, new_state
+            mode, outcome, source, reviewed_at, duration_ms, was_new, previous_state, new_state,
+            modified_by_device_id
           ) VALUES (
             $1, $2, $3, $4, $5,
-            $6, $7, $8::timestamptz, $9, $10, $11, $12
+            $6, $7, $8, $9::timestamptz, $10, $11, $12, $13, $14::uuid
           )
           ON CONFLICT (user_id, client_event_id) DO NOTHING
           RETURNING client_event_id
@@ -1087,11 +1157,13 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
             review.cardId,
             review.mode,
             review.outcome,
+            review.source,
             review.reviewedAt,
             review.durationMs,
             review.wasNew,
             review.previousState,
             review.newState,
+            deviceId,
           ],
         );
         if (result.rowCount) {
@@ -1105,9 +1177,9 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
         const result = await client.query<{ card_id: string }>(
           `
           INSERT INTO card_progress (
-            user_id, card_id, deck_id, fsrs_data, due_at, state, updated_at
+            user_id, card_id, deck_id, fsrs_data, due_at, state, updated_at, modified_by_device_id
           ) VALUES (
-            $1, $2, $3, $4::jsonb, $5::timestamptz, $6, COALESCE($7::timestamptz, now())
+            $1, $2, $3, $4::jsonb, $5::timestamptz, $6, COALESCE($7::timestamptz, now()), $8::uuid
           )
           ON CONFLICT (user_id, card_id) DO UPDATE SET
             deck_id = excluded.deck_id,
@@ -1115,6 +1187,7 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
             due_at = excluded.due_at,
             state = excluded.state,
             updated_at = excluded.updated_at,
+            modified_by_device_id = excluded.modified_by_device_id,
             server_revision = nextval('server_revision_seq')
           WHERE (
               card_progress.deck_id IS DISTINCT FROM excluded.deck_id
@@ -1134,6 +1207,7 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
             progress.dueAt,
             progress.state,
             progress.updatedAt,
+            deviceId,
           ],
         );
         if (result.rowCount) {
@@ -1145,15 +1219,17 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
         const result = await client.query<{ deck_id: string }>(
           `
           INSERT INTO deck_matching_records (
-            user_id, deck_id, deck_version_id, best_duration_seconds, pair_count, achieved_at
+            user_id, deck_id, deck_version_id, best_duration_seconds, pair_count, achieved_at,
+            modified_by_device_id
           ) VALUES (
-            $1, $2, $3, $4, $5, $6::timestamptz
+            $1, $2, $3, $4, $5, $6::timestamptz, $7::uuid
           )
           ON CONFLICT (user_id, deck_id) DO UPDATE SET
             deck_version_id = excluded.deck_version_id,
             best_duration_seconds = excluded.best_duration_seconds,
             pair_count = excluded.pair_count,
             achieved_at = excluded.achieved_at,
+            modified_by_device_id = excluded.modified_by_device_id,
             server_revision = nextval('server_revision_seq')
           WHERE deck_matching_records.pair_count IS DISTINCT FROM excluded.pair_count
              OR excluded.best_duration_seconds < deck_matching_records.best_duration_seconds
@@ -1166,6 +1242,7 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
             record.bestDurationSeconds,
             record.pairCount,
             record.achievedAt,
+            deviceId,
           ],
         );
         if (result.rowCount) {
@@ -1177,18 +1254,19 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
         await client.query(
           `
           INSERT INTO user_deck_preferences (
-            user_id, deck_id, is_enabled, updated_at
+            user_id, deck_id, is_enabled, updated_at, modified_by_device_id
           ) VALUES (
-            $1, $2, $3, COALESCE($4::timestamptz, now())
+            $1, $2, $3, COALESCE($4::timestamptz, now()), $5::uuid
           )
           ON CONFLICT (user_id, deck_id) DO UPDATE SET
             is_enabled = excluded.is_enabled,
             updated_at = excluded.updated_at,
+            modified_by_device_id = excluded.modified_by_device_id,
             server_revision = nextval('server_revision_seq')
           WHERE user_deck_preferences.is_enabled IS DISTINCT FROM excluded.is_enabled
             AND excluded.updated_at >= user_deck_preferences.updated_at
           `,
-          [userId, preference.deckId, preference.isEnabled, preference.updatedAt],
+          [userId, preference.deckId, preference.isEnabled, preference.updatedAt, deviceId],
         );
         deckPreferenceDeckIds.push(preference.deckId);
       }

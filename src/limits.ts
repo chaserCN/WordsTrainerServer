@@ -11,6 +11,7 @@ export const endpointRateLimits = {
   admin: { name: "admin", max: 10_000, windowMs: 60_000 },
   mediaUpload: { name: "media_upload", max: 10_000, windowMs: 60_000 },
   syncEvents: { name: "sync_events", max: 120, windowMs: 60_000 },
+  syncReads: { name: "sync_reads", max: 240, windowMs: 60_000 },
 } as const;
 
 type RateLimitOptions = {

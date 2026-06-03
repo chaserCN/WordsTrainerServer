@@ -1366,7 +1366,7 @@ test("admin can hide and restore a deck through assignment status without deleti
   const activeBootstrap = await syncJson(ctx, "GET", "/v1/bootstrap", learner.token, undefined, learner.userId);
   assert.equal(activeBootstrap.assignments[0].assignment_status, "active");
   assert.equal(activeBootstrap.content.cards.length, 2);
-  assert.deepEqual(activeBootstrap.reviews, []);
+  assert.equal(activeBootstrap.reviews.length, 1);
   assert.equal(activeBootstrap.statsSummary.activityDays.length, 1);
   assert.equal(activeBootstrap.progress.length, 1);
 
@@ -1391,7 +1391,7 @@ test("admin can hide and restore a deck through assignment status without deleti
   const archivedBootstrap = await syncJson(ctx, "GET", "/v1/bootstrap", learner.token, undefined, learner.userId);
   assert.equal(archivedBootstrap.assignments[0].assignment_status, "archived");
   assert.deepEqual(archivedBootstrap.content.cards, []);
-  assert.deepEqual(archivedBootstrap.reviews, []);
+  assert.equal(archivedBootstrap.reviews.length, 1);
   assert.equal(archivedBootstrap.statsSummary.activityDays.length, 1);
   assert.equal(archivedBootstrap.progress.length, 1);
 
@@ -1410,7 +1410,7 @@ test("admin can hide and restore a deck through assignment status without deleti
   const restoredBootstrap = await syncJson(ctx, "GET", "/v1/bootstrap", learner.token, undefined, learner.userId);
   assert.equal(restoredBootstrap.assignments[0].assignment_status, "active");
   assert.equal(restoredBootstrap.content.cards.length, 2);
-  assert.deepEqual(restoredBootstrap.reviews, []);
+  assert.equal(restoredBootstrap.reviews.length, 1);
   assert.equal(restoredBootstrap.statsSummary.activityDays.length, 1);
   assert.equal(restoredBootstrap.progress.length, 1);
 });
@@ -1724,6 +1724,7 @@ test("mobile sync supports user switching, idempotent reviews, progress updates,
         cardId: deck.cardIds[0],
         mode: "flashcards",
         outcome: "remembered",
+        source: "today_queue",
         reviewedAt,
         durationMs: 1400,
         wasNew: true,
@@ -1782,19 +1783,30 @@ test("mobile sync supports user switching, idempotent reviews, progress updates,
     `
     SELECT
       (SELECT COUNT(*) FROM study_reviews WHERE user_id = $1) AS review_count,
+      (SELECT source FROM study_reviews WHERE user_id = $1 LIMIT 1) AS review_source,
       (SELECT COUNT(*) FROM card_progress WHERE user_id = $1) AS progress_count,
       (SELECT COUNT(*) FROM deck_matching_records WHERE user_id = $1) AS matching_count
     `,
     [child.userId],
   );
   assert.equal(Number(persistedStats.rows[0].review_count), 1);
+  assert.equal(persistedStats.rows[0].review_source, "today_queue");
   assert.equal(Number(persistedStats.rows[0].progress_count), 1);
   assert.equal(Number(persistedStats.rows[0].matching_count), 1);
 
-  const bootstrapAfterSync = await syncJson(ctx, "GET", "/v1/bootstrap", child.token, undefined, child.userId);
+  const bootstrapAfterSync = await syncJson(
+    ctx,
+    "GET",
+    `/v1/bootstrap?sinceRevision=${baselineRevision}`,
+    child.token,
+    undefined,
+    child.userId,
+  );
   assert.equal(bootstrapAfterSync.progress.length, 1);
   assert.equal(bootstrapAfterSync.progress[0].card_id, deck.cardIds[0]);
-  assert.deepEqual(bootstrapAfterSync.reviews, []);
+  assert.equal(bootstrapAfterSync.reviews.length, 1);
+  assert.equal(bootstrapAfterSync.reviews[0].client_event_id, clientEventId);
+  assert.equal(bootstrapAfterSync.reviews[0].source, "today_queue");
   assert.equal(bootstrapAfterSync.matchingRecords.length, 1);
   assert.equal(bootstrapAfterSync.matchingRecords[0].deck_id, deck.deckId);
   assert.equal(bootstrapAfterSync.dailyUsage.length, 1);
@@ -1829,6 +1841,7 @@ test("mobile sync supports user switching, idempotent reviews, progress updates,
   );
   assert.equal(changes.reviews.length, 1);
   assert.equal(changes.reviews[0].client_event_id, clientEventId);
+  assert.equal(changes.reviews[0].source, "today_queue");
   assert.equal(changes.progress.length, 1);
   assert.equal(changes.progress[0].card_id, deck.cardIds[0]);
   assert.equal(changes.matchingRecords.length, 1);
@@ -1915,6 +1928,7 @@ test("sync validation rejects malformed payloads without partial writes", async 
     { payload: { reviews: [reviewEvent(deck, { clientEventId: "not-a-uuid" })] }, message: "bad review uuid" },
     { payload: { reviews: [reviewEvent(deck, { mode: "quiz" })] }, message: "bad review mode" },
     { payload: { reviews: [reviewEvent(deck, { outcome: "maybe" })] }, message: "bad review outcome" },
+    { payload: { reviews: [reviewEvent(deck, { source: "random" })] }, message: "bad review source" },
     { payload: { reviews: [reviewEvent(deck, { reviewedAt: "not-a-date" })] }, message: "bad review date" },
     { payload: { reviews: [reviewEvent(deck, { durationMs: 1.5 })] }, message: "bad review duration" },
     { payload: { reviews: [reviewEvent(deck, { wasNew: "yes" })] }, message: "bad review boolean" },
@@ -2290,6 +2304,104 @@ test("sync target validation partially accepts a mixed batch with explicit rejec
   assert.equal(Number(persistedStats.rows[0].progress_count), 1);
   assert.equal(Number(persistedStats.rows[0].matching_count), 1);
   assert.equal(Number(persistedStats.rows[0].preference_count), 1);
+});
+
+test("sync changes excludes records written by the same device", async (t) => {
+  const ctx = await createTestApp(t);
+  if (!ctx) return;
+
+  const learner = await createUser(ctx, "Device Filter Learner");
+  const deck = await createPublishedDeck(ctx, learner.userId, "Device filter words");
+  const baseline = await syncJson(ctx, "GET", "/v1/bootstrap", learner.token, undefined, learner.userId);
+  const deviceId = randomUUID();
+  const otherDeviceId = randomUUID();
+  const clientEventId = randomUUID();
+
+  await injectJson(ctx.app, {
+    method: "POST",
+    url: "/v1/sync/events",
+    headers: {
+      authorization: `Bearer ${learner.token}`,
+      "x-flashgame-user-id": learner.userId,
+      "x-flashgame-device-id": deviceId,
+    },
+    payload: {
+      reviews: [
+        reviewEvent(deck, { clientEventId, source: "today_queue" }),
+      ],
+      progress: [
+        progressEvent(deck),
+      ],
+      matchingRecords: [
+        matchingRecord(deck),
+      ],
+      deckPreferences: [
+        {
+          deckId: deck.deckId,
+          isEnabled: false,
+          updatedAt: "2026-06-02T10:02:00.000Z",
+        },
+      ],
+    },
+  });
+
+  const sameDeviceChanges = await injectJson(ctx.app, {
+    method: "GET",
+    url: `/v1/sync/changes?sinceRevision=${baseline.serverRevision}`,
+    headers: {
+      authorization: `Bearer ${learner.token}`,
+      "x-flashgame-user-id": learner.userId,
+      "x-flashgame-device-id": deviceId,
+    },
+  });
+  assert.deepEqual(sameDeviceChanges.assignments, []);
+  assert.deepEqual(sameDeviceChanges.progress, []);
+  assert.deepEqual(sameDeviceChanges.reviews, []);
+  assert.deepEqual(sameDeviceChanges.matchingRecords, []);
+  assert.ok(BigInt(sameDeviceChanges.serverRevision) > BigInt(baseline.serverRevision));
+
+  const otherDeviceChanges = await injectJson(ctx.app, {
+    method: "GET",
+    url: `/v1/sync/changes?sinceRevision=${baseline.serverRevision}`,
+    headers: {
+      authorization: `Bearer ${learner.token}`,
+      "x-flashgame-user-id": learner.userId,
+      "x-flashgame-device-id": otherDeviceId,
+    },
+  });
+  assert.equal(otherDeviceChanges.assignments.length, 1);
+  assert.equal(otherDeviceChanges.assignments[0].user_enabled, false);
+  assert.equal(otherDeviceChanges.reviews.length, 1);
+  assert.equal(otherDeviceChanges.reviews[0].client_event_id, clientEventId);
+  assert.equal(otherDeviceChanges.reviews[0].source, "today_queue");
+  assert.equal(otherDeviceChanges.progress.length, 1);
+  assert.equal(otherDeviceChanges.progress[0].card_id, deck.cardIds[0]);
+  assert.equal(otherDeviceChanges.matchingRecords.length, 1);
+  assert.equal(otherDeviceChanges.matchingRecords[0].deck_id, deck.deckId);
+
+  const sameDeviceBootstrap = await injectJson(ctx.app, {
+    method: "GET",
+    url: `/v1/bootstrap?sinceRevision=${baseline.serverRevision}`,
+    headers: {
+      authorization: `Bearer ${learner.token}`,
+      "x-flashgame-user-id": learner.userId,
+      "x-flashgame-device-id": deviceId,
+    },
+  });
+  assert.deepEqual(sameDeviceBootstrap.reviews, []);
+  assert.ok(BigInt(sameDeviceBootstrap.serverRevision) > BigInt(baseline.serverRevision));
+
+  const otherDeviceBootstrap = await injectJson(ctx.app, {
+    method: "GET",
+    url: `/v1/bootstrap?sinceRevision=${baseline.serverRevision}`,
+    headers: {
+      authorization: `Bearer ${learner.token}`,
+      "x-flashgame-user-id": learner.userId,
+      "x-flashgame-device-id": otherDeviceId,
+    },
+  });
+  assert.equal(otherDeviceBootstrap.reviews.length, 1);
+  assert.equal(otherDeviceBootstrap.reviews[0].client_event_id, clientEventId);
 });
 
 test("sync ignores stale progress updates for the same user and card", async (t) => {
