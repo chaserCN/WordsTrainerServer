@@ -405,6 +405,21 @@ async function createMedia(ctx: TestApp, name: string): Promise<string> {
   return result.media.id;
 }
 
+async function uploadLocalMedia(ctx: TestApp, fileName: string, mimeType: string, bytes: Buffer): Promise<any> {
+  const response = await ctx.app.inject({
+    method: "POST",
+    url: "/v1/admin/media/upload",
+    headers: {
+      ...ctx.adminAuth,
+      "content-type": mimeType,
+      "x-file-name": fileName,
+    },
+    payload: bytes,
+  });
+  assert.equal(response.statusCode, 201, response.payload);
+  return JSON.parse(response.payload).media;
+}
+
 async function createUser(ctx: TestApp, displayName: string): Promise<{ userId: string; token: string }> {
   const user = await adminJson(ctx, "POST", "/v1/admin/users", {
     displayName,
@@ -1070,6 +1085,88 @@ test("admin can delete draft cards and examples with dependent content", async (
   assert.equal(bootstrap.content.cards.length, 1);
   assert.equal(bootstrap.content.cards[0].card_id, keptCardId);
   assert.deepEqual(bootstrap.content.examples, []);
+});
+
+test("admin can delete draft deck versions and orphan local media", async (t) => {
+  const ctx = await createTestApp(t);
+  if (!ctx) return;
+
+  const learner = await createUser(ctx, "Draft Cleanup Learner");
+  const deck = await createPublishedDeck(ctx, learner.userId, "Draft cleanup deck");
+
+  await adminJson(ctx, "DELETE", `/v1/admin/decks/${deck.deckId}/versions/${deck.versionId}`, {
+    deleteOrphanMedia: true,
+    orphanMediaOlderThanMinutes: 0,
+  }, 400);
+
+  const draft = await adminJson(ctx, "POST", `/v1/admin/decks/${deck.deckId}/versions`, {
+    manifest: { source: "interrupted-upload-test" },
+  }, 201);
+  const draftVersionId = draft.version.id;
+  const draftCardId = randomUUID();
+  const draftAudio = await uploadLocalMedia(ctx, "draft-word.mp3", "audio/mpeg", Buffer.from("draft audio"));
+  const orphanAudio = await uploadLocalMedia(ctx, "orphan-word.mp3", "audio/mpeg", Buffer.from("orphan audio"));
+  const retainedAvatar = await uploadLocalMedia(ctx, "retained-avatar.jpg", "image/jpeg", Buffer.from("avatar"));
+
+  await adminJson(ctx, "PUT", `/v1/admin/users/${learner.userId}`, {
+    avatarMediaId: retainedAvatar.id,
+  });
+  await adminJson(ctx, "PUT", `/v1/admin/decks/${deck.deckId}/versions/${draftVersionId}/cards/${draftCardId}`, {
+    lemma: "draft",
+    displayWord: "draft",
+    translation: "черновик",
+    audioWordMediaId: draftAudio.id,
+    sortOrder: 1,
+  });
+
+  const versionsBefore = await adminJson(ctx, "GET", `/v1/admin/decks/${deck.deckId}/versions`);
+  assert.deepEqual(
+    versionsBefore.versions.map((version: any) => version.status).sort(),
+    ["draft", "published"],
+  );
+
+  const deleted = await adminJson(ctx, "DELETE", `/v1/admin/decks/${deck.deckId}/versions/${draftVersionId}`, {
+    deleteOrphanMedia: true,
+    orphanMediaOlderThanMinutes: 0,
+  });
+  assert.equal(deleted.version.id, draftVersionId);
+  assert.equal(deleted.deletedMediaCount, 2);
+  assert.equal(deleted.deletedFileCount, 2);
+  assert.deepEqual(deleted.failedFiles, []);
+  assert.deepEqual(
+    deleted.deletedMedia.map((media: any) => media.id).sort(),
+    [draftAudio.id, orphanAudio.id].sort(),
+  );
+
+  await adminJson(ctx, "GET", `/v1/admin/decks/${deck.deckId}/versions/${draftVersionId}`, undefined, 404);
+  const versionsAfter = await adminJson(ctx, "GET", `/v1/admin/decks/${deck.deckId}/versions`);
+  assert.deepEqual(versionsAfter.versions.map((version: any) => version.status), ["published"]);
+
+  const missingDraftAudio = await ctx.app.inject({
+    method: "GET",
+    url: `/v1/media/${draftAudio.id}`,
+    headers: { authorization: `Bearer ${ctx.syncToken}` },
+  });
+  assert.equal(missingDraftAudio.statusCode, 404, missingDraftAudio.payload);
+
+  const missingOrphanAudio = await ctx.app.inject({
+    method: "GET",
+    url: `/v1/media/${orphanAudio.id}`,
+    headers: { authorization: `Bearer ${ctx.syncToken}` },
+  });
+  assert.equal(missingOrphanAudio.statusCode, 404, missingOrphanAudio.payload);
+
+  const retainedDownload = await ctx.app.inject({
+    method: "GET",
+    url: `/v1/media/${retainedAvatar.id}`,
+    headers: { authorization: `Bearer ${ctx.syncToken}` },
+  });
+  assert.equal(retainedDownload.statusCode, 200, retainedDownload.payload);
+  assert.deepEqual(retainedDownload.rawPayload, Buffer.from("avatar"));
+
+  const bootstrap = await syncJson(ctx, "GET", "/v1/bootstrap", learner.token, undefined, learner.userId);
+  assert.equal(bootstrap.assignments.length, 1);
+  assert.equal(bootstrap.assignments[0].current_version_id, deck.versionId);
 });
 
 test("admin can remove a published card by publishing a new draft version without it", async (t) => {

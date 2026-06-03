@@ -1,6 +1,6 @@
 import type { FastifyInstance } from "fastify";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type pg from "pg";
 import { requireAdmin } from "../auth.js";
@@ -28,6 +28,12 @@ type IdParams = {
 };
 
 type Queryable = Pick<pg.Pool, "query">;
+
+type DeletedMediaObject = {
+  id: string;
+  storage_key: string;
+  byte_size: string | number | null;
+};
 
 function body(requestBody: unknown): Record<string, unknown> {
   if (requestBody == null || typeof requestBody !== "object" || Array.isArray(requestBody)) {
@@ -91,6 +97,67 @@ function optionalBoolean(value: unknown, field: string, defaultValue: boolean): 
     badRequest(`${field} must be a boolean`);
   }
   return value;
+}
+
+async function removeLocalMediaFiles(config: AppConfig, media: DeletedMediaObject[]): Promise<{
+  deletedFileCount: number;
+  failedFiles: string[];
+}> {
+  const root = path.resolve(config.localMediaRoot);
+  let deletedFileCount = 0;
+  const failedFiles: string[] = [];
+
+  for (const item of media) {
+    if (/^https?:\/\//i.test(item.storage_key)) {
+      continue;
+    }
+    const filePath = path.resolve(root, item.storage_key);
+    if (!filePath.startsWith(`${root}${path.sep}`)) {
+      failedFiles.push(item.storage_key);
+      continue;
+    }
+    try {
+      await rm(filePath, { force: true });
+      deletedFileCount += 1;
+    } catch {
+      failedFiles.push(item.storage_key);
+    }
+  }
+
+  return { deletedFileCount, failedFiles };
+}
+
+async function deleteOrphanMediaObjects(
+  client: Queryable,
+  olderThanMinutes: number,
+): Promise<DeletedMediaObject[]> {
+  const result = await client.query<DeletedMediaObject>(
+    `
+    DELETE FROM media_objects
+    WHERE created_at <= now() - ($1::text || ' minutes')::interval
+      AND NOT EXISTS (
+        SELECT 1 FROM users WHERE users.avatar_media_id = media_objects.id
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM decks WHERE decks.avatar_media_id = media_objects.id
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM deck_version_cards
+        WHERE deck_version_cards.image_media_id = media_objects.id
+           OR deck_version_cards.audio_word_media_id = media_objects.id
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM deck_version_examples
+        WHERE deck_version_examples.image_media_id = media_objects.id
+           OR deck_version_examples.audio_example_media_id = media_objects.id
+      )
+    RETURNING id, storage_key, byte_size
+    `,
+    [olderThanMinutes],
+  );
+  return result.rows;
 }
 
 function requireSingleBlank(template: string): void {
@@ -897,6 +964,113 @@ export async function registerAdminRoutes(
     );
     reply.status(201);
     return { version: result.rows[0] };
+  });
+
+  app.get<{ Params: IdParams }>("/v1/admin/decks/:deckId/versions", async (request) => {
+    const deckId = requiredUUID(request.params.deckId, "deckId");
+    await requireDeck(pool, deckId);
+
+    const result = await pool.query(
+      `
+      SELECT deck_versions.id,
+             deck_versions.deck_id,
+             deck_versions.version_number,
+             deck_versions.status,
+             deck_versions.manifest,
+             deck_versions.server_revision,
+             deck_versions.created_at,
+             deck_versions.published_at,
+             COUNT(DISTINCT deck_version_cards.card_id)::int AS card_count,
+             COUNT(DISTINCT deck_version_examples.example_id)::int AS example_count
+      FROM deck_versions
+      LEFT JOIN deck_version_cards ON deck_version_cards.deck_version_id = deck_versions.id
+      LEFT JOIN deck_version_examples ON deck_version_examples.deck_version_id = deck_versions.id
+      WHERE deck_versions.deck_id = $1
+      GROUP BY deck_versions.id
+      ORDER BY deck_versions.version_number DESC
+      `,
+      [deckId],
+    );
+    return { versions: result.rows };
+  });
+
+  app.delete<{ Params: IdParams }>("/v1/admin/decks/:deckId/versions/:versionId", async (request) => {
+    const deckId = requiredUUID(request.params.deckId, "deckId");
+    const versionId = requiredUUID(request.params.versionId, "versionId");
+    const data = request.body == null ? {} : body(request.body);
+    const deleteOrphanMedia = optionalBoolean(data.deleteOrphanMedia, "deleteOrphanMedia", true);
+    const orphanMediaOlderThanMinutes = optionalInteger(data.orphanMediaOlderThanMinutes, "orphanMediaOlderThanMinutes", 5);
+    if (orphanMediaOlderThanMinutes < 0) {
+      badRequest("orphanMediaOlderThanMinutes must be non-negative");
+    }
+
+    const client = await pool.connect();
+    let deletedMedia: DeletedMediaObject[] = [];
+    let deletedVersion: unknown;
+    try {
+      await client.query("BEGIN");
+      const version = await client.query(
+        `
+        SELECT deck_versions.id,
+               deck_versions.deck_id,
+               deck_versions.version_number,
+               deck_versions.status,
+               deck_versions.manifest,
+               deck_versions.server_revision,
+               deck_versions.created_at,
+               deck_versions.published_at,
+               decks.current_version_id
+        FROM deck_versions
+        JOIN decks ON decks.id = deck_versions.deck_id
+        WHERE deck_versions.deck_id = $1 AND deck_versions.id = $2
+        FOR UPDATE
+        `,
+        [deckId, versionId],
+      );
+      if (!version.rowCount) {
+        notFound("deck version not found");
+      }
+      if (version.rows[0].status !== "draft") {
+        badRequest("only draft deck versions can be deleted");
+      }
+      if (version.rows[0].current_version_id === versionId) {
+        badRequest("current deck version cannot be deleted");
+      }
+
+      const deleted = await client.query(
+        `
+        DELETE FROM deck_versions
+        WHERE deck_id = $1 AND id = $2
+        RETURNING id, deck_id, version_number, status, manifest, server_revision, created_at, published_at
+        `,
+        [deckId, versionId],
+      );
+      deletedVersion = deleted.rows[0];
+
+      if (deleteOrphanMedia) {
+        deletedMedia = await deleteOrphanMediaObjects(client, orphanMediaOlderThanMinutes);
+      }
+
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+
+    const fileCleanup = await removeLocalMediaFiles(config, deletedMedia);
+    return {
+      version: deletedVersion,
+      deletedMedia: deletedMedia.map((media) => ({
+        id: media.id,
+        storage_key: media.storage_key,
+        byte_size: media.byte_size == null ? null : Number(media.byte_size),
+      })),
+      deletedMediaCount: deletedMedia.length,
+      deletedFileCount: fileCleanup.deletedFileCount,
+      failedFiles: fileCleanup.failedFiles,
+    };
   });
 
   app.get<{ Params: IdParams }>("/v1/admin/decks/:deckId/versions/:versionId", async (request) => {
