@@ -20,6 +20,9 @@ type ChangesQuery = {
 
 const cachedDeckVersionIdsHeader = "x-flashgame-cached-deck-version-ids";
 const clientTimeZoneHeader = "x-flashgame-time-zone";
+const timeZoneAliases = new Map<string, string>([
+  ["Europe/Kiev", "Europe/Kyiv"],
+]);
 
 type UserRow = {
   id: string;
@@ -362,9 +365,15 @@ function clientTimeZone(request: { headers: Record<string, unknown> }): string {
   }
   const value = (Array.isArray(rawValue) ? rawValue[0] : String(rawValue)).trim();
   if (!/^[A-Za-z0-9_+\-./]{1,64}$/.test(value)) {
-    badRequest("x-flashgame-time-zone must be a valid time zone name");
+    return "UTC";
   }
-  return value;
+  const normalized = timeZoneAliases.get(value) ?? value;
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: normalized });
+    return normalized;
+  } catch {
+    return "UTC";
+  }
 }
 
 async function latestRevision(pool: pg.Pool): Promise<string> {

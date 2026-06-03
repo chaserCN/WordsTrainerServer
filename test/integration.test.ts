@@ -1807,6 +1807,18 @@ test("mobile sync supports user switching, idempotent reviews, progress updates,
   assert.equal(bootstrapAfterSync.statsSummary.activityDays[0].passed_count, 1);
   assert.deepEqual(bootstrapAfterSync.statsSummary.weakCards, []);
 
+  const legacyKievTimeZoneBootstrap = await injectJson(ctx.app, {
+    method: "GET",
+    url: "/v1/bootstrap",
+    headers: {
+      authorization: `Bearer ${child.token}`,
+      "x-flashgame-user-id": child.userId,
+      "x-flashgame-time-zone": "Europe/Kiev",
+    },
+  });
+  assert.equal(legacyKievTimeZoneBootstrap.dailyUsage.length, 1);
+  assert.equal(legacyKievTimeZoneBootstrap.statsSummary.activityDays.length, 1);
+
   const changes = await syncJson(
     ctx,
     "GET",
