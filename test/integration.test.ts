@@ -567,7 +567,7 @@ function matchingRecord(deck: PublishedDeck, overrides: Record<string, unknown> 
     deckId: deck.deckId,
     deckVersionId: deck.versionId,
     bestDurationSeconds: 18.7,
-    pairCount: 4,
+    pairCount: 2,
     achievedAt: "2026-06-01T09:32:00.000Z",
     ...overrides,
   };
@@ -1730,8 +1730,10 @@ test("admin can clone assignments, create a test learner, inspect state, and res
   assert.equal(dryRun.dryRun, true);
   assert.deepEqual(dryRun.deleted, {
     reviews: 1,
+    practiceReviews: 0,
     progress: 1,
     matchingRecords: 1,
+    matchingAttempts: 0,
   });
 
   const detailAfterDryRun = await adminJson(ctx, "GET", `/v1/admin/users/${testLearner.user.id}`);
@@ -1745,8 +1747,10 @@ test("admin can clone assignments, create a test learner, inspect state, and res
   assert.equal(reset.dryRun, false);
   assert.deepEqual(reset.deleted, {
     reviews: 1,
+    practiceReviews: 0,
     progress: 1,
     matchingRecords: 1,
+    matchingAttempts: 0,
   });
 
   const detailAfterReset = await adminJson(ctx, "GET", `/v1/admin/users/${testLearner.user.id}`);
@@ -1888,7 +1892,7 @@ test("mobile sync supports user switching, idempotent reviews, progress updates,
         deckId: deck.deckId,
         deckVersionId: deck.versionId,
         bestDurationSeconds: 18.7,
-        pairCount: 4,
+        pairCount: 2,
         achievedAt: "2026-06-01T09:32:00.000Z",
       },
     ],
@@ -2024,7 +2028,7 @@ test("mobile sync supports user switching, idempotent reviews, progress updates,
           deckId: deck.deckId,
           deckVersionId: deck.versionId,
           bestDurationSeconds: 25.2,
-          pairCount: 4,
+          pairCount: 2,
           achievedAt: "2026-06-02T09:34:00.000Z",
         },
       ],
@@ -2046,7 +2050,7 @@ test("mobile sync supports user switching, idempotent reviews, progress updates,
           deckId: deck.deckId,
           deckVersionId: deck.versionId,
           bestDurationSeconds: 14.1,
-          pairCount: 4,
+          pairCount: 2,
           achievedAt: "2026-06-02T09:35:00.000Z",
         },
       ],
@@ -2054,6 +2058,94 @@ test("mobile sync supports user switching, idempotent reviews, progress updates,
     child.userId,
   );
   assert.deepEqual(betterMatchingRecord.matchingRecordDeckIds, [deck.deckId]);
+
+  const partialMatchingRecord = await syncJson(
+    ctx,
+    "POST",
+    "/v1/sync/events",
+    child.token,
+    {
+      matchingRecords: [
+        {
+          deckId: deck.deckId,
+          deckVersionId: deck.versionId,
+          bestDurationSeconds: 3.5,
+          pairCount: 1,
+          achievedAt: "2026-06-02T09:36:00.000Z",
+        },
+      ],
+    },
+    child.userId,
+  );
+  assert.deepEqual(partialMatchingRecord.matchingRecordDeckIds, []);
+  assert.deepEqual(partialMatchingRecord.rejectedMatchingRecordDeckIds, [deck.deckId]);
+});
+
+test("admin daily activity separates study, practice, and matching attempts", async (t) => {
+  const ctx = await createTestApp(t);
+  if (!ctx) return;
+
+  const learner = await createUser(ctx, "Daily Activity Learner");
+  const deck = await createPublishedDeck(ctx, learner.userId, "Daily activity deck");
+  const practiceReviewId = randomUUID();
+  const matchingAttemptId = randomUUID();
+
+  await syncJson(ctx, "POST", "/v1/sync/events", learner.token, {
+    reviews: [
+      reviewEvent(deck, {
+        clientEventId: randomUUID(),
+        source: "today_queue",
+        reviewedAt: "2026-06-01T09:30:00.000Z",
+      }),
+    ],
+    practiceReviews: [
+      {
+        clientEventId: practiceReviewId,
+        deckId: deck.deckId,
+        deckVersionId: deck.versionId,
+        cardId: deck.cardIds[0],
+        mode: "clozeMultipleChoice",
+        outcome: "correct",
+        source: "today_practice",
+        practicedAt: "2026-06-01T10:00:00.000Z",
+        durationMs: 900,
+      },
+    ],
+    matchingAttempts: [
+      {
+        clientEventId: matchingAttemptId,
+        deckId: deck.deckId,
+        deckVersionId: null,
+        mode: "matchingAudio",
+        source: "today_practice",
+        completedAt: "2026-06-01T10:05:00.000Z",
+        durationMs: 24000,
+        pairCount: 2,
+      },
+    ],
+  }, learner.userId);
+
+  const activity = await adminJson(
+    ctx,
+    "GET",
+    `/v1/admin/users/${learner.userId}/daily-activity?dayKey=2026-06-01&timeZone=Europe%2FKiev`,
+  );
+  assert.equal(activity.active, true);
+  assert.deepEqual(activity.studyReviews, { total: 1, passed: 1 });
+  assert.deepEqual(activity.practiceReviews, { total: 1, passed: 1 });
+  assert.deepEqual(activity.matchingAttempts, { total: 1, columns: 0, audioColumns: 1 });
+  assert.equal(activity.firstActivityAt, "2026-06-01T09:30:00.000Z");
+  assert.equal(activity.lastActivityAt, "2026-06-01T10:05:00.000Z");
+
+  const emptyActivity = await adminJson(
+    ctx,
+    "GET",
+    `/v1/admin/users/${learner.userId}/daily-activity?dayKey=2026-06-02&timeZone=Europe%2FKiev`,
+  );
+  assert.equal(emptyActivity.active, false);
+  assert.deepEqual(emptyActivity.studyReviews, { total: 0, passed: 0 });
+  assert.deepEqual(emptyActivity.practiceReviews, { total: 0, passed: 0 });
+  assert.deepEqual(emptyActivity.matchingAttempts, { total: 0, columns: 0, audioColumns: 0 });
 });
 
 test("sync validation rejects malformed payloads without partial writes", async (t) => {
@@ -2176,7 +2268,7 @@ test("sync data is isolated for different users sharing the same deck", async (t
         deckId: sharedDeck.deckId,
         deckVersionId: sharedDeck.versionId,
         bestDurationSeconds: 31.4,
-        pairCount: 4,
+        pairCount: 2,
         achievedAt: "2026-06-01T10:04:00.000Z",
       },
     ],
@@ -2212,7 +2304,7 @@ test("sync data is isolated for different users sharing the same deck", async (t
         deckId: sharedDeck.deckId,
         deckVersionId: sharedDeck.versionId,
         bestDurationSeconds: 19.8,
-        pairCount: 4,
+        pairCount: 2,
         achievedAt: "2026-06-01T11:05:00.000Z",
       },
     ],
@@ -2306,7 +2398,7 @@ test("sync data is isolated for different users sharing the same deck", async (t
         deckId: sharedDeck.deckId,
         deckVersionId: sharedDeck.versionId,
         bestDurationSeconds: 12.4,
-        pairCount: 4,
+        pairCount: 2,
         achievedAt: "2026-06-02T08:02:00.000Z",
       },
     ],

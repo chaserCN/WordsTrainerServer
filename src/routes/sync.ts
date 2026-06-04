@@ -689,6 +689,7 @@ type ProgressTarget = {
 type MatchingTarget = {
   deckId: string;
   deckVersionId: string | null;
+  pairCount: number;
 };
 
 type MatchingAttemptTarget = {
@@ -709,7 +710,7 @@ function progressTargetKey(target: ProgressTarget): string {
 }
 
 function matchingTargetKey(target: MatchingTarget): string {
-  return `${target.deckId}:${nullableKey(target.deckVersionId)}`;
+  return `${target.deckId}:${nullableKey(target.deckVersionId)}:${target.pairCount}`;
 }
 
 function matchingAttemptTargetKey(target: MatchingAttemptTarget): string {
@@ -735,10 +736,11 @@ function progressTargetRows(targets: ProgressTarget[]): Array<{ deck_id: string;
   }));
 }
 
-function matchingTargetRows(targets: MatchingTarget[]): Array<{ deck_id: string; deck_version_id: string | null }> {
+function matchingTargetRows(targets: MatchingTarget[]): Array<{ deck_id: string; deck_version_id: string | null; pair_count: number }> {
   return targets.map((target) => ({
     deck_id: target.deckId,
     deck_version_id: target.deckVersionId,
+    pair_count: target.pairCount,
   }));
 }
 
@@ -1026,6 +1028,7 @@ async function allowedMatchingTargetKeys(
     matchingRecords.map((record) => ({
       deckId: record.deckId,
       deckVersionId: record.deckVersionId,
+      pairCount: record.pairCount,
     })),
     matchingTargetKey,
   );
@@ -1036,17 +1039,20 @@ async function allowedMatchingTargetKeys(
   const result = await client.query<{
     deck_id: string;
     deck_version_id: string | null;
+    pair_count: number;
   }>(
     `
     WITH input_targets AS (
       SELECT DISTINCT
         deck_id::uuid AS deck_id,
-        deck_version_id::uuid AS deck_version_id
+        deck_version_id::uuid AS deck_version_id,
+        pair_count::int AS pair_count
       FROM jsonb_to_recordset($2::jsonb)
-        AS target(deck_id text, deck_version_id text)
+        AS target(deck_id text, deck_version_id text, pair_count int)
     )
     SELECT input_targets.deck_id::text,
-           input_targets.deck_version_id::text
+           input_targets.deck_version_id::text,
+           input_targets.pair_count
     FROM input_targets
     JOIN deck_assignments
       ON deck_assignments.user_id = $1
@@ -1057,12 +1063,22 @@ async function allowedMatchingTargetKeys(
       ON deck_versions.id = decks.current_version_id
       AND deck_versions.status = 'published'
       AND (input_targets.deck_version_id IS NULL OR input_targets.deck_version_id = decks.current_version_id)
+    JOIN deck_version_cards
+      ON deck_version_cards.deck_version_id = deck_versions.id
+      AND deck_version_cards.status = 'active'
+    JOIN LATERAL (
+      SELECT GREATEST(1, COUNT(*) FILTER (WHERE btrim(part) <> ''))::int AS pair_count
+      FROM regexp_split_to_table(deck_version_cards.translation, ';') AS part
+    ) card_pairs ON true
+    GROUP BY input_targets.deck_id, input_targets.deck_version_id, input_targets.pair_count
+    HAVING SUM(card_pairs.pair_count)::int = input_targets.pair_count
     `,
     [userId, JSON.stringify(matchingTargetRows(targets))],
   );
   return new Set(result.rows.map((row) => matchingTargetKey({
     deckId: row.deck_id,
     deckVersionId: row.deck_version_id,
+    pairCount: row.pair_count,
   })));
 }
 

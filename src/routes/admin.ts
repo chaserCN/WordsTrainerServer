@@ -27,6 +27,11 @@ type IdParams = {
   groupId?: string;
 };
 
+type DailyActivityQuery = {
+  dayKey?: string;
+  timeZone?: string;
+};
+
 type Queryable = Pick<pg.Pool, "query">;
 
 type DeletedMediaObject = {
@@ -91,6 +96,40 @@ function optionalInteger(value: unknown, field: string, defaultValue: number): n
     badRequest(`${field} must be an integer`);
   }
   return numberValue;
+}
+
+function adminTimeZone(value: unknown): string {
+  const text = optionalString(value, "timeZone") ?? "Europe/Kiev";
+  if (!/^[A-Za-z0-9_+\-./]{1,64}$/.test(text)) {
+    badRequest("timeZone must be an IANA time zone");
+  }
+  const normalized = text === "Europe/Kyiv" ? "Europe/Kiev" : text;
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: normalized });
+    return normalized;
+  } catch {
+    badRequest("timeZone must be an IANA time zone");
+  }
+}
+
+function studyDayKey(date: Date, timeZone: string): string {
+  const shifted = new Date(date.getTime() - 4 * 60 * 60 * 1000);
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(shifted);
+  const byType = new Map(parts.map((part) => [part.type, part.value]));
+  return `${byType.get("year")}-${byType.get("month")}-${byType.get("day")}`;
+}
+
+function requestedDayKey(value: unknown, timeZone: string): string {
+  const dayKey = optionalString(value, "dayKey") ?? studyDayKey(new Date(), timeZone);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dayKey)) {
+    badRequest("dayKey must be YYYY-MM-DD");
+  }
+  return dayKey;
 }
 
 function optionalBoolean(value: unknown, field: string, defaultValue: boolean): boolean {
@@ -567,6 +606,104 @@ export async function registerAdminRoutes(
       user: user.rows[0],
       assignments: assignments.rows,
       stats: stats.rows[0],
+    };
+  });
+
+  app.get<{ Params: IdParams; Querystring: DailyActivityQuery }>("/v1/admin/users/:userId/daily-activity", async (request) => {
+    const userId = requiredUUID(request.params.userId, "userId");
+    const timeZone = adminTimeZone(request.query.timeZone);
+    const dayKey = requestedDayKey(request.query.dayKey, timeZone);
+
+    const [user, activity] = await Promise.all([
+      pool.query("SELECT id FROM users WHERE id = $1", [userId]),
+      pool.query(
+        `
+        WITH study AS (
+          SELECT
+            COUNT(*)::int AS total_count,
+            COUNT(*) FILTER (WHERE outcome IN ('remembered', 'correct'))::int AS passed_count,
+            MIN(reviewed_at) AS first_at,
+            MAX(reviewed_at) AS last_at
+          FROM study_reviews
+          WHERE user_id = $1
+            AND to_char((reviewed_at AT TIME ZONE $2) - interval '4 hours', 'YYYY-MM-DD') = $3
+        ),
+        practice AS (
+          SELECT
+            COUNT(*)::int AS total_count,
+            COUNT(*) FILTER (WHERE outcome IN ('remembered', 'correct'))::int AS passed_count,
+            MIN(practiced_at) AS first_at,
+            MAX(practiced_at) AS last_at
+          FROM practice_reviews
+          WHERE user_id = $1
+            AND to_char((practiced_at AT TIME ZONE $2) - interval '4 hours', 'YYYY-MM-DD') = $3
+        ),
+        matching AS (
+          SELECT
+            COUNT(*)::int AS total_count,
+            COUNT(*) FILTER (WHERE mode = 'matching')::int AS columns_count,
+            COUNT(*) FILTER (WHERE mode = 'matching_audio')::int AS audio_columns_count,
+            MIN(completed_at) AS first_at,
+            MAX(completed_at) AS last_at
+          FROM matching_attempts
+          WHERE user_id = $1
+            AND to_char((completed_at AT TIME ZONE $2) - interval '4 hours', 'YYYY-MM-DD') = $3
+        )
+        SELECT
+          study.total_count AS study_review_count,
+          study.passed_count AS study_passed_count,
+          practice.total_count AS practice_review_count,
+          practice.passed_count AS practice_passed_count,
+          matching.total_count AS matching_attempt_count,
+          matching.columns_count AS matching_columns_count,
+          matching.audio_columns_count AS matching_audio_columns_count,
+          LEAST(
+            COALESCE(study.first_at, 'infinity'::timestamptz),
+            COALESCE(practice.first_at, 'infinity'::timestamptz),
+            COALESCE(matching.first_at, 'infinity'::timestamptz)
+          ) AS first_activity_at,
+          GREATEST(
+            COALESCE(study.last_at, '-infinity'::timestamptz),
+            COALESCE(practice.last_at, '-infinity'::timestamptz),
+            COALESCE(matching.last_at, '-infinity'::timestamptz)
+          ) AS last_activity_at
+        FROM study, practice, matching
+        `,
+        [userId, timeZone, dayKey],
+      ),
+    ]);
+    if (!user.rowCount) {
+      notFound("user not found");
+    }
+
+    const row = activity.rows[0];
+    const studyReviewCount = Number(row.study_review_count);
+    const practiceReviewCount = Number(row.practice_review_count);
+    const matchingAttemptCount = Number(row.matching_attempt_count);
+    return {
+      userId,
+      dayKey,
+      timeZone,
+      active: studyReviewCount + practiceReviewCount + matchingAttemptCount > 0,
+      studyReviews: {
+        total: studyReviewCount,
+        passed: Number(row.study_passed_count),
+      },
+      practiceReviews: {
+        total: practiceReviewCount,
+        passed: Number(row.practice_passed_count),
+      },
+      matchingAttempts: {
+        total: matchingAttemptCount,
+        columns: Number(row.matching_columns_count),
+        audioColumns: Number(row.matching_audio_columns_count),
+      },
+      firstActivityAt: row.first_activity_at instanceof Date && Number.isFinite(row.first_activity_at.getTime())
+        ? row.first_activity_at.toISOString()
+        : null,
+      lastActivityAt: row.last_activity_at instanceof Date && Number.isFinite(row.last_activity_at.getTime())
+        ? row.last_activity_at.toISOString()
+        : null,
     };
   });
 

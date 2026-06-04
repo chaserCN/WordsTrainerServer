@@ -127,6 +127,7 @@ Admin/editor bootstrap endpoints:
 GET  /v1/admin/users
 POST /v1/admin/users
 PUT  /v1/admin/users/:userId
+GET  /v1/admin/users/:userId/daily-activity?dayKey=YYYY-MM-DD&timeZone=Europe/Kiev
 GET  /v1/admin/groups
 POST /v1/admin/groups
 GET  /v1/admin/groups/:groupId
