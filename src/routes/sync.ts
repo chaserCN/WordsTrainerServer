@@ -53,6 +53,18 @@ type ReviewEventInput = {
   newState: string | null;
 };
 
+type PracticeReviewInput = {
+  clientEventId: string;
+  deckId: string;
+  deckVersionId: string | null;
+  cardId: string;
+  mode: string;
+  outcome: string;
+  source: string;
+  practicedAt: string;
+  durationMs: number | null;
+};
+
 type ProgressInput = {
   cardId: string;
   deckId: string;
@@ -70,6 +82,17 @@ type MatchingRecordInput = {
   achievedAt: string;
 };
 
+type MatchingAttemptInput = {
+  clientEventId: string;
+  deckId: string | null;
+  deckVersionId: string | null;
+  mode: string;
+  source: string;
+  completedAt: string;
+  durationMs: number;
+  pairCount: number;
+};
+
 type DeckPreferenceInput = {
   deckId: string;
   isEnabled: boolean;
@@ -78,12 +101,16 @@ type DeckPreferenceInput = {
 
 type SyncTargetValidation = {
   reviews: ReviewEventInput[];
+  practiceReviews: PracticeReviewInput[];
   progressItems: ProgressInput[];
   matchingRecords: MatchingRecordInput[];
+  matchingAttempts: MatchingAttemptInput[];
   deckPreferences: DeckPreferenceInput[];
   rejectedReviewIds: string[];
+  rejectedPracticeReviewIds: string[];
   rejectedProgressCardIds: string[];
   rejectedMatchingRecordDeckIds: string[];
+  rejectedMatchingAttemptIds: string[];
   rejectedDeckPreferenceDeckIds: string[];
 };
 
@@ -93,6 +120,7 @@ function studyMode(value: unknown, field: string): string {
   case "flashcards":
   case "recall":
   case "matching":
+  case "matching_audio":
   case "cloze_multiple_choice":
   case "cloze_typing":
     return mode;
@@ -100,9 +128,27 @@ function studyMode(value: unknown, field: string): string {
     return "cloze_multiple_choice";
   case "clozeTyping":
     return "cloze_typing";
+  case "matchingAudio":
+    return "matching_audio";
   default:
     badRequest(`${field} must be a valid study mode`);
   }
+}
+
+function matchingAttemptMode(value: unknown, field: string): string {
+  const mode = studyMode(value, field);
+  if (!["matching", "matching_audio"].includes(mode)) {
+    badRequest(`${field} must be matching or matching_audio`);
+  }
+  return mode;
+}
+
+function practiceReviewMode(value: unknown, field: string): string {
+  const mode = studyMode(value, field);
+  if (!["flashcards", "cloze_multiple_choice", "cloze_typing"].includes(mode)) {
+    badRequest(`${field} must be flashcards, cloze_multiple_choice, or cloze_typing`);
+  }
+  return mode;
 }
 
 function reviewOutcome(value: unknown, field: string): string {
@@ -413,7 +459,9 @@ async function latestRevision(pool: Queryable): Promise<string> {
       COALESCE((SELECT MAX(server_revision) FROM user_deck_preferences), 0),
       COALESCE((SELECT MAX(server_revision) FROM card_progress), 0),
       COALESCE((SELECT MAX(server_revision) FROM study_reviews), 0),
-      COALESCE((SELECT MAX(server_revision) FROM deck_matching_records), 0)
+      COALESCE((SELECT MAX(server_revision) FROM practice_reviews), 0),
+      COALESCE((SELECT MAX(server_revision) FROM deck_matching_records), 0),
+      COALESCE((SELECT MAX(server_revision) FROM matching_attempts), 0)
     )::text AS revision
     `,
   );
@@ -491,6 +539,32 @@ function parseReviews(value: unknown): ReviewEventInput[] {
   });
 }
 
+function parsePracticeReviews(value: unknown): PracticeReviewInput[] {
+  if (value == null) {
+    return [];
+  }
+  if (!Array.isArray(value)) {
+    badRequest("practiceReviews must be an array");
+  }
+  return value.map((item, index) => {
+    if (item == null || typeof item !== "object" || Array.isArray(item)) {
+      badRequest(`practiceReviews[${index}] must be an object`);
+    }
+    const review = item as Record<string, unknown>;
+    return {
+      clientEventId: requiredUUID(review.clientEventId, `practiceReviews[${index}].clientEventId`),
+      deckId: requiredUUID(review.deckId, `practiceReviews[${index}].deckId`),
+      deckVersionId: optionalUUID(review.deckVersionId, `practiceReviews[${index}].deckVersionId`),
+      cardId: requiredUUID(review.cardId, `practiceReviews[${index}].cardId`),
+      mode: practiceReviewMode(review.mode, `practiceReviews[${index}].mode`),
+      outcome: reviewOutcome(review.outcome, `practiceReviews[${index}].outcome`),
+      source: reviewSource(review.source, `practiceReviews[${index}].source`),
+      practicedAt: requiredTimestamp(review.practicedAt, `practiceReviews[${index}].practicedAt`),
+      durationMs: optionalNonNegativeInteger(review.durationMs, `practiceReviews[${index}].durationMs`),
+    };
+  });
+}
+
 function parseProgress(value: unknown): ProgressInput[] {
   if (value == null) {
     return [];
@@ -551,6 +625,35 @@ function parseMatchingRecords(value: unknown): MatchingRecordInput[] {
   });
 }
 
+function parseMatchingAttempts(value: unknown): MatchingAttemptInput[] {
+  if (value == null) {
+    return [];
+  }
+  if (!Array.isArray(value)) {
+    badRequest("matchingAttempts must be an array");
+  }
+  return value.map((item, index) => {
+    if (item == null || typeof item !== "object" || Array.isArray(item)) {
+      badRequest(`matchingAttempts[${index}] must be an object`);
+    }
+    const attempt = item as Record<string, unknown>;
+    const pairCount = optionalNumber(attempt.pairCount, `matchingAttempts[${index}].pairCount`);
+    if (pairCount == null || !Number.isInteger(pairCount) || pairCount <= 0) {
+      badRequest(`matchingAttempts[${index}].pairCount must be a positive integer`);
+    }
+    return {
+      clientEventId: requiredUUID(attempt.clientEventId, `matchingAttempts[${index}].clientEventId`),
+      deckId: optionalUUID(attempt.deckId, `matchingAttempts[${index}].deckId`),
+      deckVersionId: optionalUUID(attempt.deckVersionId, `matchingAttempts[${index}].deckVersionId`),
+      mode: matchingAttemptMode(attempt.mode, `matchingAttempts[${index}].mode`),
+      source: reviewSource(attempt.source, `matchingAttempts[${index}].source`),
+      completedAt: requiredTimestamp(attempt.completedAt, `matchingAttempts[${index}].completedAt`),
+      durationMs: optionalNonNegativeInteger(attempt.durationMs, `matchingAttempts[${index}].durationMs`) ?? 0,
+      pairCount,
+    };
+  });
+}
+
 function parseDeckPreferences(value: unknown): DeckPreferenceInput[] {
   if (value == null) {
     return [];
@@ -588,6 +691,11 @@ type MatchingTarget = {
   deckVersionId: string | null;
 };
 
+type MatchingAttemptTarget = {
+  deckId: string | null;
+  deckVersionId: string | null;
+};
+
 function nullableKey(value: string | null): string {
   return value ?? "<effective>";
 }
@@ -602,6 +710,10 @@ function progressTargetKey(target: ProgressTarget): string {
 
 function matchingTargetKey(target: MatchingTarget): string {
   return `${target.deckId}:${nullableKey(target.deckVersionId)}`;
+}
+
+function matchingAttemptTargetKey(target: MatchingAttemptTarget): string {
+  return `${nullableKey(target.deckId)}:${nullableKey(target.deckVersionId)}`;
 }
 
 function uniqueByKey<T>(items: T[], key: (item: T) => string): T[] {
@@ -630,33 +742,50 @@ function matchingTargetRows(targets: MatchingTarget[]): Array<{ deck_id: string;
   }));
 }
 
+function matchingAttemptTargetRows(targets: MatchingAttemptTarget[]): Array<{ deck_id: string | null; deck_version_id: string | null }> {
+  return targets.map((target) => ({
+    deck_id: target.deckId,
+    deck_version_id: target.deckVersionId,
+  }));
+}
+
 async function validateSyncTargets(
   client: Queryable,
   userId: string,
   reviews: ReviewEventInput[],
+  practiceReviews: PracticeReviewInput[],
   progressItems: ProgressInput[],
   matchingRecords: MatchingRecordInput[],
+  matchingAttempts: MatchingAttemptInput[],
   deckPreferences: DeckPreferenceInput[],
 ): Promise<SyncTargetValidation> {
   const [
     allowedReviewTargets,
+    allowedPracticeReviewTargets,
     allowedProgressTargets,
     allowedMatchingTargets,
+    allowedMatchingAttemptTargets,
     allowedDeckPreferenceTargets,
   ] = await Promise.all([
     allowedReviewTargetKeys(client, userId, reviews),
+    allowedPracticeReviewTargetKeys(client, userId, practiceReviews),
     allowedProgressTargetKeys(client, userId, progressItems),
     allowedMatchingTargetKeys(client, userId, matchingRecords),
+    allowedMatchingAttemptTargetKeys(client, userId, matchingAttempts),
     allowedDeckPreferenceTargetKeys(client, userId, deckPreferences),
   ]);
 
   const acceptedReviews: ReviewEventInput[] = [];
+  const acceptedPracticeReviews: PracticeReviewInput[] = [];
   const acceptedProgressItems: ProgressInput[] = [];
   const acceptedMatchingRecords: MatchingRecordInput[] = [];
+  const acceptedMatchingAttempts: MatchingAttemptInput[] = [];
   const acceptedDeckPreferences: DeckPreferenceInput[] = [];
   const rejectedReviewIds: string[] = [];
+  const rejectedPracticeReviewIds: string[] = [];
   const rejectedProgressCardIds: string[] = [];
   const rejectedMatchingRecordDeckIds: string[] = [];
+  const rejectedMatchingAttemptIds: string[] = [];
   const rejectedDeckPreferenceDeckIds: string[] = [];
 
   for (const review of reviews) {
@@ -665,6 +794,14 @@ async function validateSyncTargets(
       acceptedReviews.push(review);
     } else {
       rejectedReviewIds.push(review.clientEventId);
+    }
+  }
+  for (const review of practiceReviews) {
+    const key = reviewTargetKey(review);
+    if (allowedPracticeReviewTargets.has(key)) {
+      acceptedPracticeReviews.push(review);
+    } else {
+      rejectedPracticeReviewIds.push(review.clientEventId);
     }
   }
   for (const progress of progressItems) {
@@ -683,6 +820,14 @@ async function validateSyncTargets(
       rejectedMatchingRecordDeckIds.push(record.deckId);
     }
   }
+  for (const attempt of matchingAttempts) {
+    const key = matchingAttemptTargetKey(attempt);
+    if (allowedMatchingAttemptTargets.has(key)) {
+      acceptedMatchingAttempts.push(attempt);
+    } else {
+      rejectedMatchingAttemptIds.push(attempt.clientEventId);
+    }
+  }
   for (const preference of deckPreferences) {
     if (allowedDeckPreferenceTargets.has(preference.deckId)) {
       acceptedDeckPreferences.push(preference);
@@ -693,12 +838,16 @@ async function validateSyncTargets(
 
   return {
     reviews: acceptedReviews,
+    practiceReviews: acceptedPracticeReviews,
     progressItems: acceptedProgressItems,
     matchingRecords: acceptedMatchingRecords,
+    matchingAttempts: acceptedMatchingAttempts,
     deckPreferences: acceptedDeckPreferences,
     rejectedReviewIds,
+    rejectedPracticeReviewIds,
     rejectedProgressCardIds,
     rejectedMatchingRecordDeckIds,
+    rejectedMatchingAttemptIds,
     rejectedDeckPreferenceDeckIds,
   };
 }
@@ -707,6 +856,63 @@ async function allowedReviewTargetKeys(
   client: Queryable,
   userId: string,
   reviews: ReviewEventInput[],
+): Promise<Set<string>> {
+  const targets = uniqueByKey(
+    reviews.map((review) => ({
+      deckId: review.deckId,
+      deckVersionId: review.deckVersionId,
+      cardId: review.cardId,
+    })),
+    reviewTargetKey,
+  );
+  if (!targets.length) {
+    return new Set();
+  }
+
+  const result = await client.query<{
+    deck_id: string;
+    deck_version_id: string | null;
+    card_id: string;
+  }>(
+    `
+    WITH input_targets AS (
+      SELECT DISTINCT
+        deck_id::uuid AS deck_id,
+        deck_version_id::uuid AS deck_version_id,
+        card_id::uuid AS card_id
+      FROM jsonb_to_recordset($2::jsonb)
+        AS target(deck_id text, deck_version_id text, card_id text)
+    )
+    SELECT input_targets.deck_id::text,
+           input_targets.deck_version_id::text,
+           input_targets.card_id::text
+    FROM input_targets
+    JOIN deck_assignments
+      ON deck_assignments.user_id = $1
+      AND deck_assignments.deck_id = input_targets.deck_id
+      AND deck_assignments.status = 'active'
+    JOIN decks ON decks.id = deck_assignments.deck_id
+    JOIN deck_versions
+      ON deck_versions.id = decks.current_version_id
+      AND deck_versions.status = 'published'
+      AND (input_targets.deck_version_id IS NULL OR input_targets.deck_version_id = decks.current_version_id)
+    JOIN deck_version_cards
+      ON deck_version_cards.deck_version_id = deck_versions.id
+      AND deck_version_cards.card_id = input_targets.card_id
+    `,
+    [userId, JSON.stringify(reviewTargetRows(targets))],
+  );
+  return new Set(result.rows.map((row) => reviewTargetKey({
+    deckId: row.deck_id,
+    deckVersionId: row.deck_version_id,
+    cardId: row.card_id,
+  })));
+}
+
+async function allowedPracticeReviewTargetKeys(
+  client: Queryable,
+  userId: string,
+  reviews: PracticeReviewInput[],
 ): Promise<Set<string>> {
   const targets = uniqueByKey(
     reviews.map((review) => ({
@@ -858,6 +1064,70 @@ async function allowedMatchingTargetKeys(
     deckId: row.deck_id,
     deckVersionId: row.deck_version_id,
   })));
+}
+
+async function allowedMatchingAttemptTargetKeys(
+  client: Queryable,
+  userId: string,
+  matchingAttempts: MatchingAttemptInput[],
+): Promise<Set<string>> {
+  const targets = uniqueByKey(
+    matchingAttempts.map((attempt) => ({
+      deckId: attempt.deckId,
+      deckVersionId: attempt.deckVersionId,
+    })),
+    matchingAttemptTargetKey,
+  );
+  if (!targets.length) {
+    return new Set();
+  }
+
+  const keys = new Set<string>();
+  for (const target of targets) {
+    if (target.deckId == null && target.deckVersionId == null) {
+      keys.add(matchingAttemptTargetKey(target));
+    }
+  }
+
+  const deckTargets = targets.filter((target): target is MatchingTarget => target.deckId != null);
+  if (!deckTargets.length) {
+    return keys;
+  }
+
+  const result = await client.query<{
+    deck_id: string;
+    deck_version_id: string | null;
+  }>(
+    `
+    WITH input_targets AS (
+      SELECT DISTINCT
+        deck_id::uuid AS deck_id,
+        deck_version_id::uuid AS deck_version_id
+      FROM jsonb_to_recordset($2::jsonb)
+        AS target(deck_id text, deck_version_id text)
+    )
+    SELECT input_targets.deck_id::text,
+           input_targets.deck_version_id::text
+    FROM input_targets
+    JOIN deck_assignments
+      ON deck_assignments.user_id = $1
+      AND deck_assignments.deck_id = input_targets.deck_id
+      AND deck_assignments.status = 'active'
+    JOIN decks ON decks.id = deck_assignments.deck_id
+    JOIN deck_versions
+      ON deck_versions.id = decks.current_version_id
+      AND deck_versions.status = 'published'
+      AND (input_targets.deck_version_id IS NULL OR input_targets.deck_version_id = decks.current_version_id)
+    `,
+    [userId, JSON.stringify(matchingAttemptTargetRows(deckTargets))],
+  );
+  for (const row of result.rows) {
+    keys.add(matchingAttemptTargetKey({
+      deckId: row.deck_id,
+      deckVersionId: row.deck_version_id,
+    }));
+  }
+  return keys;
 }
 
 async function allowedDeckPreferenceTargetKeys(
@@ -1107,8 +1377,10 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
     const startedAt = Date.now();
     const data = body(request.body);
     const reviews = parseReviews(data.reviews);
+    const practiceReviews = parsePracticeReviews(data.practiceReviews);
     const progressItems = parseProgress(data.progress);
     const matchingRecords = parseMatchingRecords(data.matchingRecords);
+    const matchingAttempts = parseMatchingAttempts(data.matchingAttempts);
     const deckPreferences = parseDeckPreferences(data.deckPreferences);
 
     const client = await pool.connect();
@@ -1117,11 +1389,24 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
 
       const acceptedReviewIds: string[] = [];
       const duplicateReviewIds: string[] = [];
+      const acceptedPracticeReviewIds: string[] = [];
+      const duplicatePracticeReviewIds: string[] = [];
       const progressCardIds: string[] = [];
       const matchingRecordDeckIds: string[] = [];
+      const acceptedMatchingAttemptIds: string[] = [];
+      const duplicateMatchingAttemptIds: string[] = [];
       const deckPreferenceDeckIds: string[] = [];
 
-      const validated = await validateSyncTargets(client, userId, reviews, progressItems, matchingRecords, deckPreferences);
+      const validated = await validateSyncTargets(
+        client,
+        userId,
+        reviews,
+        practiceReviews,
+        progressItems,
+        matchingRecords,
+        matchingAttempts,
+        deckPreferences,
+      );
 
       for (const review of validated.reviews) {
         const result = await client.query<{ client_event_id: string }>(
@@ -1158,6 +1443,40 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
           acceptedReviewIds.push(review.clientEventId);
         } else {
           duplicateReviewIds.push(review.clientEventId);
+        }
+      }
+
+      for (const review of validated.practiceReviews) {
+        const result = await client.query<{ client_event_id: string }>(
+          `
+          INSERT INTO practice_reviews (
+            user_id, client_event_id, deck_id, deck_version_id, card_id,
+            mode, outcome, source, practiced_at, duration_ms, modified_by_device_id
+          ) VALUES (
+            $1, $2, $3, $4, $5,
+            $6, $7, $8, $9::timestamptz, $10, $11::uuid
+          )
+          ON CONFLICT (user_id, client_event_id) DO NOTHING
+          RETURNING client_event_id
+          `,
+          [
+            userId,
+            review.clientEventId,
+            review.deckId,
+            review.deckVersionId,
+            review.cardId,
+            review.mode,
+            review.outcome,
+            review.source,
+            review.practicedAt,
+            review.durationMs,
+            deviceId,
+          ],
+        );
+        if (result.rowCount) {
+          acceptedPracticeReviewIds.push(review.clientEventId);
+        } else {
+          duplicatePracticeReviewIds.push(review.clientEventId);
         }
       }
 
@@ -1238,6 +1557,39 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
         }
       }
 
+      for (const attempt of validated.matchingAttempts) {
+        const result = await client.query<{ client_event_id: string }>(
+          `
+          INSERT INTO matching_attempts (
+            user_id, client_event_id, deck_id, deck_version_id, mode, source,
+            completed_at, duration_ms, pair_count, modified_by_device_id
+          ) VALUES (
+            $1, $2, $3::uuid, $4::uuid, $5, $6,
+            $7::timestamptz, $8, $9, $10::uuid
+          )
+          ON CONFLICT (user_id, client_event_id) DO NOTHING
+          RETURNING client_event_id
+          `,
+          [
+            userId,
+            attempt.clientEventId,
+            attempt.deckId,
+            attempt.deckVersionId,
+            attempt.mode,
+            attempt.source,
+            attempt.completedAt,
+            attempt.durationMs,
+            attempt.pairCount,
+            deviceId,
+          ],
+        );
+        if (result.rowCount) {
+          acceptedMatchingAttemptIds.push(attempt.clientEventId);
+        } else {
+          duplicateMatchingAttemptIds.push(attempt.clientEventId);
+        }
+      }
+
       for (const preference of validated.deckPreferences) {
         await client.query(
           `
@@ -1268,27 +1620,41 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
         reviewCount: reviews.length,
         acceptedReviewCount: acceptedReviewIds.length,
         duplicateReviewCount: duplicateReviewIds.length,
+        practiceReviewCount: practiceReviews.length,
+        acceptedPracticeReviewCount: acceptedPracticeReviewIds.length,
+        duplicatePracticeReviewCount: duplicatePracticeReviewIds.length,
         progressCount: progressItems.length,
         acceptedProgressCount: progressCardIds.length,
         matchingRecordCount: matchingRecords.length,
         acceptedMatchingRecordCount: matchingRecordDeckIds.length,
+        matchingAttemptCount: matchingAttempts.length,
+        acceptedMatchingAttemptCount: acceptedMatchingAttemptIds.length,
+        duplicateMatchingAttemptCount: duplicateMatchingAttemptIds.length,
         deckPreferenceCount: deckPreferences.length,
         acceptedDeckPreferenceCount: deckPreferenceDeckIds.length,
         rejectedReviewCount: validated.rejectedReviewIds.length,
+        rejectedPracticeReviewCount: validated.rejectedPracticeReviewIds.length,
         rejectedProgressCount: validated.rejectedProgressCardIds.length,
         rejectedMatchingRecordCount: validated.rejectedMatchingRecordDeckIds.length,
+        rejectedMatchingAttemptCount: validated.rejectedMatchingAttemptIds.length,
         rejectedDeckPreferenceCount: validated.rejectedDeckPreferenceDeckIds.length,
       }, "sync events accepted");
 
       return {
         acceptedReviewIds,
         duplicateReviewIds,
+        acceptedPracticeReviewIds,
+        duplicatePracticeReviewIds,
         progressCardIds,
         matchingRecordDeckIds,
+        acceptedMatchingAttemptIds,
+        duplicateMatchingAttemptIds,
         deckPreferenceDeckIds,
         rejectedReviewIds: validated.rejectedReviewIds,
+        rejectedPracticeReviewIds: validated.rejectedPracticeReviewIds,
         rejectedProgressCardIds: validated.rejectedProgressCardIds,
         rejectedMatchingRecordDeckIds: validated.rejectedMatchingRecordDeckIds,
+        rejectedMatchingAttemptIds: validated.rejectedMatchingAttemptIds,
         rejectedDeckPreferenceDeckIds: validated.rejectedDeckPreferenceDeckIds,
         serverRevision: await latestRevision(pool),
       };
@@ -1299,8 +1665,10 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
         userId,
         durationMs: Date.now() - startedAt,
         reviewCount: reviews.length,
+        practiceReviewCount: practiceReviews.length,
         progressCount: progressItems.length,
         matchingRecordCount: matchingRecords.length,
+        matchingAttemptCount: matchingAttempts.length,
         deckPreferenceCount: deckPreferences.length,
       }, "sync events rejected");
       throw error;

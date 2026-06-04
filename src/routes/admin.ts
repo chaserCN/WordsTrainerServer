@@ -553,7 +553,9 @@ export async function registerAdminRoutes(
           (SELECT COUNT(*) FROM deck_assignments WHERE user_id = $1 AND status = 'active') AS active_assignment_count,
           (SELECT COUNT(*) FROM card_progress WHERE user_id = $1) AS progress_count,
           (SELECT COUNT(*) FROM study_reviews WHERE user_id = $1) AS review_count,
-          (SELECT COUNT(*) FROM deck_matching_records WHERE user_id = $1) AS matching_record_count
+          (SELECT COUNT(*) FROM practice_reviews WHERE user_id = $1) AS practice_review_count,
+          (SELECT COUNT(*) FROM deck_matching_records WHERE user_id = $1) AS matching_record_count,
+          (SELECT COUNT(*) FROM matching_attempts WHERE user_id = $1) AS matching_attempt_count
         `,
         [userId],
       ),
@@ -651,14 +653,20 @@ export async function registerAdminRoutes(
         `
         SELECT
           (SELECT COUNT(*) FROM study_reviews WHERE user_id = $1 AND ($2::uuid IS NULL OR deck_id = $2)) AS review_count,
+          (SELECT COUNT(*) FROM practice_reviews WHERE user_id = $1 AND ($2::uuid IS NULL OR deck_id = $2)) AS practice_review_count,
           (SELECT COUNT(*) FROM card_progress WHERE user_id = $1 AND ($2::uuid IS NULL OR deck_id = $2)) AS progress_count,
-          (SELECT COUNT(*) FROM deck_matching_records WHERE user_id = $1 AND ($2::uuid IS NULL OR deck_id = $2)) AS matching_record_count
+          (SELECT COUNT(*) FROM deck_matching_records WHERE user_id = $1 AND ($2::uuid IS NULL OR deck_id = $2)) AS matching_record_count,
+          (SELECT COUNT(*) FROM matching_attempts WHERE user_id = $1 AND ($2::uuid IS NULL OR deck_id = $2)) AS matching_attempt_count
         `,
         params,
       );
       if (!dryRun) {
         await client.query(
           "DELETE FROM study_reviews WHERE user_id = $1 AND ($2::uuid IS NULL OR deck_id = $2)",
+          params,
+        );
+        await client.query(
+          "DELETE FROM practice_reviews WHERE user_id = $1 AND ($2::uuid IS NULL OR deck_id = $2)",
           params,
         );
         await client.query(
@@ -669,14 +677,20 @@ export async function registerAdminRoutes(
           "DELETE FROM deck_matching_records WHERE user_id = $1 AND ($2::uuid IS NULL OR deck_id = $2)",
           params,
         );
+        await client.query(
+          "DELETE FROM matching_attempts WHERE user_id = $1 AND ($2::uuid IS NULL OR deck_id = $2)",
+          params,
+        );
       }
       await client.query("COMMIT");
       return {
         dryRun,
         deleted: {
           reviews: Number(counts.rows[0].review_count),
+          practiceReviews: Number(counts.rows[0].practice_review_count),
           progress: Number(counts.rows[0].progress_count),
           matchingRecords: Number(counts.rows[0].matching_record_count),
+          matchingAttempts: Number(counts.rows[0].matching_attempt_count),
         },
       };
     } catch (error) {

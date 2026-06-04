@@ -9,7 +9,7 @@ CREATE TYPE app_role AS ENUM ('admin', 'editor', 'learner');
 CREATE TYPE group_role AS ENUM ('owner', 'editor', 'learner');
 CREATE TYPE content_status AS ENUM ('active', 'inactive', 'archived');
 CREATE TYPE deck_version_status AS ENUM ('draft', 'published', 'archived');
-CREATE TYPE study_mode AS ENUM ('flashcards', 'recall', 'cloze_multiple_choice', 'cloze_typing', 'matching');
+CREATE TYPE study_mode AS ENUM ('flashcards', 'recall', 'cloze_multiple_choice', 'cloze_typing', 'matching', 'matching_audio');
 CREATE TYPE review_outcome AS ENUM ('remembered', 'forgot', 'correct', 'incorrect');
 
 CREATE TABLE media_objects (
@@ -206,6 +206,30 @@ CREATE INDEX idx_study_reviews_deck_reviewed ON study_reviews(deck_id, reviewed_
 CREATE INDEX idx_study_reviews_card ON study_reviews(user_id, card_id);
 CREATE INDEX idx_study_reviews_revision ON study_reviews(server_revision);
 
+CREATE TABLE practice_reviews (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    client_event_id uuid NOT NULL,
+    deck_id uuid NOT NULL REFERENCES decks(id) ON DELETE CASCADE,
+    deck_version_id uuid REFERENCES deck_versions(id),
+    card_id uuid NOT NULL,
+    mode study_mode NOT NULL,
+    outcome review_outcome NOT NULL,
+    source text NOT NULL DEFAULT 'today_practice'
+        CHECK (source IN ('today_queue', 'deck_session', 'weak_cards', 'today_practice')),
+    practiced_at timestamptz NOT NULL,
+    duration_ms integer CHECK (duration_ms IS NULL OR duration_ms >= 0),
+    modified_by_device_id uuid,
+    server_revision bigint NOT NULL DEFAULT nextval('server_revision_seq'),
+    created_at timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (user_id, client_event_id)
+);
+
+CREATE INDEX idx_practice_reviews_user_practiced ON practice_reviews(user_id, practiced_at);
+CREATE INDEX idx_practice_reviews_deck_practiced ON practice_reviews(deck_id, practiced_at);
+CREATE INDEX idx_practice_reviews_card ON practice_reviews(user_id, card_id);
+CREATE INDEX idx_practice_reviews_revision ON practice_reviews(server_revision);
+
 CREATE TABLE deck_matching_records (
     user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     deck_id uuid NOT NULL REFERENCES decks(id) ON DELETE CASCADE,
@@ -219,6 +243,28 @@ CREATE TABLE deck_matching_records (
 );
 
 CREATE INDEX idx_deck_matching_records_revision ON deck_matching_records(server_revision);
+
+CREATE TABLE matching_attempts (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    client_event_id uuid NOT NULL,
+    deck_id uuid REFERENCES decks(id) ON DELETE CASCADE,
+    deck_version_id uuid REFERENCES deck_versions(id),
+    mode study_mode NOT NULL,
+    source text NOT NULL DEFAULT 'deck_session'
+        CHECK (source IN ('today_queue', 'deck_session', 'weak_cards', 'today_practice')),
+    completed_at timestamptz NOT NULL,
+    duration_ms integer NOT NULL CHECK (duration_ms >= 0),
+    pair_count integer NOT NULL CHECK (pair_count > 0),
+    modified_by_device_id uuid,
+    server_revision bigint NOT NULL DEFAULT nextval('server_revision_seq'),
+    created_at timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (user_id, client_event_id)
+);
+
+CREATE INDEX idx_matching_attempts_user_completed ON matching_attempts(user_id, completed_at);
+CREATE INDEX idx_matching_attempts_deck_completed ON matching_attempts(deck_id, completed_at);
+CREATE INDEX idx_matching_attempts_revision ON matching_attempts(server_revision);
 
 CREATE TABLE telegram_links (
     user_id uuid PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
