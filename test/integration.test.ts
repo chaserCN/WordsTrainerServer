@@ -573,6 +573,20 @@ function matchingRecord(deck: PublishedDeck, overrides: Record<string, unknown> 
   };
 }
 
+function matchingAttempt(deck: PublishedDeck, overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    clientEventId: randomUUID(),
+    deckId: deck.deckId,
+    deckVersionId: deck.versionId,
+    mode: "matching",
+    source: "deck_session",
+    completedAt: "2026-06-01T09:34:00.000Z",
+    durationMs: 18700,
+    pairCount: 2,
+    ...overrides,
+  };
+}
+
 test("mobile bootstrap and sync are usable when server has no assigned content", async (t) => {
   const ctx = await createTestApp(t);
   if (!ctx) return;
@@ -1518,7 +1532,6 @@ test("admin can hide and restore a deck through assignment status without deleti
   assert.equal(activeBootstrap.assignments[0].assignment_status, "active");
   assert.equal(activeBootstrap.content.cards.length, 2);
   assert.equal(activeBootstrap.reviews.length, 1);
-  assert.equal(activeBootstrap.statsSummary.activityDays.length, 1);
   assert.equal(activeBootstrap.progress.length, 1);
 
   const archived = await adminJson(ctx, "POST", `/v1/admin/decks/${deck.deckId}/assignments`, {
@@ -1543,7 +1556,6 @@ test("admin can hide and restore a deck through assignment status without deleti
   assert.equal(archivedBootstrap.assignments[0].assignment_status, "archived");
   assert.deepEqual(archivedBootstrap.content.cards, []);
   assert.equal(archivedBootstrap.reviews.length, 1);
-  assert.equal(archivedBootstrap.statsSummary.activityDays.length, 1);
   assert.equal(archivedBootstrap.progress.length, 1);
 
   const archivedSync = await syncJson(ctx, "POST", "/v1/sync/events", learner.token, {
@@ -1562,7 +1574,6 @@ test("admin can hide and restore a deck through assignment status without deleti
   assert.equal(restoredBootstrap.assignments[0].assignment_status, "active");
   assert.equal(restoredBootstrap.content.cards.length, 2);
   assert.equal(restoredBootstrap.reviews.length, 1);
-  assert.equal(restoredBootstrap.statsSummary.activityDays.length, 1);
   assert.equal(restoredBootstrap.progress.length, 1);
 });
 
@@ -1879,6 +1890,7 @@ test("mobile sync supports user switching, idempotent reviews, progress updates,
   });
 
   const clientEventId = randomUUID();
+  const matchingAttemptId = randomUUID();
   const reviewedAt = "2026-06-01T09:30:00.000Z";
   const dueAt = "2026-06-03T09:30:00.000Z";
   const eventsPayload = {
@@ -1917,6 +1929,9 @@ test("mobile sync supports user switching, idempotent reviews, progress updates,
         achievedAt: "2026-06-01T09:32:00.000Z",
       },
     ],
+    matchingAttempts: [
+      matchingAttempt(deck, { clientEventId: matchingAttemptId }),
+    ],
   };
 
   const firstSync = await syncJson(
@@ -1931,6 +1946,7 @@ test("mobile sync supports user switching, idempotent reviews, progress updates,
   assert.deepEqual(firstSync.duplicateReviewIds, []);
   assert.deepEqual(firstSync.progressCardIds, [deck.cardIds[0]]);
   assert.deepEqual(firstSync.matchingRecordDeckIds, [deck.deckId]);
+  assert.deepEqual(firstSync.acceptedMatchingAttemptIds, [matchingAttemptId]);
 
   const duplicateSync = await syncJson(
     ctx,
@@ -1944,6 +1960,8 @@ test("mobile sync supports user switching, idempotent reviews, progress updates,
   assert.deepEqual(duplicateSync.duplicateReviewIds, [clientEventId]);
   assert.deepEqual(duplicateSync.progressCardIds, []);
   assert.deepEqual(duplicateSync.matchingRecordDeckIds, []);
+  assert.deepEqual(duplicateSync.acceptedMatchingAttemptIds, []);
+  assert.deepEqual(duplicateSync.duplicateMatchingAttemptIds, [matchingAttemptId]);
 
   const persistedStats = await ctx.pool.query(
     `
@@ -1951,7 +1969,8 @@ test("mobile sync supports user switching, idempotent reviews, progress updates,
       (SELECT COUNT(*) FROM study_reviews WHERE user_id = $1) AS review_count,
       (SELECT source FROM study_reviews WHERE user_id = $1 LIMIT 1) AS review_source,
       (SELECT COUNT(*) FROM card_progress WHERE user_id = $1) AS progress_count,
-      (SELECT COUNT(*) FROM deck_matching_records WHERE user_id = $1) AS matching_count
+      (SELECT COUNT(*) FROM deck_matching_records WHERE user_id = $1) AS matching_count,
+      (SELECT COUNT(*) FROM matching_attempts WHERE user_id = $1) AS matching_attempt_count
     `,
     [child.userId],
   );
@@ -1959,6 +1978,7 @@ test("mobile sync supports user switching, idempotent reviews, progress updates,
   assert.equal(persistedStats.rows[0].review_source, "today_queue");
   assert.equal(Number(persistedStats.rows[0].progress_count), 1);
   assert.equal(Number(persistedStats.rows[0].matching_count), 1);
+  assert.equal(Number(persistedStats.rows[0].matching_attempt_count), 1);
 
   const bootstrapAfterSync = await syncJson(
     ctx,
@@ -1975,15 +1995,12 @@ test("mobile sync supports user switching, idempotent reviews, progress updates,
   assert.equal(bootstrapAfterSync.reviews[0].source, "today_queue");
   assert.equal(bootstrapAfterSync.matchingRecords.length, 1);
   assert.equal(bootstrapAfterSync.matchingRecords[0].deck_id, deck.deckId);
+  assert.equal(bootstrapAfterSync.matchingAttempts.length, 1);
+  assert.equal(bootstrapAfterSync.matchingAttempts[0].client_event_id, matchingAttemptId);
   assert.equal(bootstrapAfterSync.dailyUsage.length, 1);
   assert.equal(bootstrapAfterSync.dailyUsage[0].deck_id, deck.deckId);
   assert.equal(bootstrapAfterSync.dailyUsage[0].day_key, "2026-06-01");
   assert.equal(bootstrapAfterSync.dailyUsage[0].new_cards_studied, 1);
-  assert.equal(bootstrapAfterSync.statsSummary.activityDays.length, 1);
-  assert.equal(bootstrapAfterSync.statsSummary.activityDays[0].day_key, "2026-06-01");
-  assert.equal(bootstrapAfterSync.statsSummary.activityDays[0].reviewed_count, 1);
-  assert.equal(bootstrapAfterSync.statsSummary.activityDays[0].passed_count, 1);
-  assert.deepEqual(bootstrapAfterSync.statsSummary.weakCards, []);
 
   const legacyKievTimeZoneBootstrap = await injectJson(ctx.app, {
     method: "GET",
@@ -1995,7 +2012,6 @@ test("mobile sync supports user switching, idempotent reviews, progress updates,
     },
   });
   assert.equal(legacyKievTimeZoneBootstrap.dailyUsage.length, 1);
-  assert.equal(legacyKievTimeZoneBootstrap.statsSummary.activityDays.length, 1);
 
   const changes = await syncJson(
     ctx,
@@ -2012,6 +2028,8 @@ test("mobile sync supports user switching, idempotent reviews, progress updates,
   assert.equal(changes.progress[0].card_id, deck.cardIds[0]);
   assert.equal(changes.matchingRecords.length, 1);
   assert.equal(changes.matchingRecords[0].deck_id, deck.deckId);
+  assert.equal(changes.matchingAttempts.length, 1);
+  assert.equal(changes.matchingAttempts[0].client_event_id, matchingAttemptId);
 
   const updatedProgress = await syncJson(
     ctx,
@@ -2121,6 +2139,15 @@ test("admin daily activity separates study, practice, and matching attempts", as
         clientEventId: randomUUID(),
         source: "today_queue",
         reviewedAt: "2026-06-01T09:30:00.000Z",
+      }),
+      reviewEvent(deck, {
+        clientEventId: randomUUID(),
+        outcome: "forgot",
+        source: "today_queue",
+        reviewedAt: "2026-06-01T09:35:00.000Z",
+        wasNew: false,
+        previousState: "review",
+        newState: "review",
       }),
     ],
     practiceReviews: [
@@ -2576,6 +2603,7 @@ test("sync changes excludes records written by the same device", async (t) => {
   const deviceId = randomUUID();
   const otherDeviceId = randomUUID();
   const clientEventId = randomUUID();
+  const matchingAttemptId = randomUUID();
 
   await injectJson(ctx.app, {
     method: "POST",
@@ -2594,6 +2622,9 @@ test("sync changes excludes records written by the same device", async (t) => {
       ],
       matchingRecords: [
         matchingRecord(deck),
+      ],
+      matchingAttempts: [
+        matchingAttempt(deck, { clientEventId: matchingAttemptId }),
       ],
       deckPreferences: [
         {
@@ -2618,6 +2649,7 @@ test("sync changes excludes records written by the same device", async (t) => {
   assert.deepEqual(sameDeviceChanges.progress, []);
   assert.deepEqual(sameDeviceChanges.reviews, []);
   assert.deepEqual(sameDeviceChanges.matchingRecords, []);
+  assert.deepEqual(sameDeviceChanges.matchingAttempts, []);
   assert.ok(BigInt(sameDeviceChanges.serverRevision) > BigInt(baseline.serverRevision));
 
   const otherDeviceChanges = await injectJson(ctx.app, {
@@ -2638,6 +2670,8 @@ test("sync changes excludes records written by the same device", async (t) => {
   assert.equal(otherDeviceChanges.progress[0].card_id, deck.cardIds[0]);
   assert.equal(otherDeviceChanges.matchingRecords.length, 1);
   assert.equal(otherDeviceChanges.matchingRecords[0].deck_id, deck.deckId);
+  assert.equal(otherDeviceChanges.matchingAttempts.length, 1);
+  assert.equal(otherDeviceChanges.matchingAttempts[0].client_event_id, matchingAttemptId);
 
   const sameDeviceBootstrap = await injectJson(ctx.app, {
     method: "GET",
@@ -2649,6 +2683,7 @@ test("sync changes excludes records written by the same device", async (t) => {
     },
   });
   assert.deepEqual(sameDeviceBootstrap.reviews, []);
+  assert.deepEqual(sameDeviceBootstrap.matchingAttempts, []);
   assert.ok(BigInt(sameDeviceBootstrap.serverRevision) > BigInt(baseline.serverRevision));
 
   const otherDeviceBootstrap = await injectJson(ctx.app, {
@@ -2662,6 +2697,8 @@ test("sync changes excludes records written by the same device", async (t) => {
   });
   assert.equal(otherDeviceBootstrap.reviews.length, 1);
   assert.equal(otherDeviceBootstrap.reviews[0].client_event_id, clientEventId);
+  assert.equal(otherDeviceBootstrap.matchingAttempts.length, 1);
+  assert.equal(otherDeviceBootstrap.matchingAttempts[0].client_event_id, matchingAttemptId);
 });
 
 test("sync ignores stale progress updates for the same user and card", async (t) => {

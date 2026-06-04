@@ -275,33 +275,10 @@ Effective deck activity on the client is:
 assignment_status == "active" && user_enabled != false
 ```
 
-Bootstrap also includes `statsSummary` for dashboard statistics so clients do
-not need raw review history for activity and weak-card views:
-
-```json
-{
-  "activityDays": [
-    {
-      "day_key": "2026-06-01",
-      "reviewed_count": 3,
-      "passed_count": 2
-    }
-  ],
-  "weakCards": [
-    {
-      "card_id": "card-uuid",
-      "deck_id": "deck-uuid",
-      "failed_count": 2,
-      "reviewed_count": 5,
-      "last_failed_at": "2026-06-01T12:00:00.000Z"
-    }
-  ]
-}
-```
-
-`GET /v1/bootstrap` keeps `reviews: []` for response-shape compatibility.
-Raw review history is not part of full bootstrap; use `/v1/sync/changes` for
-revision-based review deltas if needed.
+`GET /v1/bootstrap` includes revision-filtered raw `reviews` so clients can
+derive local statistics from review history. Use `sinceRevision` together with
+`x-flashgame-device-id` to fetch only newer review events and avoid echoing a
+device's own writes.
 
 `POST /v1/sync/events` accepts idempotent study events:
 

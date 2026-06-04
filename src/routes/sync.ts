@@ -363,53 +363,6 @@ async function dailyUsageRows(pool: Queryable, userId: string, timeZone: string)
   return result.rows;
 }
 
-async function statsSummaryRows(pool: Queryable, userId: string, timeZone: string): Promise<{
-  activityDays: pg.QueryResult["rows"];
-  weakCards: pg.QueryResult["rows"];
-}> {
-  const [activityDays, weakCards] = await Promise.all([
-    pool.query(
-      `
-      SELECT
-        to_char((study_reviews.reviewed_at AT TIME ZONE $2) - interval '4 hours', 'YYYY-MM-DD') AS day_key,
-        COUNT(*)::int AS reviewed_count,
-        COUNT(*) FILTER (WHERE study_reviews.outcome IN ('remembered', 'correct'))::int AS passed_count
-      FROM study_reviews
-      WHERE study_reviews.user_id = $1
-      GROUP BY day_key
-      ORDER BY day_key
-      `,
-      [userId, timeZone],
-    ),
-    pool.query(
-      `
-      SELECT
-        study_reviews.card_id,
-        study_reviews.deck_id,
-        COUNT(*) FILTER (WHERE study_reviews.outcome IN ('forgot', 'incorrect'))::int AS failed_count,
-        COUNT(*)::int AS reviewed_count,
-        MAX(study_reviews.reviewed_at) FILTER (WHERE study_reviews.outcome IN ('forgot', 'incorrect')) AS last_failed_at
-      FROM study_reviews
-      JOIN deck_assignments ON deck_assignments.user_id = study_reviews.user_id
-        AND deck_assignments.deck_id = study_reviews.deck_id
-        AND deck_assignments.status = 'active'
-      WHERE study_reviews.user_id = $1
-      GROUP BY study_reviews.card_id, study_reviews.deck_id
-      HAVING COUNT(*) FILTER (WHERE study_reviews.outcome IN ('forgot', 'incorrect')) > 0
-      ORDER BY failed_count DESC,
-               (COUNT(*) FILTER (WHERE study_reviews.outcome IN ('forgot', 'incorrect'))::float / COUNT(*)::float) DESC,
-               last_failed_at DESC
-      LIMIT 100
-      `,
-      [userId],
-    ),
-  ]);
-  return {
-    activityDays: activityDays.rows,
-    weakCards: weakCards.rows,
-  };
-}
-
 function parseRevision(value: unknown): bigint {
   if (typeof value !== "string" || value.trim() === "") {
     return 0n;
@@ -1192,7 +1145,7 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
       const sinceRevision = parseRevision(request.query.sinceRevision).toString();
       const deviceId = requestDeviceId(request.headers[clientDeviceIdHeader]);
 
-      const [assignments, content, media, progress, matchingRecords, reviews, dailyUsage, statsSummary, reviewsRevision] = userId
+      const [assignments, content, media, progress, matchingRecords, matchingAttempts, reviews, dailyUsage, reviewsRevision] = userId
         ? [
             await assignedDeckRows(client, userId),
             await assignedContentRows(client, userId, undefined, cachedVersions),
@@ -1273,6 +1226,17 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
             await client.query(
               `
               SELECT *
+              FROM matching_attempts
+              WHERE user_id = $1
+                AND server_revision > $2
+                AND ($3::uuid IS NULL OR modified_by_device_id IS NULL OR modified_by_device_id <> $3::uuid)
+              ORDER BY server_revision
+              `,
+              [userId, sinceRevision, deviceId],
+            ),
+            await client.query(
+              `
+              SELECT *
               FROM study_reviews
               WHERE user_id = $1
                 AND server_revision > $2
@@ -1282,7 +1246,6 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
               [userId, sinceRevision, deviceId],
             ),
             await dailyUsageRows(client, userId, timeZone),
-            await statsSummaryRows(client, userId, timeZone),
             await client.query<{ revision: string }>(
               `
               SELECT COALESCE(MAX(server_revision), 0)::text AS revision
@@ -1299,8 +1262,8 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
             { rows: [] },
             { rows: [] },
             { rows: [] },
+            { rows: [] },
             [],
-            { activityDays: [], weakCards: [] },
             { rows: [{ revision: "0" }] },
           ];
 
@@ -1316,8 +1279,8 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
         progress: progress.rows,
         reviews: reviews.rows,
         matchingRecords: matchingRecords.rows,
+        matchingAttempts: matchingAttempts.rows,
         dailyUsage,
-        statsSummary,
         reviewsRevision: reviewsRevision.rows[0]?.revision ?? "0",
         serverRevision,
       };
@@ -1337,7 +1300,7 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
     const sinceRevision = parseRevision(request.query.sinceRevision).toString();
     const deviceId = requestDeviceId(request.headers[clientDeviceIdHeader]);
 
-    const [assignments, content, progress, reviews, matchingRecords] = await Promise.all([
+    const [assignments, content, progress, reviews, matchingRecords, matchingAttempts] = await Promise.all([
       assignedDeckRows(pool, userId, sinceRevision, deviceId),
       assignedContentRows(pool, userId, sinceRevision),
       pool.query(
@@ -1373,6 +1336,17 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
         `,
         [userId, sinceRevision, deviceId],
       ),
+      pool.query(
+        `
+        SELECT *
+        FROM matching_attempts
+        WHERE user_id = $1
+          AND server_revision > $2
+          AND ($3::uuid IS NULL OR modified_by_device_id IS NULL OR modified_by_device_id <> $3::uuid)
+        ORDER BY server_revision
+        `,
+        [userId, sinceRevision, deviceId],
+      ),
     ]);
 
     return {
@@ -1381,6 +1355,7 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
       progress: progress.rows,
       reviews: reviews.rows,
       matchingRecords: matchingRecords.rows,
+      matchingAttempts: matchingAttempts.rows,
       serverRevision: await latestRevision(pool),
     };
   });

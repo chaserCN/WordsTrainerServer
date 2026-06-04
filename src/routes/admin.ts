@@ -661,8 +661,8 @@ export async function registerAdminRoutes(
         `
         WITH study AS (
           SELECT
-            COUNT(*)::int AS total_count,
-            COUNT(*) FILTER (WHERE outcome IN ('remembered', 'correct'))::int AS passed_count,
+            COUNT(DISTINCT card_id)::int AS total_count,
+            COUNT(DISTINCT card_id) FILTER (WHERE outcome IN ('remembered', 'correct'))::int AS passed_count,
             MIN(reviewed_at) AS first_at,
             MAX(reviewed_at) AS last_at
           FROM study_reviews
