@@ -757,14 +757,6 @@ export async function registerAdminRoutes(
         total: cardReviewCount,
         passed: studyPassedCount + practicePassedCount,
       },
-      studyReviews: {
-        total: studyReviewCount,
-        passed: studyPassedCount,
-      },
-      practiceReviews: {
-        total: practiceReviewCount,
-        passed: practicePassedCount,
-      },
       matchingAttempts: {
         total: matchingAttemptCount,
         columns: Number(row.matching_columns_count),
