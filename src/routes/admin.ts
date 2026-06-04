@@ -99,11 +99,11 @@ function optionalInteger(value: unknown, field: string, defaultValue: number): n
 }
 
 function adminTimeZone(value: unknown): string {
-  const text = optionalString(value, "timeZone") ?? "Europe/Kiev";
+  const text = optionalString(value, "timeZone") ?? "Europe/Kyiv";
   if (!/^[A-Za-z0-9_+\-./]{1,64}$/.test(text)) {
     badRequest("timeZone must be an IANA time zone");
   }
-  const normalized = text === "Europe/Kyiv" ? "Europe/Kiev" : text;
+  const normalized = text === "Europe/Kiev" ? "Europe/Kyiv" : text;
   try {
     new Intl.DateTimeFormat("en-US", { timeZone: normalized });
     return normalized;
