@@ -661,8 +661,8 @@ export async function registerAdminRoutes(
         `
         WITH study AS (
           SELECT
-            COUNT(DISTINCT card_id)::int AS total_count,
-            COUNT(DISTINCT card_id) FILTER (WHERE outcome IN ('remembered', 'correct'))::int AS passed_count,
+            COUNT(*)::int AS total_count,
+            COUNT(*) FILTER (WHERE outcome IN ('remembered', 'correct'))::int AS passed_count,
             MIN(reviewed_at) AS first_at,
             MAX(reviewed_at) AS last_at
           FROM study_reviews
@@ -679,6 +679,23 @@ export async function registerAdminRoutes(
           WHERE user_id = $1
             AND to_char((practiced_at AT TIME ZONE $2) - interval '4 hours', 'YYYY-MM-DD') = $3
         ),
+        card_reviews AS (
+          SELECT card_id, outcome
+          FROM study_reviews
+          WHERE user_id = $1
+            AND to_char((reviewed_at AT TIME ZONE $2) - interval '4 hours', 'YYYY-MM-DD') = $3
+          UNION ALL
+          SELECT card_id, outcome
+          FROM practice_reviews
+          WHERE user_id = $1
+            AND to_char((practiced_at AT TIME ZONE $2) - interval '4 hours', 'YYYY-MM-DD') = $3
+        ),
+        unique_cards AS (
+          SELECT
+            COUNT(DISTINCT card_id)::int AS total_count,
+            COUNT(DISTINCT card_id) FILTER (WHERE outcome IN ('remembered', 'correct'))::int AS passed_count
+          FROM card_reviews
+        ),
         matching AS (
           SELECT
             COUNT(*)::int AS total_count,
@@ -691,6 +708,8 @@ export async function registerAdminRoutes(
             AND to_char((completed_at AT TIME ZONE $2) - interval '4 hours', 'YYYY-MM-DD') = $3
         )
         SELECT
+          unique_cards.total_count AS unique_card_count,
+          unique_cards.passed_count AS unique_card_passed_count,
           study.total_count AS study_review_count,
           study.passed_count AS study_passed_count,
           practice.total_count AS practice_review_count,
@@ -708,7 +727,7 @@ export async function registerAdminRoutes(
             COALESCE(practice.last_at, '-infinity'::timestamptz),
             COALESCE(matching.last_at, '-infinity'::timestamptz)
           ) AS last_activity_at
-        FROM study, practice, matching
+        FROM study, practice, unique_cards, matching
         `,
         [userId, timeZone, dayKey],
       ),
@@ -719,21 +738,32 @@ export async function registerAdminRoutes(
 
     const row = activity.rows[0];
     const studyReviewCount = Number(row.study_review_count);
+    const studyPassedCount = Number(row.study_passed_count);
     const practiceReviewCount = Number(row.practice_review_count);
+    const practicePassedCount = Number(row.practice_passed_count);
+    const cardReviewCount = studyReviewCount + practiceReviewCount;
     const matchingAttemptCount = Number(row.matching_attempt_count);
     return {
       userId,
       user: user.rows[0],
       dayKey,
       timeZone,
-      active: studyReviewCount + practiceReviewCount + matchingAttemptCount > 0,
+      active: cardReviewCount + matchingAttemptCount > 0,
+      uniqueCards: {
+        total: Number(row.unique_card_count),
+        passed: Number(row.unique_card_passed_count),
+      },
+      cardReviews: {
+        total: cardReviewCount,
+        passed: studyPassedCount + practicePassedCount,
+      },
       studyReviews: {
         total: studyReviewCount,
-        passed: Number(row.study_passed_count),
+        passed: studyPassedCount,
       },
       practiceReviews: {
         total: practiceReviewCount,
-        passed: Number(row.practice_passed_count),
+        passed: practicePassedCount,
       },
       matchingAttempts: {
         total: matchingAttemptCount,

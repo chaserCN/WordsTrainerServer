@@ -2185,7 +2185,9 @@ test("admin daily activity separates study, practice, and matching attempts", as
   assert.equal(activity.active, true);
   assert.equal(activity.user.display_name_localized, "Даша");
   assert.equal(activity.user.grammatical_gender, "female");
-  assert.deepEqual(activity.studyReviews, { total: 1, passed: 1 });
+  assert.deepEqual(activity.uniqueCards, { total: 1, passed: 1 });
+  assert.deepEqual(activity.cardReviews, { total: 3, passed: 2 });
+  assert.deepEqual(activity.studyReviews, { total: 2, passed: 1 });
   assert.deepEqual(activity.practiceReviews, { total: 1, passed: 1 });
   assert.deepEqual(activity.matchingAttempts, { total: 1, columns: 0, audioColumns: 1 });
   assert.equal(activity.firstActivityAt, "2026-06-01T09:30:00.000Z");
@@ -2197,6 +2199,8 @@ test("admin daily activity separates study, practice, and matching attempts", as
     `/v1/admin/users/${learner.userId}/daily-activity?dayKey=2026-06-02&timeZone=Europe%2FKiev`,
   );
   assert.equal(emptyActivity.active, false);
+  assert.deepEqual(emptyActivity.uniqueCards, { total: 0, passed: 0 });
+  assert.deepEqual(emptyActivity.cardReviews, { total: 0, passed: 0 });
   assert.deepEqual(emptyActivity.studyReviews, { total: 0, passed: 0 });
   assert.deepEqual(emptyActivity.practiceReviews, { total: 0, passed: 0 });
   assert.deepEqual(emptyActivity.matchingAttempts, { total: 0, columns: 0, audioColumns: 0 });
