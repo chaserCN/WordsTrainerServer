@@ -178,7 +178,7 @@ async function assignedDeckRows(
     `
     SELECT deck_assignments.user_id,
            deck_assignments.deck_id,
-           deck_assignments.deck_version_id,
+           NULL::uuid AS deck_version_id,
            deck_assignments.status AS assignment_status,
            deck_assignments.server_revision AS assignment_revision,
            decks.title,
@@ -196,7 +196,7 @@ async function assignedDeckRows(
            user_deck_preferences.server_revision AS preference_revision
     FROM deck_assignments
     JOIN decks ON decks.id = deck_assignments.deck_id
-    LEFT JOIN deck_versions ON deck_versions.id = COALESCE(deck_assignments.deck_version_id, decks.current_version_id)
+    LEFT JOIN deck_versions ON deck_versions.id = decks.current_version_id
     LEFT JOIN user_deck_preferences
       ON user_deck_preferences.user_id = deck_assignments.user_id
       AND user_deck_preferences.deck_id = deck_assignments.deck_id
@@ -236,7 +236,7 @@ async function assignedContentRows(
       SELECT deck_versions.id
       FROM deck_assignments
       JOIN decks ON decks.id = deck_assignments.deck_id
-      JOIN deck_versions ON deck_versions.id = COALESCE(deck_assignments.deck_version_id, decks.current_version_id)
+      JOIN deck_versions ON deck_versions.id = decks.current_version_id
       WHERE deck_assignments.user_id = $1
         AND deck_assignments.status = 'active'
         AND deck_versions.status = 'published'
@@ -744,15 +744,9 @@ async function allowedReviewTargetKeys(
       AND deck_assignments.status = 'active'
     JOIN decks ON decks.id = deck_assignments.deck_id
     JOIN deck_versions
-      ON deck_versions.deck_id = decks.id
+      ON deck_versions.id = decks.current_version_id
       AND deck_versions.status = 'published'
-      AND (
-        (input_targets.deck_version_id IS NOT NULL AND deck_versions.id = input_targets.deck_version_id)
-        OR (
-          input_targets.deck_version_id IS NULL
-          AND deck_versions.id = COALESCE(deck_assignments.deck_version_id, decks.current_version_id)
-        )
-      )
+      AND (input_targets.deck_version_id IS NULL OR input_targets.deck_version_id = decks.current_version_id)
     JOIN deck_version_cards
       ON deck_version_cards.deck_version_id = deck_versions.id
       AND deck_version_cards.card_id = input_targets.card_id
@@ -803,7 +797,7 @@ async function allowedProgressTargetKeys(
       AND deck_assignments.status = 'active'
     JOIN decks ON decks.id = deck_assignments.deck_id
     JOIN deck_versions
-      ON deck_versions.id = COALESCE(deck_assignments.deck_version_id, decks.current_version_id)
+      ON deck_versions.id = decks.current_version_id
       AND deck_versions.status = 'published'
     JOIN deck_version_cards
       ON deck_version_cards.deck_version_id = deck_versions.id
@@ -854,15 +848,9 @@ async function allowedMatchingTargetKeys(
       AND deck_assignments.status = 'active'
     JOIN decks ON decks.id = deck_assignments.deck_id
     JOIN deck_versions
-      ON deck_versions.deck_id = decks.id
+      ON deck_versions.id = decks.current_version_id
       AND deck_versions.status = 'published'
-      AND (
-        (input_targets.deck_version_id IS NOT NULL AND deck_versions.id = input_targets.deck_version_id)
-        OR (
-          input_targets.deck_version_id IS NULL
-          AND deck_versions.id = COALESCE(deck_assignments.deck_version_id, decks.current_version_id)
-        )
-      )
+      AND (input_targets.deck_version_id IS NULL OR input_targets.deck_version_id = decks.current_version_id)
     `,
     [userId, JSON.stringify(matchingTargetRows(targets))],
   );
@@ -944,25 +932,25 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
                 SELECT deck_version_cards.image_media_id
                 FROM deck_assignments
                 JOIN decks ON decks.id = deck_assignments.deck_id
-                JOIN deck_version_cards ON deck_version_cards.deck_version_id = COALESCE(deck_assignments.deck_version_id, decks.current_version_id)
+                JOIN deck_version_cards ON deck_version_cards.deck_version_id = decks.current_version_id
                 WHERE deck_assignments.user_id = $1 AND deck_version_cards.image_media_id IS NOT NULL
                 UNION
                 SELECT deck_version_cards.audio_word_media_id
                 FROM deck_assignments
                 JOIN decks ON decks.id = deck_assignments.deck_id
-                JOIN deck_version_cards ON deck_version_cards.deck_version_id = COALESCE(deck_assignments.deck_version_id, decks.current_version_id)
+                JOIN deck_version_cards ON deck_version_cards.deck_version_id = decks.current_version_id
                 WHERE deck_assignments.user_id = $1 AND deck_version_cards.audio_word_media_id IS NOT NULL
                 UNION
                 SELECT deck_version_examples.image_media_id
                 FROM deck_assignments
                 JOIN decks ON decks.id = deck_assignments.deck_id
-                JOIN deck_version_examples ON deck_version_examples.deck_version_id = COALESCE(deck_assignments.deck_version_id, decks.current_version_id)
+                JOIN deck_version_examples ON deck_version_examples.deck_version_id = decks.current_version_id
                 WHERE deck_assignments.user_id = $1 AND deck_version_examples.image_media_id IS NOT NULL
                 UNION
                 SELECT deck_version_examples.audio_example_media_id
                 FROM deck_assignments
                 JOIN decks ON decks.id = deck_assignments.deck_id
-                JOIN deck_version_examples ON deck_version_examples.deck_version_id = COALESCE(deck_assignments.deck_version_id, decks.current_version_id)
+                JOIN deck_version_examples ON deck_version_examples.deck_version_id = decks.current_version_id
                 WHERE deck_assignments.user_id = $1 AND deck_version_examples.audio_example_media_id IS NOT NULL
               )
               ORDER BY media_objects.storage_key

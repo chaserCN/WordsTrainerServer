@@ -32,7 +32,11 @@ type Queryable = Pick<pg.Pool, "query">;
 type DeletedMediaObject = {
   id: string;
   storage_key: string;
+  sha256?: string | null;
+  mime_type?: string | null;
   byte_size: string | number | null;
+  created_at?: Date | string;
+  updated_at?: Date | string;
 };
 
 function body(requestBody: unknown): Record<string, unknown> {
@@ -127,13 +131,14 @@ async function removeLocalMediaFiles(config: AppConfig, media: DeletedMediaObjec
   return { deletedFileCount, failedFiles };
 }
 
-async function deleteOrphanMediaObjects(
+async function listOrphanMediaObjects(
   client: Queryable,
   olderThanMinutes: number,
 ): Promise<DeletedMediaObject[]> {
   const result = await client.query<DeletedMediaObject>(
     `
-    DELETE FROM media_objects
+    SELECT id, storage_key, sha256, mime_type, byte_size, created_at, updated_at
+    FROM media_objects
     WHERE created_at <= now() - ($1::text || ' minutes')::interval
       AND NOT EXISTS (
         SELECT 1 FROM users WHERE users.avatar_media_id = media_objects.id
@@ -153,11 +158,142 @@ async function deleteOrphanMediaObjects(
         WHERE deck_version_examples.image_media_id = media_objects.id
            OR deck_version_examples.audio_example_media_id = media_objects.id
       )
-    RETURNING id, storage_key, byte_size
+    ORDER BY created_at, id
     `,
     [olderThanMinutes],
   );
   return result.rows;
+}
+
+async function deleteOrphanMediaObjects(
+  client: Queryable,
+  olderThanMinutes: number,
+): Promise<DeletedMediaObject[]> {
+  const result = await client.query<DeletedMediaObject>(
+    `
+    DELETE FROM media_objects
+    WHERE id IN (
+      SELECT id
+      FROM media_objects
+      WHERE created_at <= now() - ($1::text || ' minutes')::interval
+        AND NOT EXISTS (
+          SELECT 1 FROM users WHERE users.avatar_media_id = media_objects.id
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM decks WHERE decks.avatar_media_id = media_objects.id
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM deck_version_cards
+          WHERE deck_version_cards.image_media_id = media_objects.id
+             OR deck_version_cards.audio_word_media_id = media_objects.id
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM deck_version_examples
+          WHERE deck_version_examples.image_media_id = media_objects.id
+             OR deck_version_examples.audio_example_media_id = media_objects.id
+        )
+    )
+    RETURNING id, storage_key, sha256, mime_type, byte_size, created_at, updated_at
+    `,
+    [olderThanMinutes],
+  );
+  return result.rows;
+}
+
+async function listOrphanMediaObjectsByIds(
+  client: Queryable,
+  mediaIds: string[],
+  olderThanMinutes: number,
+): Promise<DeletedMediaObject[]> {
+  if (!mediaIds.length) {
+    return [];
+  }
+  const result = await client.query<DeletedMediaObject>(
+    `
+    SELECT id, storage_key, sha256, mime_type, byte_size, created_at, updated_at
+    FROM media_objects
+    WHERE id = ANY($2::uuid[])
+      AND created_at <= now() - ($1::text || ' minutes')::interval
+      AND NOT EXISTS (
+        SELECT 1 FROM users WHERE users.avatar_media_id = media_objects.id
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM decks WHERE decks.avatar_media_id = media_objects.id
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM deck_version_cards
+        WHERE deck_version_cards.image_media_id = media_objects.id
+           OR deck_version_cards.audio_word_media_id = media_objects.id
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM deck_version_examples
+        WHERE deck_version_examples.image_media_id = media_objects.id
+           OR deck_version_examples.audio_example_media_id = media_objects.id
+      )
+    ORDER BY created_at, id
+    `,
+    [olderThanMinutes, mediaIds],
+  );
+  return result.rows;
+}
+
+async function deleteOrphanMediaObjectsByIds(
+  client: Queryable,
+  mediaIds: string[],
+  olderThanMinutes: number,
+): Promise<DeletedMediaObject[]> {
+  if (!mediaIds.length) {
+    return [];
+  }
+  const result = await client.query<DeletedMediaObject>(
+    `
+    DELETE FROM media_objects
+    WHERE id = ANY($2::uuid[])
+      AND created_at <= now() - ($1::text || ' minutes')::interval
+      AND NOT EXISTS (
+        SELECT 1 FROM users WHERE users.avatar_media_id = media_objects.id
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM decks WHERE decks.avatar_media_id = media_objects.id
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM deck_version_cards
+        WHERE deck_version_cards.image_media_id = media_objects.id
+           OR deck_version_cards.audio_word_media_id = media_objects.id
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM deck_version_examples
+        WHERE deck_version_examples.image_media_id = media_objects.id
+           OR deck_version_examples.audio_example_media_id = media_objects.id
+      )
+    RETURNING id, storage_key, sha256, mime_type, byte_size, created_at, updated_at
+    `,
+    [olderThanMinutes, mediaIds],
+  );
+  return result.rows;
+}
+
+function mediaSummary(media: DeletedMediaObject[]) {
+  const totalByteSize = media.reduce((sum, item) => sum + Number(item.byte_size ?? 0), 0);
+  return {
+    media: media.map((item) => ({
+      id: item.id,
+      storage_key: item.storage_key,
+      sha256: item.sha256 ?? null,
+      mime_type: item.mime_type ?? null,
+      byte_size: item.byte_size == null ? null : Number(item.byte_size),
+      created_at: item.created_at,
+      updated_at: item.updated_at,
+    })),
+    mediaCount: media.length,
+    totalByteSize,
+  };
 }
 
 function requireSingleBlank(template: string): void {
@@ -272,11 +408,11 @@ async function cloneUserAssignments(
   const result = await client.query(
     `
     INSERT INTO deck_assignments (user_id, deck_id, deck_version_id, status, server_revision)
-    SELECT $2, deck_id, deck_version_id, status, nextval('server_revision_seq')
+    SELECT $2, deck_id, NULL, status, nextval('server_revision_seq')
     FROM deck_assignments
     WHERE user_id = $1
     ON CONFLICT (user_id, deck_id) DO UPDATE SET
-      deck_version_id = excluded.deck_version_id,
+      deck_version_id = NULL,
       status = excluded.status,
       server_revision = nextval('server_revision_seq'),
       updated_at = now()
@@ -388,7 +524,7 @@ export async function registerAdminRoutes(
         `
         SELECT deck_assignments.user_id,
                deck_assignments.deck_id,
-               deck_assignments.deck_version_id,
+               NULL::uuid AS deck_version_id,
                deck_assignments.status,
                deck_assignments.server_revision,
                deck_assignments.assigned_at,
@@ -398,13 +534,12 @@ export async function registerAdminRoutes(
                decks.avatar_media_id,
                decks.language_code,
                decks.current_version_id,
-               assigned_versions.version_number AS assigned_version_number,
-               assigned_versions.status AS assigned_version_status,
+               NULL::int AS assigned_version_number,
+               NULL::deck_version_status AS assigned_version_status,
                current_versions.version_number AS current_version_number,
                current_versions.status AS current_version_status
         FROM deck_assignments
         JOIN decks ON decks.id = deck_assignments.deck_id
-        LEFT JOIN deck_versions AS assigned_versions ON assigned_versions.id = deck_assignments.deck_version_id
         LEFT JOIN deck_versions AS current_versions ON current_versions.id = decks.current_version_id
         WHERE deck_assignments.user_id = $1
         ORDER BY decks.title
@@ -839,6 +974,48 @@ export async function registerAdminRoutes(
     return { media: result.rows[0] };
   });
 
+  app.post("/v1/admin/media/delete-orphans", async (request) => {
+    const data = request.body == null ? {} : body(request.body);
+    const dryRun = optionalBoolean(data.dryRun, "dryRun", true);
+    const olderThanMinutes = optionalInteger(data.olderThanMinutes, "olderThanMinutes", 60);
+    if (olderThanMinutes < 0) {
+      badRequest("olderThanMinutes must be non-negative");
+    }
+
+    if (dryRun) {
+      const media = await listOrphanMediaObjects(pool, olderThanMinutes);
+      return {
+        dryRun,
+        olderThanMinutes,
+        ...mediaSummary(media),
+        deletedFileCount: 0,
+        failedFiles: [],
+      };
+    }
+
+    const client = await pool.connect();
+    let deletedMedia: DeletedMediaObject[] = [];
+    try {
+      await client.query("BEGIN");
+      deletedMedia = await deleteOrphanMediaObjects(client, olderThanMinutes);
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+
+    const fileCleanup = await removeLocalMediaFiles(config, deletedMedia);
+    return {
+      dryRun,
+      olderThanMinutes,
+      ...mediaSummary(deletedMedia),
+      deletedFileCount: fileCleanup.deletedFileCount,
+      failedFiles: fileCleanup.failedFiles,
+    };
+  });
+
   app.get("/v1/admin/decks", async () => {
     const result = await pool.query(`
       SELECT decks.id,
@@ -994,6 +1171,122 @@ export async function registerAdminRoutes(
     return { versions: result.rows };
   });
 
+  app.post<{ Params: IdParams }>("/v1/admin/decks/:deckId/prune-versions", async (request) => {
+    const deckId = requiredUUID(request.params.deckId, "deckId");
+    const data = request.body == null ? {} : body(request.body);
+    const dryRun = optionalBoolean(data.dryRun, "dryRun", true);
+    const keepPublishedVersions = optionalInteger(data.keepPublishedVersions, "keepPublishedVersions", 1);
+    const deleteDrafts = optionalBoolean(data.deleteDrafts, "deleteDrafts", true);
+    const deleteOrphanMedia = optionalBoolean(data.deleteOrphanMedia, "deleteOrphanMedia", true);
+    const orphanMediaOlderThanMinutes = optionalInteger(data.orphanMediaOlderThanMinutes, "orphanMediaOlderThanMinutes", 0);
+    if (keepPublishedVersions < 1) {
+      badRequest("keepPublishedVersions must be at least 1");
+    }
+    if (orphanMediaOlderThanMinutes < 0) {
+      badRequest("orphanMediaOlderThanMinutes must be non-negative");
+    }
+
+    const client = await pool.connect();
+    let prunedVersions: pg.QueryResultRow[] = [];
+    let deletedMedia: DeletedMediaObject[] = [];
+    try {
+      await client.query("BEGIN");
+      await requireDeck(client, deckId);
+      const versionResult = await client.query(
+        `
+        WITH ranked_versions AS (
+          SELECT deck_versions.id,
+                 deck_versions.deck_id,
+                 deck_versions.version_number,
+                 deck_versions.status,
+                 deck_versions.manifest,
+                 deck_versions.server_revision,
+                 deck_versions.created_at,
+                 deck_versions.published_at,
+                 decks.current_version_id,
+                 CASE WHEN deck_versions.status = 'published'
+                   THEN row_number() OVER (
+                     PARTITION BY deck_versions.deck_id, deck_versions.status
+                     ORDER BY deck_versions.version_number DESC
+                   )
+                 END AS published_rank
+          FROM deck_versions
+          JOIN decks ON decks.id = deck_versions.deck_id
+          WHERE deck_versions.deck_id = $1
+        )
+        SELECT id, deck_id, version_number, status, manifest, server_revision, created_at, published_at
+        FROM ranked_versions
+        WHERE id <> current_version_id
+          AND (
+            (status = 'draft' AND $3::boolean)
+            OR (status IN ('published', 'archived') AND published_rank > $2::int)
+          )
+        ORDER BY version_number
+        `,
+        [deckId, keepPublishedVersions, deleteDrafts],
+      );
+      prunedVersions = versionResult.rows;
+      const versionIds = prunedVersions.map((version) => version.id);
+
+      const mediaResult = versionIds.length
+        ? await client.query<{ id: string }>(
+          `
+          SELECT DISTINCT media_id AS id
+          FROM (
+            SELECT image_media_id AS media_id FROM deck_version_cards WHERE deck_version_id = ANY($1::uuid[])
+            UNION
+            SELECT audio_word_media_id AS media_id FROM deck_version_cards WHERE deck_version_id = ANY($1::uuid[])
+            UNION
+            SELECT image_media_id AS media_id FROM deck_version_examples WHERE deck_version_id = ANY($1::uuid[])
+            UNION
+            SELECT audio_example_media_id AS media_id FROM deck_version_examples WHERE deck_version_id = ANY($1::uuid[])
+          ) version_media
+          WHERE media_id IS NOT NULL
+          `,
+          [versionIds],
+        )
+        : { rows: [] };
+      const mediaIds = mediaResult.rows.map((media) => media.id);
+
+      if (versionIds.length) {
+        await client.query("DELETE FROM deck_versions WHERE deck_id = $1 AND id = ANY($2::uuid[])", [
+          deckId,
+          versionIds,
+        ]);
+      }
+      if (deleteOrphanMedia) {
+        deletedMedia = dryRun
+          ? await listOrphanMediaObjectsByIds(client, mediaIds, orphanMediaOlderThanMinutes)
+          : await deleteOrphanMediaObjectsByIds(client, mediaIds, orphanMediaOlderThanMinutes);
+      }
+
+      if (dryRun) {
+        await client.query("ROLLBACK");
+      } else {
+        await client.query("COMMIT");
+      }
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+
+    const fileCleanup = dryRun ? { deletedFileCount: 0, failedFiles: [] } : await removeLocalMediaFiles(config, deletedMedia);
+    return {
+      dryRun,
+      keepPublishedVersions,
+      deleteDrafts,
+      deleteOrphanMedia,
+      orphanMediaOlderThanMinutes,
+      versions: prunedVersions,
+      versionCount: prunedVersions.length,
+      ...mediaSummary(deletedMedia),
+      deletedFileCount: fileCleanup.deletedFileCount,
+      failedFiles: fileCleanup.failedFiles,
+    };
+  });
+
   app.delete<{ Params: IdParams }>("/v1/admin/decks/:deckId/versions/:versionId", async (request) => {
     const deckId = requiredUUID(request.params.deckId, "deckId");
     const versionId = requiredUUID(request.params.versionId, "versionId");
@@ -1096,7 +1389,7 @@ export async function registerAdminRoutes(
       notFound("deck version not found");
     }
 
-    const [cards, examples, forms, distractors] = await Promise.all([
+    const [cards, examples, forms, distractors, mediaObjects] = await Promise.all([
       pool.query("SELECT * FROM deck_version_cards WHERE deck_version_id = $1 ORDER BY sort_order, display_word", [
         versionId,
       ]),
@@ -1109,6 +1402,34 @@ export async function registerAdminRoutes(
       pool.query("SELECT * FROM deck_version_distractors WHERE deck_version_id = $1 ORDER BY example_id, priority", [
         versionId,
       ]),
+      pool.query(
+        `
+        SELECT media_objects.id,
+               media_objects.storage_key,
+               media_objects.sha256,
+               media_objects.mime_type,
+               media_objects.byte_size::int AS byte_size,
+               media_objects.width::int AS width,
+               media_objects.height::int AS height,
+               media_objects.upload_status,
+               media_objects.created_at,
+               media_objects.updated_at
+        FROM media_objects
+        WHERE media_objects.id IN (
+          SELECT image_media_id FROM deck_version_cards WHERE deck_version_id = $1 AND image_media_id IS NOT NULL
+          UNION
+          SELECT audio_word_media_id FROM deck_version_cards WHERE deck_version_id = $1 AND audio_word_media_id IS NOT NULL
+          UNION
+          SELECT image_media_id FROM deck_version_examples WHERE deck_version_id = $1 AND image_media_id IS NOT NULL
+          UNION
+          SELECT audio_example_media_id FROM deck_version_examples WHERE deck_version_id = $1 AND audio_example_media_id IS NOT NULL
+          UNION
+          SELECT avatar_media_id FROM decks WHERE id = $2 AND avatar_media_id IS NOT NULL
+        )
+        ORDER BY media_objects.storage_key
+        `,
+        [versionId, deckId],
+      ),
     ]);
 
     return {
@@ -1117,6 +1438,7 @@ export async function registerAdminRoutes(
       examples: examples.rows,
       forms: forms.rows,
       distractors: distractors.rows,
+      mediaObjects: mediaObjects.rows,
     };
   });
 
@@ -1485,7 +1807,9 @@ export async function registerAdminRoutes(
     const deckId = requiredUUID(request.params.deckId, "deckId");
     const data = body(request.body);
     const userId = requiredUUID(data.userId, "userId");
-    const deckVersionId = optionalUUID(data.deckVersionId, "deckVersionId");
+    if (Object.hasOwn(data, "deckVersionId") && data.deckVersionId != null) {
+      badRequest("deckVersionId is no longer supported; assignments always follow the current deck version");
+    }
     const status = contentStatus(data.status, "status");
 
     const client = await pool.connect();
@@ -1493,21 +1817,18 @@ export async function registerAdminRoutes(
       await client.query("BEGIN");
       await requireUser(client, userId);
       await requireDeck(client, deckId);
-      if (deckVersionId) {
-        await requireDeckVersion(client, deckId, deckVersionId);
-      }
       const result = await client.query(
         `
         INSERT INTO deck_assignments (user_id, deck_id, deck_version_id, status)
-        VALUES ($1, $2, $3, $4)
+        VALUES ($1, $2, NULL, $3)
         ON CONFLICT (user_id, deck_id) DO UPDATE SET
-          deck_version_id = excluded.deck_version_id,
+          deck_version_id = NULL,
           status = excluded.status,
           server_revision = nextval('server_revision_seq'),
           updated_at = now()
         RETURNING user_id, deck_id, deck_version_id, status, server_revision, assigned_at, updated_at
         `,
-        [userId, deckId, deckVersionId, status],
+        [userId, deckId, status],
       );
       await client.query("COMMIT");
       reply.status(201);

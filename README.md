@@ -75,8 +75,8 @@ Request limits:
 - Default JSON body limit: 1 MiB.
 - `POST /v1/sync/events`: 2 MiB body limit and 120 requests/minute per
   token+selected-user identity.
-- Admin routes: 300 requests/minute per token identity.
-- `POST /v1/admin/media/upload`: 25 MiB body limit and 30 requests/minute per
+- Admin routes: 10,000 requests/minute per token identity.
+- `POST /v1/admin/media/upload`: 25 MiB body limit and 10,000 requests/minute per
   token identity.
 
 Build:
@@ -134,6 +134,7 @@ PUT  /v1/admin/groups/:groupId
 PUT  /v1/admin/groups/:groupId/members/:userId
 DELETE /v1/admin/groups/:groupId/members/:userId
 POST /v1/admin/media
+POST /v1/admin/media/delete-orphans
 POST /v1/admin/media/upload-url
 POST /v1/admin/media/:mediaId/complete
 POST /v1/admin/media/:mediaId/failed
@@ -142,7 +143,10 @@ GET  /v1/admin/decks
 POST /v1/admin/decks
 PUT  /v1/admin/decks/:deckId
 POST /v1/admin/decks/:deckId/versions
+GET  /v1/admin/decks/:deckId/versions
 GET  /v1/admin/decks/:deckId/versions/:versionId
+POST /v1/admin/decks/:deckId/prune-versions
+DELETE /v1/admin/decks/:deckId/versions/:versionId
 PUT  /v1/admin/decks/:deckId/versions/:versionId/cards/:cardId
 DELETE /v1/admin/decks/:deckId/versions/:versionId/cards/:cardId
 PUT  /v1/admin/decks/:deckId/versions/:versionId/cards/:cardId/examples/:exampleId

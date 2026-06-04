@@ -1169,6 +1169,142 @@ test("admin can delete draft deck versions and orphan local media", async (t) =>
   assert.equal(bootstrap.assignments[0].current_version_id, deck.versionId);
 });
 
+test("admin can dry-run and delete orphan media", async (t) => {
+  const ctx = await createTestApp(t);
+  if (!ctx) return;
+
+  const learner = await createUser(ctx, "Orphan Media Learner");
+  const deck = await createPublishedDeck(ctx, learner.userId, "Orphan media deck");
+  const retainedAvatar = await uploadLocalMedia(ctx, "retained-avatar.jpg", "image/jpeg", Buffer.from("avatar"));
+  const orphanAudio = await uploadLocalMedia(ctx, "orphan-audio.mp3", "audio/mpeg", Buffer.from("orphan audio"));
+
+  await adminJson(ctx, "PUT", `/v1/admin/users/${learner.userId}`, {
+    avatarMediaId: retainedAvatar.id,
+  });
+
+  await adminJson(ctx, "POST", "/v1/admin/media/delete-orphans", {
+    olderThanMinutes: -1,
+  }, 400);
+
+  const dryRun = await adminJson(ctx, "POST", "/v1/admin/media/delete-orphans", {
+    dryRun: true,
+    olderThanMinutes: 0,
+  });
+  assert.equal(dryRun.dryRun, true);
+  assert.equal(dryRun.mediaCount, 1);
+  assert.equal(dryRun.deletedFileCount, 0);
+  assert.deepEqual(dryRun.failedFiles, []);
+  assert.deepEqual(dryRun.media.map((media: any) => media.id), [orphanAudio.id]);
+  assert.equal(dryRun.media[0].byte_size, Buffer.from("orphan audio").length);
+
+  const orphanBeforeDelete = await ctx.app.inject({
+    method: "GET",
+    url: `/v1/media/${orphanAudio.id}`,
+    headers: { authorization: `Bearer ${ctx.syncToken}` },
+  });
+  assert.equal(orphanBeforeDelete.statusCode, 200, orphanBeforeDelete.payload);
+
+  const deleted = await adminJson(ctx, "POST", "/v1/admin/media/delete-orphans", {
+    dryRun: false,
+    olderThanMinutes: 0,
+  });
+  assert.equal(deleted.dryRun, false);
+  assert.equal(deleted.mediaCount, 1);
+  assert.equal(deleted.deletedFileCount, 1);
+  assert.deepEqual(deleted.failedFiles, []);
+  assert.deepEqual(deleted.media.map((media: any) => media.id), [orphanAudio.id]);
+
+  const orphanAfterDelete = await ctx.app.inject({
+    method: "GET",
+    url: `/v1/media/${orphanAudio.id}`,
+    headers: { authorization: `Bearer ${ctx.syncToken}` },
+  });
+  assert.equal(orphanAfterDelete.statusCode, 404, orphanAfterDelete.payload);
+
+  const retainedDownload = await ctx.app.inject({
+    method: "GET",
+    url: `/v1/media/${retainedAvatar.id}`,
+    headers: { authorization: `Bearer ${ctx.syncToken}` },
+  });
+  assert.equal(retainedDownload.statusCode, 200, retainedDownload.payload);
+  assert.deepEqual(retainedDownload.rawPayload, Buffer.from("avatar"));
+
+  const versionDetail = await adminJson(ctx, "GET", `/v1/admin/decks/${deck.deckId}/versions/${deck.versionId}`);
+  assert.equal(versionDetail.mediaObjects.length, 2);
+});
+
+test("admin can prune old deck versions and only their orphaned media", async (t) => {
+  const ctx = await createTestApp(t);
+  if (!ctx) return;
+
+  const learner = await createUser(ctx, "Prune Versions Learner");
+  const deck = await createPublishedDeck(ctx, learner.userId, "Prune versions deck");
+  const unrelatedOrphan = await uploadLocalMedia(ctx, "unrelated-orphan.mp3", "audio/mpeg", Buffer.from("unrelated"));
+
+  const secondVersion = await adminJson(ctx, "POST", `/v1/admin/decks/${deck.deckId}/versions`, {
+    manifest: { reason: "replace first version" },
+  }, 201);
+  await adminJson(
+    ctx,
+    "PUT",
+    `/v1/admin/decks/${deck.deckId}/versions/${secondVersion.version.id}/cards/${deck.cardIds[0]}`,
+    {
+      lemma: "pedir",
+      displayWord: "pido v2",
+      translation: "I order, refreshed",
+      sortOrder: 1,
+    },
+  );
+  await adminJson(ctx, "POST", `/v1/admin/decks/${deck.deckId}/publish`, {
+    versionId: secondVersion.version.id,
+  });
+
+  const dryRun = await adminJson(ctx, "POST", `/v1/admin/decks/${deck.deckId}/prune-versions`, {
+    dryRun: true,
+    keepPublishedVersions: 1,
+    orphanMediaOlderThanMinutes: 0,
+  });
+  assert.equal(dryRun.dryRun, true);
+  assert.equal(dryRun.versionCount, 1);
+  assert.deepEqual(dryRun.versions.map((version: any) => version.id), [deck.versionId]);
+  assert.equal(dryRun.mediaCount, 1);
+  assert.deepEqual(dryRun.media.map((media: any) => media.id).includes(unrelatedOrphan.id), false);
+  assert.equal(dryRun.deletedFileCount, 0);
+
+  const versionsAfterDryRun = await adminJson(ctx, "GET", `/v1/admin/decks/${deck.deckId}/versions`);
+  assert.equal(versionsAfterDryRun.versions.length, 2);
+
+  const pruned = await adminJson(ctx, "POST", `/v1/admin/decks/${deck.deckId}/prune-versions`, {
+    dryRun: false,
+    keepPublishedVersions: 1,
+    orphanMediaOlderThanMinutes: 0,
+  });
+  assert.equal(pruned.dryRun, false);
+  assert.equal(pruned.versionCount, 1);
+  assert.deepEqual(pruned.versions.map((version: any) => version.id), [deck.versionId]);
+  assert.equal(pruned.mediaCount, 1);
+  assert.deepEqual(pruned.media.map((media: any) => media.id).includes(unrelatedOrphan.id), false);
+  assert.equal(pruned.deletedFileCount, 1);
+  assert.deepEqual(pruned.failedFiles, []);
+
+  const versionsAfterPrune = await adminJson(ctx, "GET", `/v1/admin/decks/${deck.deckId}/versions`);
+  assert.deepEqual(versionsAfterPrune.versions.map((version: any) => version.id), [secondVersion.version.id]);
+
+  const retainedUnrelated = await ctx.app.inject({
+    method: "GET",
+    url: `/v1/media/${unrelatedOrphan.id}`,
+    headers: { authorization: `Bearer ${ctx.syncToken}` },
+  });
+  assert.equal(retainedUnrelated.statusCode, 200, retainedUnrelated.payload);
+  assert.deepEqual(retainedUnrelated.rawPayload, Buffer.from("unrelated"));
+
+  const bootstrap = await syncJson(ctx, "GET", "/v1/bootstrap", learner.token, undefined, learner.userId);
+  assert.equal(bootstrap.assignments[0].deck_version_id, null);
+  assert.equal(bootstrap.assignments[0].version_number, 2);
+  assert.equal(bootstrap.content.cards.length, 1);
+  assert.equal(bootstrap.content.cards[0].deck_version_id, secondVersion.version.id);
+});
+
 test("admin can remove a published card by publishing a new draft version without it", async (t) => {
   const ctx = await createTestApp(t);
   if (!ctx) return;
@@ -1670,15 +1806,20 @@ test("admin endpoints reject invalid roles, ids, and missing parent records", as
   await adminJson(ctx, "POST", `/v1/admin/decks/${deck.deck.id}/assignments`, {
     userId: learner.userId,
     deckVersionId: randomUUID(),
-  }, 404);
+  }, 400);
 
   const assignment = await adminJson(ctx, "POST", `/v1/admin/decks/${deck.deck.id}/assignments`, {
     userId: learner.userId,
-    deckVersionId: version.version.id,
     status: "active",
   }, 201);
   assert.equal(assignment.assignment.user_id, learner.userId);
-  assert.equal(assignment.assignment.deck_version_id, version.version.id);
+  assert.equal(assignment.assignment.deck_version_id, null);
+
+  await adminJson(ctx, "POST", `/v1/admin/decks/${deck.deck.id}/assignments`, {
+    userId: learner.userId,
+    deckVersionId: version.version.id,
+    status: "active",
+  }, 400);
 
   await adminJson(ctx, "GET", "/v1/admin/groups/not-a-uuid", undefined, 400);
 });
@@ -2500,15 +2641,14 @@ test("sync accepts iOS study mode names and stores canonical review modes", asyn
   );
 });
 
-test("deck assignments can pin a user to an old published version and later follow current", async (t) => {
+test("deck assignments always follow the current published version", async (t) => {
   const ctx = await createTestApp(t);
   if (!ctx) return;
 
-  const learner = await createUser(ctx, "Pinned Version Learner");
-  const deck = await createPublishedDeck(ctx, learner.userId, "Pinned version deck");
+  const learner = await createUser(ctx, "Current Version Learner");
+  const deck = await createPublishedDeck(ctx, learner.userId, "Current version deck");
   await adminJson(ctx, "POST", `/v1/admin/decks/${deck.deckId}/assignments`, {
     userId: learner.userId,
-    deckVersionId: deck.versionId,
     status: "active",
   }, 201);
 
@@ -2531,17 +2671,6 @@ test("deck assignments can pin a user to an old published version and later foll
     versionId: secondVersion.version.id,
   });
 
-  const pinnedBootstrap = await syncJson(ctx, "GET", "/v1/bootstrap", learner.token);
-  assert.equal(pinnedBootstrap.assignments[0].deck_version_id, deck.versionId);
-  assert.equal(pinnedBootstrap.assignments[0].current_version_id, secondVersion.version.id);
-  assert.equal(pinnedBootstrap.content.cards.length, 2);
-  assert.equal(pinnedBootstrap.content.cards[0].deck_version_id, deck.versionId);
-  assert.equal(pinnedBootstrap.content.cards[0].display_word, "pido");
-
-  await adminJson(ctx, "POST", `/v1/admin/decks/${deck.deckId}/assignments`, {
-    userId: learner.userId,
-    status: "active",
-  }, 201);
   const currentBootstrap = await syncJson(ctx, "GET", "/v1/bootstrap", learner.token);
   assert.equal(currentBootstrap.assignments[0].deck_version_id, null);
   assert.equal(currentBootstrap.assignments[0].version_number, 2);
