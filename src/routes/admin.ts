@@ -140,6 +140,21 @@ function requestedDayKey(value: unknown, timeZone: string): string {
   return dayKey;
 }
 
+function formatStudyDuration(totalSeconds: number): string {
+  const seconds = Math.max(0, Math.round(totalSeconds));
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const remainingSeconds = seconds % 60;
+
+  if (hours > 0) {
+    return minutes > 0 ? `${hours} ч ${minutes} мин` : `${hours} ч`;
+  }
+  if (minutes > 0) {
+    return remainingSeconds > 0 ? `${minutes} мин ${remainingSeconds} сек` : `${minutes} мин`;
+  }
+  return `${remainingSeconds} сек`;
+}
+
 function optionalBoolean(value: unknown, field: string, defaultValue: boolean): boolean {
   if (value == null) {
     return defaultValue;
@@ -663,6 +678,7 @@ export async function registerAdminRoutes(
           SELECT
             COUNT(*)::int AS total_count,
             COUNT(*) FILTER (WHERE outcome IN ('remembered', 'correct'))::int AS passed_count,
+            COALESCE(SUM(duration_ms), 0)::bigint AS duration_ms,
             MIN(reviewed_at) AS first_at,
             MAX(reviewed_at) AS last_at
           FROM study_reviews
@@ -673,6 +689,7 @@ export async function registerAdminRoutes(
           SELECT
             COUNT(*)::int AS total_count,
             COUNT(*) FILTER (WHERE outcome IN ('remembered', 'correct'))::int AS passed_count,
+            COALESCE(SUM(duration_ms), 0)::bigint AS duration_ms,
             MIN(practiced_at) AS first_at,
             MAX(practiced_at) AS last_at
           FROM practice_reviews
@@ -701,6 +718,8 @@ export async function registerAdminRoutes(
             COUNT(*)::int AS total_count,
             COUNT(*) FILTER (WHERE mode = 'matching')::int AS columns_count,
             COUNT(*) FILTER (WHERE mode = 'matching_audio')::int AS audio_columns_count,
+            COALESCE(SUM(pair_count), 0)::int AS pair_count,
+            COALESCE(SUM(duration_ms), 0)::bigint AS duration_ms,
             MIN(completed_at) AS first_at,
             MAX(completed_at) AS last_at
           FROM matching_attempts
@@ -712,11 +731,15 @@ export async function registerAdminRoutes(
           unique_cards.passed_count AS unique_card_passed_count,
           study.total_count AS study_review_count,
           study.passed_count AS study_passed_count,
+          study.duration_ms AS study_duration_ms,
           practice.total_count AS practice_review_count,
           practice.passed_count AS practice_passed_count,
+          practice.duration_ms AS practice_duration_ms,
           matching.total_count AS matching_attempt_count,
           matching.columns_count AS matching_columns_count,
           matching.audio_columns_count AS matching_audio_columns_count,
+          matching.pair_count AS matching_pair_count,
+          matching.duration_ms AS matching_duration_ms,
           LEAST(
             COALESCE(study.first_at, 'infinity'::timestamptz),
             COALESCE(practice.first_at, 'infinity'::timestamptz),
@@ -743,6 +766,10 @@ export async function registerAdminRoutes(
     const practicePassedCount = Number(row.practice_passed_count);
     const cardReviewCount = studyReviewCount + practiceReviewCount;
     const matchingAttemptCount = Number(row.matching_attempt_count);
+    const studyDurationMs = Number(row.study_duration_ms) || 0;
+    const practiceDurationMs = Number(row.practice_duration_ms) || 0;
+    const matchingDurationMs = Number(row.matching_duration_ms) || 0;
+    const totalDurationSeconds = Math.round((studyDurationMs + practiceDurationMs + matchingDurationMs) / 1000);
     return {
       userId,
       user: user.rows[0],
@@ -761,6 +788,11 @@ export async function registerAdminRoutes(
         total: matchingAttemptCount,
         columns: Number(row.matching_columns_count),
         audioColumns: Number(row.matching_audio_columns_count),
+        pairsMatched: Number(row.matching_pair_count),
+      },
+      studyTime: {
+        totalSeconds: totalDurationSeconds,
+        text: formatStudyDuration(totalDurationSeconds),
       },
       firstActivityAt: row.first_activity_at instanceof Date && Number.isFinite(row.first_activity_at.getTime())
         ? row.first_activity_at.toISOString()

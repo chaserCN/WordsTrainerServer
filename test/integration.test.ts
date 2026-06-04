@@ -2220,7 +2220,8 @@ test("admin daily activity separates study, practice, and matching attempts", as
   assert.deepEqual(activity.cardReviews, { total: 3, passed: 2 });
   assert.equal(activity.studyReviews, undefined);
   assert.equal(activity.practiceReviews, undefined);
-  assert.deepEqual(activity.matchingAttempts, { total: 1, columns: 0, audioColumns: 1 });
+  assert.deepEqual(activity.matchingAttempts, { total: 1, columns: 0, audioColumns: 1, pairsMatched: 2 });
+  assert.deepEqual(activity.studyTime, { totalSeconds: 28, text: "28 сек" });
   assert.equal(activity.firstActivityAt, "2026-06-01T09:30:00.000Z");
   assert.equal(activity.lastActivityAt, "2026-06-01T10:05:00.000Z");
 
@@ -2234,7 +2235,8 @@ test("admin daily activity separates study, practice, and matching attempts", as
   assert.deepEqual(emptyActivity.cardReviews, { total: 0, passed: 0 });
   assert.equal(emptyActivity.studyReviews, undefined);
   assert.equal(emptyActivity.practiceReviews, undefined);
-  assert.deepEqual(emptyActivity.matchingAttempts, { total: 0, columns: 0, audioColumns: 0 });
+  assert.deepEqual(emptyActivity.matchingAttempts, { total: 0, columns: 0, audioColumns: 0, pairsMatched: 0 });
+  assert.deepEqual(emptyActivity.studyTime, { totalSeconds: 0, text: "0 сек" });
 });
 
 test("sync validation rejects malformed payloads without partial writes", async (t) => {
