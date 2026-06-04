@@ -550,6 +550,21 @@ function reviewEvent(deck: PublishedDeck, overrides: Record<string, unknown> = {
   };
 }
 
+function practiceReviewEvent(deck: PublishedDeck, overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    clientEventId: randomUUID(),
+    deckId: deck.deckId,
+    deckVersionId: deck.versionId,
+    cardId: deck.cardIds[0],
+    mode: "clozeTyping",
+    outcome: "correct",
+    source: "today_practice",
+    practicedAt: "2026-06-01T09:31:00.000Z",
+    durationMs: 900,
+    ...overrides,
+  };
+}
+
 function progressEvent(deck: PublishedDeck, overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     cardId: deck.cardIds[0],
@@ -1890,6 +1905,7 @@ test("mobile sync supports user switching, idempotent reviews, progress updates,
   });
 
   const clientEventId = randomUUID();
+  const practiceReviewId = randomUUID();
   const matchingAttemptId = randomUUID();
   const reviewedAt = "2026-06-01T09:30:00.000Z";
   const dueAt = "2026-06-03T09:30:00.000Z";
@@ -1909,6 +1925,9 @@ test("mobile sync supports user switching, idempotent reviews, progress updates,
         previousState: "new",
         newState: "review",
       },
+    ],
+    practiceReviews: [
+      practiceReviewEvent(deck, { clientEventId: practiceReviewId }),
     ],
     progress: [
       {
@@ -1944,6 +1963,8 @@ test("mobile sync supports user switching, idempotent reviews, progress updates,
   );
   assert.deepEqual(firstSync.acceptedReviewIds, [clientEventId]);
   assert.deepEqual(firstSync.duplicateReviewIds, []);
+  assert.deepEqual(firstSync.acceptedPracticeReviewIds, [practiceReviewId]);
+  assert.deepEqual(firstSync.duplicatePracticeReviewIds, []);
   assert.deepEqual(firstSync.progressCardIds, [deck.cardIds[0]]);
   assert.deepEqual(firstSync.matchingRecordDeckIds, [deck.deckId]);
   assert.deepEqual(firstSync.acceptedMatchingAttemptIds, [matchingAttemptId]);
@@ -1958,6 +1979,8 @@ test("mobile sync supports user switching, idempotent reviews, progress updates,
   );
   assert.deepEqual(duplicateSync.acceptedReviewIds, []);
   assert.deepEqual(duplicateSync.duplicateReviewIds, [clientEventId]);
+  assert.deepEqual(duplicateSync.acceptedPracticeReviewIds, []);
+  assert.deepEqual(duplicateSync.duplicatePracticeReviewIds, [practiceReviewId]);
   assert.deepEqual(duplicateSync.progressCardIds, []);
   assert.deepEqual(duplicateSync.matchingRecordDeckIds, []);
   assert.deepEqual(duplicateSync.acceptedMatchingAttemptIds, []);
@@ -1968,6 +1991,7 @@ test("mobile sync supports user switching, idempotent reviews, progress updates,
     SELECT
       (SELECT COUNT(*) FROM study_reviews WHERE user_id = $1) AS review_count,
       (SELECT source FROM study_reviews WHERE user_id = $1 LIMIT 1) AS review_source,
+      (SELECT COUNT(*) FROM practice_reviews WHERE user_id = $1) AS practice_review_count,
       (SELECT COUNT(*) FROM card_progress WHERE user_id = $1) AS progress_count,
       (SELECT COUNT(*) FROM deck_matching_records WHERE user_id = $1) AS matching_count,
       (SELECT COUNT(*) FROM matching_attempts WHERE user_id = $1) AS matching_attempt_count
@@ -1976,6 +2000,7 @@ test("mobile sync supports user switching, idempotent reviews, progress updates,
   );
   assert.equal(Number(persistedStats.rows[0].review_count), 1);
   assert.equal(persistedStats.rows[0].review_source, "today_queue");
+  assert.equal(Number(persistedStats.rows[0].practice_review_count), 1);
   assert.equal(Number(persistedStats.rows[0].progress_count), 1);
   assert.equal(Number(persistedStats.rows[0].matching_count), 1);
   assert.equal(Number(persistedStats.rows[0].matching_attempt_count), 1);
@@ -1993,6 +2018,9 @@ test("mobile sync supports user switching, idempotent reviews, progress updates,
   assert.equal(bootstrapAfterSync.reviews.length, 1);
   assert.equal(bootstrapAfterSync.reviews[0].client_event_id, clientEventId);
   assert.equal(bootstrapAfterSync.reviews[0].source, "today_queue");
+  assert.equal(bootstrapAfterSync.practiceReviews.length, 1);
+  assert.equal(bootstrapAfterSync.practiceReviews[0].client_event_id, practiceReviewId);
+  assert.equal(bootstrapAfterSync.practiceReviews[0].duration_ms, 900);
   assert.equal(bootstrapAfterSync.matchingRecords.length, 1);
   assert.equal(bootstrapAfterSync.matchingRecords[0].deck_id, deck.deckId);
   assert.equal(bootstrapAfterSync.matchingAttempts.length, 1);
@@ -2024,6 +2052,9 @@ test("mobile sync supports user switching, idempotent reviews, progress updates,
   assert.equal(changes.reviews.length, 1);
   assert.equal(changes.reviews[0].client_event_id, clientEventId);
   assert.equal(changes.reviews[0].source, "today_queue");
+  assert.equal(changes.practiceReviews.length, 1);
+  assert.equal(changes.practiceReviews[0].client_event_id, practiceReviewId);
+  assert.equal(changes.practiceReviews[0].duration_ms, 900);
   assert.equal(changes.progress.length, 1);
   assert.equal(changes.progress[0].card_id, deck.cardIds[0]);
   assert.equal(changes.matchingRecords.length, 1);
@@ -2607,6 +2638,7 @@ test("sync changes excludes records written by the same device", async (t) => {
   const deviceId = randomUUID();
   const otherDeviceId = randomUUID();
   const clientEventId = randomUUID();
+  const practiceReviewId = randomUUID();
   const matchingAttemptId = randomUUID();
 
   await injectJson(ctx.app, {
@@ -2620,6 +2652,9 @@ test("sync changes excludes records written by the same device", async (t) => {
     payload: {
       reviews: [
         reviewEvent(deck, { clientEventId, source: "today_queue" }),
+      ],
+      practiceReviews: [
+        practiceReviewEvent(deck, { clientEventId: practiceReviewId }),
       ],
       progress: [
         progressEvent(deck),
@@ -2652,6 +2687,7 @@ test("sync changes excludes records written by the same device", async (t) => {
   assert.deepEqual(sameDeviceChanges.assignments, []);
   assert.deepEqual(sameDeviceChanges.progress, []);
   assert.deepEqual(sameDeviceChanges.reviews, []);
+  assert.deepEqual(sameDeviceChanges.practiceReviews, []);
   assert.deepEqual(sameDeviceChanges.matchingRecords, []);
   assert.deepEqual(sameDeviceChanges.matchingAttempts, []);
   assert.ok(BigInt(sameDeviceChanges.serverRevision) > BigInt(baseline.serverRevision));
@@ -2670,6 +2706,8 @@ test("sync changes excludes records written by the same device", async (t) => {
   assert.equal(otherDeviceChanges.reviews.length, 1);
   assert.equal(otherDeviceChanges.reviews[0].client_event_id, clientEventId);
   assert.equal(otherDeviceChanges.reviews[0].source, "today_queue");
+  assert.equal(otherDeviceChanges.practiceReviews.length, 1);
+  assert.equal(otherDeviceChanges.practiceReviews[0].client_event_id, practiceReviewId);
   assert.equal(otherDeviceChanges.progress.length, 1);
   assert.equal(otherDeviceChanges.progress[0].card_id, deck.cardIds[0]);
   assert.equal(otherDeviceChanges.matchingRecords.length, 1);
@@ -2687,6 +2725,7 @@ test("sync changes excludes records written by the same device", async (t) => {
     },
   });
   assert.deepEqual(sameDeviceBootstrap.reviews, []);
+  assert.deepEqual(sameDeviceBootstrap.practiceReviews, []);
   assert.deepEqual(sameDeviceBootstrap.matchingAttempts, []);
   assert.ok(BigInt(sameDeviceBootstrap.serverRevision) > BigInt(baseline.serverRevision));
 
@@ -2701,6 +2740,8 @@ test("sync changes excludes records written by the same device", async (t) => {
   });
   assert.equal(otherDeviceBootstrap.reviews.length, 1);
   assert.equal(otherDeviceBootstrap.reviews[0].client_event_id, clientEventId);
+  assert.equal(otherDeviceBootstrap.practiceReviews.length, 1);
+  assert.equal(otherDeviceBootstrap.practiceReviews[0].client_event_id, practiceReviewId);
   assert.equal(otherDeviceBootstrap.matchingAttempts.length, 1);
   assert.equal(otherDeviceBootstrap.matchingAttempts[0].client_event_id, matchingAttemptId);
 });

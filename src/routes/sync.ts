@@ -1145,7 +1145,18 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
       const sinceRevision = parseRevision(request.query.sinceRevision).toString();
       const deviceId = requestDeviceId(request.headers[clientDeviceIdHeader]);
 
-      const [assignments, content, media, progress, matchingRecords, matchingAttempts, reviews, dailyUsage, reviewsRevision] = userId
+      const [
+        assignments,
+        content,
+        media,
+        progress,
+        matchingRecords,
+        matchingAttempts,
+        reviews,
+        practiceReviews,
+        dailyUsage,
+        reviewsRevision,
+      ] = userId
         ? [
             await assignedDeckRows(client, userId),
             await assignedContentRows(client, userId, undefined, cachedVersions),
@@ -1245,6 +1256,17 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
               `,
               [userId, sinceRevision, deviceId],
             ),
+            await client.query(
+              `
+              SELECT *
+              FROM practice_reviews
+              WHERE user_id = $1
+                AND server_revision > $2
+                AND ($3::uuid IS NULL OR modified_by_device_id IS NULL OR modified_by_device_id <> $3::uuid)
+              ORDER BY server_revision
+              `,
+              [userId, sinceRevision, deviceId],
+            ),
             await dailyUsageRows(client, userId, timeZone),
             await client.query<{ revision: string }>(
               `
@@ -1258,6 +1280,7 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
         : [
             [],
             emptyContent(),
+            { rows: [] },
             { rows: [] },
             { rows: [] },
             { rows: [] },
@@ -1278,6 +1301,7 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
         media: media.rows,
         progress: progress.rows,
         reviews: reviews.rows,
+        practiceReviews: practiceReviews.rows,
         matchingRecords: matchingRecords.rows,
         matchingAttempts: matchingAttempts.rows,
         dailyUsage,
@@ -1300,7 +1324,7 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
     const sinceRevision = parseRevision(request.query.sinceRevision).toString();
     const deviceId = requestDeviceId(request.headers[clientDeviceIdHeader]);
 
-    const [assignments, content, progress, reviews, matchingRecords, matchingAttempts] = await Promise.all([
+    const [assignments, content, progress, reviews, practiceReviews, matchingRecords, matchingAttempts] = await Promise.all([
       assignedDeckRows(pool, userId, sinceRevision, deviceId),
       assignedContentRows(pool, userId, sinceRevision),
       pool.query(
@@ -1318,6 +1342,17 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
         `
         SELECT *
         FROM study_reviews
+        WHERE user_id = $1
+          AND server_revision > $2
+          AND ($3::uuid IS NULL OR modified_by_device_id IS NULL OR modified_by_device_id <> $3::uuid)
+        ORDER BY server_revision
+        `,
+        [userId, sinceRevision, deviceId],
+      ),
+      pool.query(
+        `
+        SELECT *
+        FROM practice_reviews
         WHERE user_id = $1
           AND server_revision > $2
           AND ($3::uuid IS NULL OR modified_by_device_id IS NULL OR modified_by_device_id <> $3::uuid)
@@ -1354,6 +1389,7 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
       content,
       progress: progress.rows,
       reviews: reviews.rows,
+      practiceReviews: practiceReviews.rows,
       matchingRecords: matchingRecords.rows,
       matchingAttempts: matchingAttempts.rows,
       serverRevision: await latestRevision(pool),
