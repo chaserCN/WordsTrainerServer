@@ -803,9 +803,13 @@ test("admin/editor can create, edit, publish, and assign usable deck content", a
 
   const updatedUser = await adminJson(ctx, "PUT", `/v1/admin/users/${learner.userId}`, {
     displayName: "Mia Updated",
+    displayNameLocalized: "Мия",
+    grammaticalGender: "female",
     avatarMediaId: userAvatarMediaId,
   });
   assert.equal(updatedUser.user.display_name, "Mia Updated");
+  assert.equal(updatedUser.user.display_name_localized, "Мия");
+  assert.equal(updatedUser.user.grammatical_gender, "female");
   assert.equal(updatedUser.user.avatar_media_id, userAvatarMediaId);
 
   const versionDetail = await adminJson(ctx, "GET", `/v1/admin/decks/${deck.deckId}/versions/${deck.versionId}`);
@@ -831,6 +835,8 @@ test("admin/editor can create, edit, publish, and assign usable deck content", a
   const bootstrap = await syncJson(ctx, "GET", "/v1/bootstrap", learner.token);
   assert.equal(bootstrap.user.id, learner.userId);
   assert.equal(bootstrap.user.display_name, "Mia Updated");
+  assert.equal(bootstrap.user.display_name_localized, "Мия");
+  assert.equal(bootstrap.user.grammatical_gender, "female");
   assert.equal(bootstrap.user.avatar_media_id, userAvatarMediaId);
   assert.equal(bootstrap.users.length, 1);
   assert.equal(bootstrap.assignments.length, 1);
@@ -876,23 +882,31 @@ test("admin can edit user and deck metadata with partial updates and clears", as
   const secondUserAvatarId = await createMedia(ctx, "second-user-avatar");
   const user = await adminJson(ctx, "POST", "/v1/admin/users", {
     displayName: "Metadata Learner",
+    displayNameLocalized: "Метадата",
+    grammaticalGender: "female",
     role: "learner",
     avatarMediaId: firstUserAvatarId,
   }, 201);
+  assert.equal(user.user.display_name_localized, "Метадата");
+  assert.equal(user.user.grammatical_gender, "female");
   const userId = user.user.id;
 
   const renamedUser = await adminJson(ctx, "PUT", `/v1/admin/users/${userId}`, {
     displayName: "Renamed Learner",
+    displayNameLocalized: "Переименованная",
   });
   assert.equal(renamedUser.user.display_name, "Renamed Learner");
+  assert.equal(renamedUser.user.display_name_localized, "Переименованная");
   assert.equal(renamedUser.user.role, "learner");
   assert.equal(renamedUser.user.avatar_media_id, firstUserAvatarId);
 
   const reavatarUser = await adminJson(ctx, "PUT", `/v1/admin/users/${userId}`, {
+    grammaticalGender: "neutral",
     role: "editor",
     avatarMediaId: secondUserAvatarId,
   });
   assert.equal(reavatarUser.user.display_name, "Renamed Learner");
+  assert.equal(reavatarUser.user.grammatical_gender, "neutral");
   assert.equal(reavatarUser.user.role, "editor");
   assert.equal(reavatarUser.user.avatar_media_id, secondUserAvatarId);
 
@@ -903,6 +917,7 @@ test("admin can edit user and deck metadata with partial updates and clears", as
 
   await adminJson(ctx, "PUT", `/v1/admin/users/${userId}`, {}, 400);
   await adminJson(ctx, "PUT", `/v1/admin/users/${userId}`, { role: "coach" }, 400);
+  await adminJson(ctx, "PUT", `/v1/admin/users/${userId}`, { grammaticalGender: "plural" }, 400);
   await adminJson(ctx, "PUT", `/v1/admin/users/${randomUUID()}`, { displayName: "Missing" }, 404);
 
   const deckAvatarId = await createMedia(ctx, "metadata-deck-avatar");
@@ -1671,6 +1686,10 @@ test("admin can clone assignments, create a test learner, inspect state, and res
   if (!ctx) return;
 
   const child = await createUser(ctx, "Child Workflow Learner");
+  await adminJson(ctx, "PUT", `/v1/admin/users/${child.userId}`, {
+    displayNameLocalized: "Ребёнок",
+    grammaticalGender: "female",
+  });
   const deck = await createPublishedDeck(ctx, child.userId, "Workflow deck");
   const manualTarget = await createUser(ctx, "Manual Sandbox");
 
@@ -1693,6 +1712,8 @@ test("admin can clone assignments, create a test learner, inspect state, and res
     displayName: "Child Workflow Sandbox",
   }, 201);
   assert.equal(testLearner.user.display_name, "Child Workflow Sandbox");
+  assert.equal(testLearner.user.display_name_localized, "Child Workflow Sandbox");
+  assert.equal(testLearner.user.grammatical_gender, "female");
   assert.equal(testLearner.user.role, "learner");
   assert.notEqual(testLearner.user.id, child.userId);
   assert.equal(testLearner.assignments.length, 1);
@@ -2086,6 +2107,10 @@ test("admin daily activity separates study, practice, and matching attempts", as
   if (!ctx) return;
 
   const learner = await createUser(ctx, "Daily Activity Learner");
+  await adminJson(ctx, "PUT", `/v1/admin/users/${learner.userId}`, {
+    displayNameLocalized: "Даша",
+    grammaticalGender: "female",
+  });
   const deck = await createPublishedDeck(ctx, learner.userId, "Daily activity deck");
   const practiceReviewId = randomUUID();
   const matchingAttemptId = randomUUID();
@@ -2131,6 +2156,8 @@ test("admin daily activity separates study, practice, and matching attempts", as
     `/v1/admin/users/${learner.userId}/daily-activity?dayKey=2026-06-01&timeZone=Europe%2FKiev`,
   );
   assert.equal(activity.active, true);
+  assert.equal(activity.user.display_name_localized, "Даша");
+  assert.equal(activity.user.grammatical_gender, "female");
   assert.deepEqual(activity.studyReviews, { total: 1, passed: 1 });
   assert.deepEqual(activity.practiceReviews, { total: 1, passed: 1 });
   assert.deepEqual(activity.matchingAttempts, { total: 1, columns: 0, audioColumns: 1 });

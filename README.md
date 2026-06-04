@@ -173,6 +173,8 @@ PUT /v1/admin/users/:userId
 ```json
 {
   "displayName": "Mia",
+  "displayNameLocalized": "Мия",
+  "grammaticalGender": "female",
   "avatarMediaId": "media-uuid-or-null",
   "role": "learner"
 }

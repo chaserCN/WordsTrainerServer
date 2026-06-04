@@ -79,6 +79,14 @@ function appRole(value: unknown, field: string): string {
   return role;
 }
 
+function grammaticalGender(value: unknown, field: string): string {
+  const gender = optionalString(value, field) ?? "neutral";
+  if (!["male", "female", "neutral"].includes(gender)) {
+    badRequest(`${field} must be male, female, or neutral`);
+  }
+  return gender;
+}
+
 function groupRole(value: unknown, field: string): string {
   const role = optionalString(value, field) ?? "learner";
   if (!["owner", "editor", "learner"].includes(role)) {
@@ -487,6 +495,8 @@ export async function registerAdminRoutes(
     const result = await pool.query(`
       SELECT users.id,
              users.display_name,
+             users.display_name_localized,
+             users.grammatical_gender,
              users.role,
              users.avatar_media_id,
              users.created_at,
@@ -500,16 +510,20 @@ export async function registerAdminRoutes(
   app.post("/v1/admin/users", async (request, reply) => {
     const data = body(request.body);
     const displayName = requiredString(data.displayName, "displayName");
+    const displayNameLocalized = Object.hasOwn(data, "displayNameLocalized")
+      ? requiredString(data.displayNameLocalized, "displayNameLocalized")
+      : displayName;
+    const gender = grammaticalGender(data.grammaticalGender, "grammaticalGender");
     const role = appRole(data.role, "role");
     const avatarMediaId = optionalUUID(data.avatarMediaId, "avatarMediaId");
 
     const result = await pool.query(
       `
-      INSERT INTO users (display_name, role, avatar_media_id)
-      VALUES ($1, $2, $3)
-      RETURNING id, display_name, role, avatar_media_id, created_at, updated_at
+      INSERT INTO users (display_name, display_name_localized, grammatical_gender, role, avatar_media_id)
+      VALUES ($1, $2, $3, $4, $5)
+      RETURNING id, display_name, display_name_localized, grammatical_gender, role, avatar_media_id, created_at, updated_at
       `,
-      [displayName, role, avatarMediaId],
+      [displayName, displayNameLocalized, gender, role, avatarMediaId],
     );
     reply.status(201);
     return { user: result.rows[0] };
@@ -519,14 +533,20 @@ export async function registerAdminRoutes(
     const userId = requiredUUID(request.params.userId, "userId");
     const data = body(request.body);
     const hasDisplayName = Object.hasOwn(data, "displayName");
+    const hasDisplayNameLocalized = Object.hasOwn(data, "displayNameLocalized");
+    const hasGrammaticalGender = Object.hasOwn(data, "grammaticalGender");
     const hasRole = Object.hasOwn(data, "role");
     const hasAvatarMediaId = Object.hasOwn(data, "avatarMediaId");
 
-    if (!hasDisplayName && !hasRole && !hasAvatarMediaId) {
+    if (!hasDisplayName && !hasDisplayNameLocalized && !hasGrammaticalGender && !hasRole && !hasAvatarMediaId) {
       badRequest("at least one user field is required");
     }
 
     const displayName = hasDisplayName ? requiredString(data.displayName, "displayName") : null;
+    const displayNameLocalized = hasDisplayNameLocalized
+      ? requiredString(data.displayNameLocalized, "displayNameLocalized")
+      : null;
+    const gender = hasGrammaticalGender ? grammaticalGender(data.grammaticalGender, "grammaticalGender") : null;
     const role = hasRole ? appRole(data.role, "role") : null;
     const avatarMediaId = hasAvatarMediaId ? optionalUUID(data.avatarMediaId, "avatarMediaId") : null;
 
@@ -534,13 +554,27 @@ export async function registerAdminRoutes(
       `
       UPDATE users
       SET display_name = CASE WHEN $2 THEN $3 ELSE display_name END,
-          role = CASE WHEN $4 THEN $5::app_role ELSE role END,
-          avatar_media_id = CASE WHEN $6 THEN $7::uuid ELSE avatar_media_id END,
+          display_name_localized = CASE WHEN $4 THEN $5 ELSE display_name_localized END,
+          grammatical_gender = CASE WHEN $6 THEN $7 ELSE grammatical_gender END,
+          role = CASE WHEN $8 THEN $9::app_role ELSE role END,
+          avatar_media_id = CASE WHEN $10 THEN $11::uuid ELSE avatar_media_id END,
           updated_at = now()
       WHERE id = $1
-      RETURNING id, display_name, role, avatar_media_id, created_at, updated_at
+      RETURNING id, display_name, display_name_localized, grammatical_gender, role, avatar_media_id, created_at, updated_at
       `,
-      [userId, hasDisplayName, displayName, hasRole, role, hasAvatarMediaId, avatarMediaId],
+      [
+        userId,
+        hasDisplayName,
+        displayName,
+        hasDisplayNameLocalized,
+        displayNameLocalized,
+        hasGrammaticalGender,
+        gender,
+        hasRole,
+        role,
+        hasAvatarMediaId,
+        avatarMediaId,
+      ],
     );
     if (!result.rowCount) {
       notFound("user not found");
@@ -553,7 +587,7 @@ export async function registerAdminRoutes(
     const [user, assignments, stats] = await Promise.all([
       pool.query(
         `
-        SELECT id, display_name, role, avatar_media_id, created_at, updated_at
+        SELECT id, display_name, display_name_localized, grammatical_gender, role, avatar_media_id, created_at, updated_at
         FROM users
         WHERE id = $1
         `,
@@ -615,7 +649,14 @@ export async function registerAdminRoutes(
     const dayKey = requestedDayKey(request.query.dayKey, timeZone);
 
     const [user, activity] = await Promise.all([
-      pool.query("SELECT id FROM users WHERE id = $1", [userId]),
+      pool.query(
+        `
+        SELECT id, display_name, display_name_localized, grammatical_gender
+        FROM users
+        WHERE id = $1
+        `,
+        [userId],
+      ),
       pool.query(
         `
         WITH study AS (
@@ -682,6 +723,7 @@ export async function registerAdminRoutes(
     const matchingAttemptCount = Number(row.matching_attempt_count);
     return {
       userId,
+      user: user.rows[0],
       dayKey,
       timeZone,
       active: studyReviewCount + practiceReviewCount + matchingAttemptCount > 0,
@@ -739,7 +781,7 @@ export async function registerAdminRoutes(
       await client.query("BEGIN");
       const sourceUser = await client.query(
         `
-        SELECT id, display_name, avatar_media_id
+        SELECT id, display_name, display_name_localized, grammatical_gender, avatar_media_id
         FROM users
         WHERE id = $1
         `,
@@ -751,11 +793,16 @@ export async function registerAdminRoutes(
       const displayName = requestedDisplayName ?? `${sourceUser.rows[0].display_name} Test`;
       const user = await client.query(
         `
-        INSERT INTO users (display_name, role, avatar_media_id)
-        VALUES ($1, 'learner', $2)
-        RETURNING id, display_name, role, avatar_media_id, created_at, updated_at
+        INSERT INTO users (display_name, display_name_localized, grammatical_gender, role, avatar_media_id)
+        VALUES ($1, $2, $3, 'learner', $4)
+        RETURNING id, display_name, display_name_localized, grammatical_gender, role, avatar_media_id, created_at, updated_at
         `,
-        [displayName, sourceUser.rows[0].avatar_media_id],
+        [
+          displayName,
+          requestedDisplayName ? displayName : `${sourceUser.rows[0].display_name_localized} Test`,
+          sourceUser.rows[0].grammatical_gender,
+          sourceUser.rows[0].avatar_media_id,
+        ],
       );
       const assignments = await cloneUserAssignments(client, sourceUserId, user.rows[0].id);
       await client.query("COMMIT");

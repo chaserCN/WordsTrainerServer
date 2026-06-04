@@ -32,6 +32,8 @@ const timeZoneAliases = new Map<string, string>([
 type UserRow = {
   id: string;
   display_name: string;
+  display_name_localized: string;
+  grammatical_gender: string;
   avatar_media_id: string | null;
   role: string;
   created_at: string;
@@ -471,7 +473,7 @@ async function latestRevision(pool: Queryable): Promise<string> {
 async function allUserRows(pool: Queryable): Promise<UserRow[]> {
   const result = await pool.query<UserRow>(
     `
-    SELECT id, display_name, avatar_media_id, role, created_at, updated_at
+    SELECT id, display_name, display_name_localized, grammatical_gender, avatar_media_id, role, created_at, updated_at
     FROM users
     ORDER BY display_name
     `,
