@@ -243,20 +243,51 @@ GET /v1/sync/changes?sinceRevision=...
   first user alphabetically.
 - `X-FlashGame-Cached-Deck-Version-Ids`: comma-separated published deck version
   ids already stored locally; content rows for these versions are omitted.
-- `X-FlashGame-Time-Zone`: IANA time zone used to build `dailyUsage.day_key`.
-  If omitted, the server uses `UTC`.
 
-Bootstrap includes `dailyUsage` rows:
+Bootstrap is a full snapshot. It does not accept `sinceRevision`:
 
 ```json
-[
-  {
-    "deck_id": "deck-uuid",
-    "day_key": "2026-06-01",
-    "new_cards_studied": 1
+{
+  "mode": "snapshot",
+  "revision": "123",
+  "user": {},
+  "users": [],
+  "snapshot": {
+    "assignments": [],
+    "content": {},
+    "media": [],
+    "progress": [],
+    "reviews": [],
+    "practiceReviews": [],
+    "matchingRecords": [],
+    "matchingAttempts": [],
+    "studyDataResets": []
   }
-]
+}
 ```
+
+Incremental sync uses only revisioned rows and reset markers:
+
+```json
+{
+  "mode": "delta",
+  "fromRevision": "100",
+  "toRevision": "123",
+  "changes": {
+    "assignments": [],
+    "content": {},
+    "progress": [],
+    "reviews": [],
+    "practiceReviews": [],
+    "matchingRecords": [],
+    "matchingAttempts": [],
+    "studyDataResets": []
+  }
+}
+```
+
+Derived statistics such as daily usage/new-card counts are not part of the
+server sync protocol. iOS rebuilds them locally from imported review events.
 
 Assignment rows include user-level deck preferences:
 
@@ -320,17 +351,15 @@ device's own writes.
 ```
 
 Repeated `clientEventId` values are reported as duplicates and do not create
-new review rows. Invalid/stale targets are reported per element via
-`rejectedReviewIds`, `rejectedProgressCardIds`,
-`rejectedMatchingRecordDeckIds`, and `rejectedDeckPreferenceDeckIds`; valid
-elements in the same request are still written. Malformed payloads still return
-`400` without partial writes.
+new review rows. Invalid/stale targets are reported per element in the
+`rejected` object; valid elements in the same request are still written.
+Malformed payloads still return `400` without partial writes.
 
-Identical progress snapshots do not advance `serverRevision`.
+Identical progress snapshots do not advance `toRevision`.
 The server logs sync event batches with selected user id, input counts,
 accepted/duplicate counts, rejected element counts, and duration.
 Deck preferences are upserted per user/deck and returned in
-`deckPreferenceDeckIds` when accepted.
+`accepted.deckPreferenceDeckIds` when accepted.
 
 ## Next Implementation Steps
 

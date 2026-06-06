@@ -356,6 +356,47 @@ async function injectJson(
   return response.payload ? JSON.parse(response.payload) : null;
 }
 
+function flattenSyncResponse(url: string, payload: any): any {
+  if (!payload || typeof payload !== "object") {
+    return payload;
+  }
+  if (url.startsWith("/v1/bootstrap") && payload.mode === "snapshot") {
+    return {
+      user: payload.user,
+      users: payload.users,
+      ...payload.snapshot,
+      serverRevision: payload.revision,
+    };
+  }
+  if (url.startsWith("/v1/sync/changes") && payload.mode === "delta") {
+    return {
+      ...payload.changes,
+      serverRevision: payload.toRevision,
+    };
+  }
+  if (url.startsWith("/v1/sync/events") && payload.mode === "events") {
+    return {
+      acceptedReviewIds: payload.accepted?.reviewIds ?? [],
+      duplicateReviewIds: payload.duplicates?.reviewIds ?? [],
+      acceptedPracticeReviewIds: payload.accepted?.practiceReviewIds ?? [],
+      duplicatePracticeReviewIds: payload.duplicates?.practiceReviewIds ?? [],
+      progressCardIds: payload.accepted?.progressCardIds ?? [],
+      matchingRecordDeckIds: payload.accepted?.matchingRecordDeckIds ?? [],
+      acceptedMatchingAttemptIds: payload.accepted?.matchingAttemptIds ?? [],
+      duplicateMatchingAttemptIds: payload.duplicates?.matchingAttemptIds ?? [],
+      deckPreferenceDeckIds: payload.accepted?.deckPreferenceDeckIds ?? [],
+      rejectedReviewIds: payload.rejected?.reviewIds ?? [],
+      rejectedPracticeReviewIds: payload.rejected?.practiceReviewIds ?? [],
+      rejectedProgressCardIds: payload.rejected?.progressCardIds ?? [],
+      rejectedMatchingRecordDeckIds: payload.rejected?.matchingRecordDeckIds ?? [],
+      rejectedMatchingAttemptIds: payload.rejected?.matchingAttemptIds ?? [],
+      rejectedDeckPreferenceDeckIds: payload.rejected?.deckPreferenceDeckIds ?? [],
+      serverRevision: payload.toRevision,
+    };
+  }
+  return payload;
+}
+
 async function adminJson(
   ctx: TestApp,
   method: "GET" | "POST" | "PUT" | "DELETE",
@@ -381,7 +422,7 @@ async function syncJson(
   selectedUserId?: string,
   expectedStatus?: number,
 ): Promise<any> {
-  return injectJson(ctx.app, {
+  const responsePayload = await injectJson(ctx.app, {
     method,
     url,
     headers: {
@@ -391,6 +432,7 @@ async function syncJson(
     payload,
     expectedStatus,
   });
+  return flattenSyncResponse(url, responsePayload);
 }
 
 async function createMedia(ctx: TestApp, name: string): Promise<string> {
@@ -617,7 +659,6 @@ test("mobile bootstrap and sync are usable when server has no assigned content",
   assert.deepEqual(bootstrap.content.distractors, []);
   assert.deepEqual(bootstrap.media, []);
   assert.deepEqual(bootstrap.progress, []);
-  assert.equal(bootstrap.reviewsRevision, "0");
   assert.equal(bootstrap.serverRevision, "0");
 
   const changes = await syncJson(ctx, "GET", "/v1/sync/changes?sinceRevision=0", learner.token, undefined, learner.userId);
@@ -729,7 +770,7 @@ test("mobile bootstrap skips content for cached deck versions", async (t) => {
     },
   });
   assert.equal(cachedBootstrapResponse.statusCode, 200, cachedBootstrapResponse.payload);
-  const cachedBootstrap = JSON.parse(cachedBootstrapResponse.payload);
+  const cachedBootstrap = flattenSyncResponse("/v1/bootstrap", JSON.parse(cachedBootstrapResponse.payload));
   assert.equal(cachedBootstrap.assignments.length, 1);
   assert.equal(cachedBootstrap.assignments[0].current_version_id, deck.versionId);
   assert.deepEqual(cachedBootstrap.content.cards, []);
@@ -2040,22 +2081,6 @@ test("mobile sync supports user switching, idempotent reviews, progress updates,
   assert.equal(bootstrapAfterSync.matchingRecords[0].deck_id, deck.deckId);
   assert.equal(bootstrapAfterSync.matchingAttempts.length, 1);
   assert.equal(bootstrapAfterSync.matchingAttempts[0].client_event_id, matchingAttemptId);
-  assert.equal(bootstrapAfterSync.dailyUsage.length, 1);
-  assert.equal(bootstrapAfterSync.dailyUsage[0].deck_id, deck.deckId);
-  assert.equal(bootstrapAfterSync.dailyUsage[0].day_key, "2026-06-01");
-  assert.equal(bootstrapAfterSync.dailyUsage[0].new_cards_studied, 1);
-
-  const legacyKievTimeZoneBootstrap = await injectJson(ctx.app, {
-    method: "GET",
-    url: "/v1/bootstrap",
-    headers: {
-      authorization: `Bearer ${child.token}`,
-      "x-flashgame-user-id": child.userId,
-      "x-flashgame-time-zone": "Europe/Kiev",
-    },
-  });
-  assert.equal(legacyKievTimeZoneBootstrap.dailyUsage.length, 1);
-
   const changes = await syncJson(
     ctx,
     "GET",
@@ -2692,7 +2717,7 @@ test("sync changes excludes records written by the same device", async (t) => {
     },
   });
 
-  const fullBootstrapWithDevice = await injectJson(ctx.app, {
+  const fullBootstrapWithDevice = flattenSyncResponse("/v1/bootstrap", await injectJson(ctx.app, {
     method: "GET",
     url: "/v1/bootstrap",
     headers: {
@@ -2700,11 +2725,11 @@ test("sync changes excludes records written by the same device", async (t) => {
       "x-flashgame-user-id": learner.userId,
       "x-flashgame-device-id": deviceId,
     },
-  });
+  }));
   assert.equal(fullBootstrapWithDevice.progress.length, 1);
   assert.equal(fullBootstrapWithDevice.progress[0].card_id, deck.cardIds[0]);
 
-  const sameDeviceChanges = await injectJson(ctx.app, {
+  const sameDeviceChanges = flattenSyncResponse(`/v1/sync/changes?sinceRevision=${baseline.serverRevision}`, await injectJson(ctx.app, {
     method: "GET",
     url: `/v1/sync/changes?sinceRevision=${baseline.serverRevision}`,
     headers: {
@@ -2712,7 +2737,7 @@ test("sync changes excludes records written by the same device", async (t) => {
       "x-flashgame-user-id": learner.userId,
       "x-flashgame-device-id": deviceId,
     },
-  });
+  }));
   assert.deepEqual(sameDeviceChanges.assignments, []);
   assert.deepEqual(sameDeviceChanges.progress, []);
   assert.deepEqual(sameDeviceChanges.reviews, []);
@@ -2721,7 +2746,7 @@ test("sync changes excludes records written by the same device", async (t) => {
   assert.deepEqual(sameDeviceChanges.matchingAttempts, []);
   assert.ok(BigInt(sameDeviceChanges.serverRevision) > BigInt(baseline.serverRevision));
 
-  const otherDeviceChanges = await injectJson(ctx.app, {
+  const otherDeviceChanges = flattenSyncResponse(`/v1/sync/changes?sinceRevision=${baseline.serverRevision}`, await injectJson(ctx.app, {
     method: "GET",
     url: `/v1/sync/changes?sinceRevision=${baseline.serverRevision}`,
     headers: {
@@ -2729,7 +2754,7 @@ test("sync changes excludes records written by the same device", async (t) => {
       "x-flashgame-user-id": learner.userId,
       "x-flashgame-device-id": otherDeviceId,
     },
-  });
+  }));
   assert.equal(otherDeviceChanges.assignments.length, 1);
   assert.equal(otherDeviceChanges.assignments[0].user_enabled, false);
   assert.equal(otherDeviceChanges.reviews.length, 1);
@@ -2744,60 +2769,16 @@ test("sync changes excludes records written by the same device", async (t) => {
   assert.equal(otherDeviceChanges.matchingAttempts.length, 1);
   assert.equal(otherDeviceChanges.matchingAttempts[0].client_event_id, matchingAttemptId);
 
-  const sameDeviceBootstrap = await injectJson(ctx.app, {
+  const bootstrapWithoutDevice = flattenSyncResponse("/v1/bootstrap", await injectJson(ctx.app, {
     method: "GET",
-    url: `/v1/bootstrap?sinceRevision=${baseline.serverRevision}`,
-    headers: {
-      authorization: `Bearer ${learner.token}`,
-      "x-flashgame-user-id": learner.userId,
-      "x-flashgame-device-id": deviceId,
-    },
-  });
-  assert.deepEqual(sameDeviceBootstrap.progress, []);
-  assert.deepEqual(sameDeviceBootstrap.reviews, []);
-  assert.deepEqual(sameDeviceBootstrap.practiceReviews, []);
-  assert.deepEqual(sameDeviceBootstrap.matchingAttempts, []);
-  assert.ok(BigInt(sameDeviceBootstrap.serverRevision) > BigInt(baseline.serverRevision));
-
-  const otherDeviceBootstrap = await injectJson(ctx.app, {
-    method: "GET",
-    url: `/v1/bootstrap?sinceRevision=${baseline.serverRevision}`,
-    headers: {
-      authorization: `Bearer ${learner.token}`,
-      "x-flashgame-user-id": learner.userId,
-      "x-flashgame-device-id": otherDeviceId,
-    },
-  });
-  assert.equal(otherDeviceBootstrap.progress.length, 1);
-  assert.equal(otherDeviceBootstrap.progress[0].card_id, deck.cardIds[0]);
-  assert.equal(otherDeviceBootstrap.reviews.length, 1);
-  assert.equal(otherDeviceBootstrap.reviews[0].client_event_id, clientEventId);
-  assert.equal(otherDeviceBootstrap.practiceReviews.length, 1);
-  assert.equal(otherDeviceBootstrap.practiceReviews[0].client_event_id, practiceReviewId);
-  assert.equal(otherDeviceBootstrap.matchingAttempts.length, 1);
-  assert.equal(otherDeviceBootstrap.matchingAttempts[0].client_event_id, matchingAttemptId);
-
-  const bootstrapWithoutDevice = await injectJson(ctx.app, {
-    method: "GET",
-    url: `/v1/bootstrap?sinceRevision=${baseline.serverRevision}`,
+    url: "/v1/bootstrap",
     headers: {
       authorization: `Bearer ${learner.token}`,
       "x-flashgame-user-id": learner.userId,
     },
-  });
+  }));
   assert.equal(bootstrapWithoutDevice.progress.length, 1);
   assert.equal(bootstrapWithoutDevice.progress[0].card_id, deck.cardIds[0]);
-
-  const currentRevisionBootstrap = await injectJson(ctx.app, {
-    method: "GET",
-    url: `/v1/bootstrap?sinceRevision=${otherDeviceBootstrap.serverRevision}`,
-    headers: {
-      authorization: `Bearer ${learner.token}`,
-      "x-flashgame-user-id": learner.userId,
-      "x-flashgame-device-id": otherDeviceId,
-    },
-  });
-  assert.deepEqual(currentRevisionBootstrap.progress, []);
 });
 
 test("sync ignores stale progress updates for the same user and card", async (t) => {

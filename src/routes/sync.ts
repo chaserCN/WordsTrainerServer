@@ -18,16 +18,10 @@ type ChangesQuery = {
   sinceRevision?: string;
 };
 
-type BootstrapQuery = {
-  sinceRevision?: string;
-};
+type BootstrapQuery = Record<string, never>;
 
 const cachedDeckVersionIdsHeader = "x-flashgame-cached-deck-version-ids";
 const clientDeviceIdHeader = "x-flashgame-device-id";
-const clientTimeZoneHeader = "x-flashgame-time-zone";
-const timeZoneAliases = new Map<string, string>([
-  ["Europe/Kiev", "Europe/Kyiv"],
-]);
 
 type UserRow = {
   id: string;
@@ -341,28 +335,6 @@ async function assignedContentRows(
   };
 }
 
-async function dailyUsageRows(pool: Queryable, userId: string, timeZone: string): Promise<pg.QueryResult["rows"]> {
-  const result = await pool.query(
-    `
-    SELECT
-      study_reviews.deck_id,
-      to_char((study_reviews.reviewed_at AT TIME ZONE $2) - interval '4 hours', 'YYYY-MM-DD') AS day_key,
-      COUNT(*)::int AS new_cards_studied
-    FROM study_reviews
-    JOIN deck_assignments ON deck_assignments.user_id = study_reviews.user_id
-      AND deck_assignments.deck_id = study_reviews.deck_id
-      AND deck_assignments.status = 'active'
-    WHERE study_reviews.user_id = $1
-      AND study_reviews.was_new = true
-      AND study_reviews.outcome IN ('remembered', 'correct')
-    GROUP BY study_reviews.deck_id, day_key
-    ORDER BY day_key, study_reviews.deck_id
-    `,
-    [userId, timeZone],
-  );
-  return result.rows;
-}
-
 function parseRevision(value: unknown): bigint {
   if (typeof value !== "string" || value.trim() === "") {
     return 0n;
@@ -385,24 +357,6 @@ function cachedDeckVersionIds(request: { headers: Record<string, unknown> }): st
     .map((value) => value.trim())
     .filter((value) => value.length > 0);
   return [...new Set(ids.map((id) => requiredUUID(id, "cachedDeckVersionIds")))];
-}
-
-function clientTimeZone(request: { headers: Record<string, unknown> }): string {
-  const rawValue = request.headers[clientTimeZoneHeader];
-  if (rawValue == null || rawValue === "") {
-    return "UTC";
-  }
-  const value = (Array.isArray(rawValue) ? rawValue[0] : String(rawValue)).trim();
-  if (!/^[A-Za-z0-9_+\-./]{1,64}$/.test(value)) {
-    return "UTC";
-  }
-  const normalized = timeZoneAliases.get(value) ?? value;
-  try {
-    new Intl.DateTimeFormat("en-US", { timeZone: normalized });
-    return normalized;
-  } catch {
-    return "UTC";
-  }
 }
 
 async function latestRevision(pool: Queryable): Promise<string> {
@@ -1142,10 +1096,6 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
       const requestedUserExists = requestedUserId && users.some((user) => user.id === requestedUserId);
       const userId = requestedUserExists ? requestedUserId : users[0]?.id ?? null;
       const cachedVersions = cachedDeckVersionIds(request);
-      const timeZone = clientTimeZone(request);
-      const hasSinceRevision = request.query.sinceRevision != null;
-      const sinceRevision = parseRevision(request.query.sinceRevision).toString();
-      const deviceId = requestDeviceId(request.headers[clientDeviceIdHeader]);
 
       const [
         assignments,
@@ -1157,8 +1107,6 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
         reviews,
         practiceReviews,
         studyDataResets,
-        dailyUsage,
-        reviewsRevision,
       ] = userId
         ? [
             await assignedDeckRows(client, userId),
@@ -1221,23 +1169,7 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
               [userId, cachedVersions],
             ),
             await client.query(
-              hasSinceRevision
-                ? `
-                SELECT user_id,
-                       card_id,
-                       deck_id,
-                       fsrs_data,
-                       due_at,
-                       state,
-                       updated_at,
-                       server_revision
-                FROM card_progress
-                WHERE user_id = $1
-                  AND server_revision > $2
-                  AND ($3::uuid IS NULL OR modified_by_device_id IS NULL OR modified_by_device_id <> $3::uuid)
-                ORDER BY server_revision
-                `
-                : `
+              `
                 SELECT user_id,
                        card_id,
                        deck_id,
@@ -1250,7 +1182,7 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
                 WHERE user_id = $1
                 ORDER BY updated_at DESC
                 `,
-              hasSinceRevision ? [userId, sinceRevision, deviceId] : [userId],
+              [userId],
             ),
             await client.query(
               `
@@ -1266,50 +1198,34 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
               SELECT *
               FROM matching_attempts
               WHERE user_id = $1
-                AND server_revision > $2
-                AND ($3::uuid IS NULL OR modified_by_device_id IS NULL OR modified_by_device_id <> $3::uuid)
               ORDER BY server_revision
               `,
-              [userId, sinceRevision, deviceId],
+              [userId],
             ),
             await client.query(
               `
               SELECT *
               FROM study_reviews
               WHERE user_id = $1
-                AND server_revision > $2
-                AND ($3::uuid IS NULL OR modified_by_device_id IS NULL OR modified_by_device_id <> $3::uuid)
               ORDER BY server_revision
               `,
-              [userId, sinceRevision, deviceId],
+              [userId],
             ),
             await client.query(
               `
               SELECT *
               FROM practice_reviews
               WHERE user_id = $1
-                AND server_revision > $2
-                AND ($3::uuid IS NULL OR modified_by_device_id IS NULL OR modified_by_device_id <> $3::uuid)
               ORDER BY server_revision
               `,
-              [userId, sinceRevision, deviceId],
+              [userId],
             ),
             await client.query(
               `
               SELECT user_id, deck_id, reset_at, server_revision
               FROM study_data_resets
               WHERE user_id = $1
-                AND server_revision > $2
               ORDER BY server_revision
-              `,
-              [userId, sinceRevision],
-            ),
-            await dailyUsageRows(client, userId, timeZone),
-            await client.query<{ revision: string }>(
-              `
-              SELECT COALESCE(MAX(server_revision), 0)::text AS revision
-              FROM study_reviews
-              WHERE user_id = $1
               `,
               [userId],
             ),
@@ -1324,28 +1240,27 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
             { rows: [] },
             { rows: [] },
             { rows: [] },
-            [],
-            { rows: [{ revision: "0" }] },
           ];
 
       const serverRevision = await latestRevision(client);
       await client.query("COMMIT");
 
       return {
+        mode: "snapshot",
+        revision: serverRevision,
         user: users.find((user) => user.id === userId) ?? null,
         users,
-        assignments,
-        content,
-        media: media.rows,
-        progress: progress.rows,
-        reviews: reviews.rows,
-        practiceReviews: practiceReviews.rows,
-        studyDataResets: studyDataResets.rows,
-        matchingRecords: matchingRecords.rows,
-        matchingAttempts: matchingAttempts.rows,
-        dailyUsage,
-        reviewsRevision: reviewsRevision.rows[0]?.revision ?? "0",
-        serverRevision,
+        snapshot: {
+          assignments,
+          content,
+          media: media.rows,
+          progress: progress.rows,
+          reviews: reviews.rows,
+          practiceReviews: practiceReviews.rows,
+          matchingRecords: matchingRecords.rows,
+          matchingAttempts: matchingAttempts.rows,
+          studyDataResets: studyDataResets.rows,
+        },
       };
     } catch (error) {
       await client.query("ROLLBACK");
@@ -1443,15 +1358,19 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
     ]);
 
     return {
-      assignments,
-      content,
-      progress: progress.rows,
-      reviews: reviews.rows,
-      practiceReviews: practiceReviews.rows,
-      matchingRecords: matchingRecords.rows,
-      matchingAttempts: matchingAttempts.rows,
-      studyDataResets: studyDataResets.rows,
-      serverRevision: await latestRevision(pool),
+      mode: "delta",
+      fromRevision: sinceRevision,
+      toRevision: await latestRevision(pool),
+      changes: {
+        assignments,
+        content,
+        progress: progress.rows,
+        reviews: reviews.rows,
+        practiceReviews: practiceReviews.rows,
+        matchingRecords: matchingRecords.rows,
+        matchingAttempts: matchingAttempts.rows,
+        studyDataResets: studyDataResets.rows,
+      },
     };
   });
 
@@ -1729,22 +1648,29 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
       }, "sync events accepted");
 
       return {
-        acceptedReviewIds,
-        duplicateReviewIds,
-        acceptedPracticeReviewIds,
-        duplicatePracticeReviewIds,
-        progressCardIds,
-        matchingRecordDeckIds,
-        acceptedMatchingAttemptIds,
-        duplicateMatchingAttemptIds,
-        deckPreferenceDeckIds,
-        rejectedReviewIds: validated.rejectedReviewIds,
-        rejectedPracticeReviewIds: validated.rejectedPracticeReviewIds,
-        rejectedProgressCardIds: validated.rejectedProgressCardIds,
-        rejectedMatchingRecordDeckIds: validated.rejectedMatchingRecordDeckIds,
-        rejectedMatchingAttemptIds: validated.rejectedMatchingAttemptIds,
-        rejectedDeckPreferenceDeckIds: validated.rejectedDeckPreferenceDeckIds,
-        serverRevision: await latestRevision(pool),
+        mode: "events",
+        accepted: {
+          reviewIds: acceptedReviewIds,
+          practiceReviewIds: acceptedPracticeReviewIds,
+          progressCardIds,
+          matchingRecordDeckIds,
+          matchingAttemptIds: acceptedMatchingAttemptIds,
+          deckPreferenceDeckIds,
+        },
+        duplicates: {
+          reviewIds: duplicateReviewIds,
+          practiceReviewIds: duplicatePracticeReviewIds,
+          matchingAttemptIds: duplicateMatchingAttemptIds,
+        },
+        rejected: {
+          reviewIds: validated.rejectedReviewIds,
+          practiceReviewIds: validated.rejectedPracticeReviewIds,
+          progressCardIds: validated.rejectedProgressCardIds,
+          matchingRecordDeckIds: validated.rejectedMatchingRecordDeckIds,
+          matchingAttemptIds: validated.rejectedMatchingAttemptIds,
+          deckPreferenceDeckIds: validated.rejectedDeckPreferenceDeckIds,
+        },
+        toRevision: await latestRevision(pool),
       };
     } catch (error) {
       await client.query("ROLLBACK");
