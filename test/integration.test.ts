@@ -2679,6 +2679,18 @@ test("sync changes excludes records written by the same device", async (t) => {
     },
   });
 
+  const fullBootstrapWithDevice = await injectJson(ctx.app, {
+    method: "GET",
+    url: "/v1/bootstrap",
+    headers: {
+      authorization: `Bearer ${learner.token}`,
+      "x-flashgame-user-id": learner.userId,
+      "x-flashgame-device-id": deviceId,
+    },
+  });
+  assert.equal(fullBootstrapWithDevice.progress.length, 1);
+  assert.equal(fullBootstrapWithDevice.progress[0].card_id, deck.cardIds[0]);
+
   const sameDeviceChanges = await injectJson(ctx.app, {
     method: "GET",
     url: `/v1/sync/changes?sinceRevision=${baseline.serverRevision}`,
@@ -2728,6 +2740,7 @@ test("sync changes excludes records written by the same device", async (t) => {
       "x-flashgame-device-id": deviceId,
     },
   });
+  assert.deepEqual(sameDeviceBootstrap.progress, []);
   assert.deepEqual(sameDeviceBootstrap.reviews, []);
   assert.deepEqual(sameDeviceBootstrap.practiceReviews, []);
   assert.deepEqual(sameDeviceBootstrap.matchingAttempts, []);
@@ -2742,12 +2755,36 @@ test("sync changes excludes records written by the same device", async (t) => {
       "x-flashgame-device-id": otherDeviceId,
     },
   });
+  assert.equal(otherDeviceBootstrap.progress.length, 1);
+  assert.equal(otherDeviceBootstrap.progress[0].card_id, deck.cardIds[0]);
   assert.equal(otherDeviceBootstrap.reviews.length, 1);
   assert.equal(otherDeviceBootstrap.reviews[0].client_event_id, clientEventId);
   assert.equal(otherDeviceBootstrap.practiceReviews.length, 1);
   assert.equal(otherDeviceBootstrap.practiceReviews[0].client_event_id, practiceReviewId);
   assert.equal(otherDeviceBootstrap.matchingAttempts.length, 1);
   assert.equal(otherDeviceBootstrap.matchingAttempts[0].client_event_id, matchingAttemptId);
+
+  const bootstrapWithoutDevice = await injectJson(ctx.app, {
+    method: "GET",
+    url: `/v1/bootstrap?sinceRevision=${baseline.serverRevision}`,
+    headers: {
+      authorization: `Bearer ${learner.token}`,
+      "x-flashgame-user-id": learner.userId,
+    },
+  });
+  assert.equal(bootstrapWithoutDevice.progress.length, 1);
+  assert.equal(bootstrapWithoutDevice.progress[0].card_id, deck.cardIds[0]);
+
+  const currentRevisionBootstrap = await injectJson(ctx.app, {
+    method: "GET",
+    url: `/v1/bootstrap?sinceRevision=${otherDeviceBootstrap.serverRevision}`,
+    headers: {
+      authorization: `Bearer ${learner.token}`,
+      "x-flashgame-user-id": learner.userId,
+      "x-flashgame-device-id": otherDeviceId,
+    },
+  });
+  assert.deepEqual(currentRevisionBootstrap.progress, []);
 });
 
 test("sync ignores stale progress updates for the same user and card", async (t) => {

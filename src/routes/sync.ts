@@ -1142,6 +1142,7 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
       const userId = requestedUserExists ? requestedUserId : users[0]?.id ?? null;
       const cachedVersions = cachedDeckVersionIds(request);
       const timeZone = clientTimeZone(request);
+      const hasSinceRevision = request.query.sinceRevision != null;
       const sinceRevision = parseRevision(request.query.sinceRevision).toString();
       const deviceId = requestDeviceId(request.headers[clientDeviceIdHeader]);
 
@@ -1218,20 +1219,36 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
               [userId, cachedVersions],
             ),
             await client.query(
-              `
-              SELECT user_id,
-                     card_id,
-                     deck_id,
-                     fsrs_data,
-                     due_at,
-                     state,
-                     updated_at,
-                     server_revision
-              FROM card_progress
-              WHERE user_id = $1
-              ORDER BY updated_at DESC
-              `,
-              [userId],
+              hasSinceRevision
+                ? `
+                SELECT user_id,
+                       card_id,
+                       deck_id,
+                       fsrs_data,
+                       due_at,
+                       state,
+                       updated_at,
+                       server_revision
+                FROM card_progress
+                WHERE user_id = $1
+                  AND server_revision > $2
+                  AND ($3::uuid IS NULL OR modified_by_device_id IS NULL OR modified_by_device_id <> $3::uuid)
+                ORDER BY server_revision
+                `
+                : `
+                SELECT user_id,
+                       card_id,
+                       deck_id,
+                       fsrs_data,
+                       due_at,
+                       state,
+                       updated_at,
+                       server_revision
+                FROM card_progress
+                WHERE user_id = $1
+                ORDER BY updated_at DESC
+                `,
+              hasSinceRevision ? [userId, sinceRevision, deviceId] : [userId],
             ),
             await client.query(
               `
