@@ -1808,6 +1808,19 @@ test("admin can clone assignments, create a test learner, inspect state, and res
   assert.equal(Number(detailAfterReset.stats.matching_record_count), 0);
   assert.equal(detailAfterReset.assignments.length, 1);
 
+  const incrementalAfterReset = await syncJson(
+    ctx,
+    "GET",
+    `/v1/bootstrap?sinceRevision=${syncResult.serverRevision}`,
+    ctx.syncToken,
+    undefined,
+    testLearner.user.id,
+  );
+  assert.equal(incrementalAfterReset.studyDataResets.length, 1);
+  assert.equal(incrementalAfterReset.studyDataResets[0].deck_id, deck.deckId);
+  assert.equal(incrementalAfterReset.studyDataResets[0].user_id, testLearner.user.id);
+  assert.ok(BigInt(incrementalAfterReset.serverRevision) > BigInt(syncResult.serverRevision));
+
   const bootstrapAfterReset = await syncJson(ctx, "GET", "/v1/bootstrap", ctx.syncToken, undefined, testLearner.user.id);
   assert.equal(bootstrapAfterReset.assignments.length, 1);
   assert.deepEqual(bootstrapAfterReset.progress, []);

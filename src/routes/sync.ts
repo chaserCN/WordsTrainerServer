@@ -416,7 +416,8 @@ async function latestRevision(pool: Queryable): Promise<string> {
       COALESCE((SELECT MAX(server_revision) FROM study_reviews), 0),
       COALESCE((SELECT MAX(server_revision) FROM practice_reviews), 0),
       COALESCE((SELECT MAX(server_revision) FROM deck_matching_records), 0),
-      COALESCE((SELECT MAX(server_revision) FROM matching_attempts), 0)
+      COALESCE((SELECT MAX(server_revision) FROM matching_attempts), 0),
+      COALESCE((SELECT MAX(server_revision) FROM study_data_resets), 0)
     )::text AS revision
     `,
   );
@@ -1155,6 +1156,7 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
         matchingAttempts,
         reviews,
         practiceReviews,
+        studyDataResets,
         dailyUsage,
         reviewsRevision,
       ] = userId
@@ -1292,6 +1294,16 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
               `,
               [userId, sinceRevision, deviceId],
             ),
+            await client.query(
+              `
+              SELECT user_id, deck_id, reset_at, server_revision
+              FROM study_data_resets
+              WHERE user_id = $1
+                AND server_revision > $2
+              ORDER BY server_revision
+              `,
+              [userId, sinceRevision],
+            ),
             await dailyUsageRows(client, userId, timeZone),
             await client.query<{ revision: string }>(
               `
@@ -1305,6 +1317,7 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
         : [
             [],
             emptyContent(),
+            { rows: [] },
             { rows: [] },
             { rows: [] },
             { rows: [] },
@@ -1327,6 +1340,7 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
         progress: progress.rows,
         reviews: reviews.rows,
         practiceReviews: practiceReviews.rows,
+        studyDataResets: studyDataResets.rows,
         matchingRecords: matchingRecords.rows,
         matchingAttempts: matchingAttempts.rows,
         dailyUsage,
@@ -1349,7 +1363,16 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
     const sinceRevision = parseRevision(request.query.sinceRevision).toString();
     const deviceId = requestDeviceId(request.headers[clientDeviceIdHeader]);
 
-    const [assignments, content, progress, reviews, practiceReviews, matchingRecords, matchingAttempts] = await Promise.all([
+    const [
+      assignments,
+      content,
+      progress,
+      reviews,
+      practiceReviews,
+      matchingRecords,
+      matchingAttempts,
+      studyDataResets,
+    ] = await Promise.all([
       assignedDeckRows(pool, userId, sinceRevision, deviceId),
       assignedContentRows(pool, userId, sinceRevision),
       pool.query(
@@ -1407,6 +1430,16 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
         `,
         [userId, sinceRevision, deviceId],
       ),
+      pool.query(
+        `
+        SELECT user_id, deck_id, reset_at, server_revision
+        FROM study_data_resets
+        WHERE user_id = $1
+          AND server_revision > $2
+        ORDER BY server_revision
+        `,
+        [userId, sinceRevision],
+      ),
     ]);
 
     return {
@@ -1417,6 +1450,7 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
       practiceReviews: practiceReviews.rows,
       matchingRecords: matchingRecords.rows,
       matchingAttempts: matchingAttempts.rows,
+      studyDataResets: studyDataResets.rows,
       serverRevision: await latestRevision(pool),
     };
   });

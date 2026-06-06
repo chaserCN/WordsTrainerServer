@@ -919,6 +919,10 @@ export async function registerAdminRoutes(
           "DELETE FROM matching_attempts WHERE user_id = $1 AND ($2::uuid IS NULL OR deck_id = $2)",
           params,
         );
+        await client.query(
+          "INSERT INTO study_data_resets (user_id, deck_id) VALUES ($1, $2::uuid)",
+          params,
+        );
       }
       await client.query("COMMIT");
       return {
