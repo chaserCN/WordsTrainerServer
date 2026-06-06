@@ -1185,29 +1185,37 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
                 FROM deck_assignments
                 JOIN decks ON decks.id = deck_assignments.deck_id
                 JOIN deck_version_cards ON deck_version_cards.deck_version_id = decks.current_version_id
-                WHERE deck_assignments.user_id = $1 AND deck_version_cards.image_media_id IS NOT NULL
+                WHERE deck_assignments.user_id = $1
+                  AND NOT (deck_version_cards.deck_version_id = ANY($2::uuid[]))
+                  AND deck_version_cards.image_media_id IS NOT NULL
                 UNION
                 SELECT deck_version_cards.audio_word_media_id
                 FROM deck_assignments
                 JOIN decks ON decks.id = deck_assignments.deck_id
                 JOIN deck_version_cards ON deck_version_cards.deck_version_id = decks.current_version_id
-                WHERE deck_assignments.user_id = $1 AND deck_version_cards.audio_word_media_id IS NOT NULL
+                WHERE deck_assignments.user_id = $1
+                  AND NOT (deck_version_cards.deck_version_id = ANY($2::uuid[]))
+                  AND deck_version_cards.audio_word_media_id IS NOT NULL
                 UNION
                 SELECT deck_version_examples.image_media_id
                 FROM deck_assignments
                 JOIN decks ON decks.id = deck_assignments.deck_id
                 JOIN deck_version_examples ON deck_version_examples.deck_version_id = decks.current_version_id
-                WHERE deck_assignments.user_id = $1 AND deck_version_examples.image_media_id IS NOT NULL
+                WHERE deck_assignments.user_id = $1
+                  AND NOT (deck_version_examples.deck_version_id = ANY($2::uuid[]))
+                  AND deck_version_examples.image_media_id IS NOT NULL
                 UNION
                 SELECT deck_version_examples.audio_example_media_id
                 FROM deck_assignments
                 JOIN decks ON decks.id = deck_assignments.deck_id
                 JOIN deck_version_examples ON deck_version_examples.deck_version_id = decks.current_version_id
-                WHERE deck_assignments.user_id = $1 AND deck_version_examples.audio_example_media_id IS NOT NULL
+                WHERE deck_assignments.user_id = $1
+                  AND NOT (deck_version_examples.deck_version_id = ANY($2::uuid[]))
+                  AND deck_version_examples.audio_example_media_id IS NOT NULL
               )
               ORDER BY media_objects.storage_key
               `,
-              [userId],
+              [userId, cachedVersions],
             ),
             await client.query(
               `

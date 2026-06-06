@@ -717,6 +717,7 @@ test("mobile bootstrap skips content for cached deck versions", async (t) => {
   assert.equal(fullBootstrap.assignments[0].current_version_id, deck.versionId);
   assert.equal(fullBootstrap.content.cards.length, 2);
   assert.equal(fullBootstrap.content.examples.length, 2);
+  assert.equal(fullBootstrap.media.length, 2);
 
   const cachedBootstrapResponse = await ctx.app.inject({
     method: "GET",
@@ -735,6 +736,7 @@ test("mobile bootstrap skips content for cached deck versions", async (t) => {
   assert.deepEqual(cachedBootstrap.content.examples, []);
   assert.deepEqual(cachedBootstrap.content.forms, []);
   assert.deepEqual(cachedBootstrap.content.distractors, []);
+  assert.equal(cachedBootstrap.media.length, 1);
 });
 
 test("admin can create object storage upload urls and mobile downloads ready media through storage redirect", async (t) => {
