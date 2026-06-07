@@ -34,6 +34,13 @@ type UserRow = {
   updated_at: string;
 };
 
+type UserSettingsRow = {
+  user_id: string;
+  random_card_count: number;
+  updated_at: string;
+  server_revision: string;
+};
+
 type ReviewEventInput = {
   clientEventId: string;
   deckId: string;
@@ -366,6 +373,7 @@ async function latestRevision(pool: Queryable): Promise<string> {
       COALESCE((SELECT MAX(server_revision) FROM deck_versions), 0),
       COALESCE((SELECT MAX(server_revision) FROM deck_assignments), 0),
       COALESCE((SELECT MAX(server_revision) FROM user_deck_preferences), 0),
+      COALESCE((SELECT MAX(server_revision) FROM user_settings), 0),
       COALESCE((SELECT MAX(server_revision) FROM card_progress), 0),
       COALESCE((SELECT MAX(server_revision) FROM study_reviews), 0),
       COALESCE((SELECT MAX(server_revision) FROM practice_reviews), 0),
@@ -385,6 +393,36 @@ async function allUserRows(pool: Queryable): Promise<UserRow[]> {
     FROM users
     ORDER BY display_name
     `,
+  );
+  return result.rows;
+}
+
+async function userSettingsRows(
+  pool: Queryable,
+  userId: string,
+  sinceRevision?: string,
+  excludingDeviceId?: string | null,
+): Promise<UserSettingsRow[]> {
+  const params: unknown[] = [userId];
+  const revisionFilter = sinceRevision
+    ? `AND user_settings.server_revision > $2
+       AND ($3::uuid IS NULL OR user_settings.modified_by_device_id IS NULL OR user_settings.modified_by_device_id <> $3::uuid)`
+    : "";
+  if (sinceRevision) {
+    params.push(sinceRevision, excludingDeviceId ?? null);
+  }
+  const result = await pool.query<UserSettingsRow>(
+    `
+    SELECT users.id AS user_id,
+           COALESCE(user_settings.random_card_count, 30)::int AS random_card_count,
+           COALESCE(user_settings.updated_at, users.updated_at) AS updated_at,
+           COALESCE(user_settings.server_revision, 0)::text AS server_revision
+    FROM users
+    LEFT JOIN user_settings ON user_settings.user_id = users.id
+    WHERE users.id = $1
+      ${revisionFilter}
+    `,
+    params,
   );
   return result.rows;
 }
@@ -1107,6 +1145,7 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
         reviews,
         practiceReviews,
         studyDataResets,
+        userSettings,
       ] = userId
         ? [
             await assignedDeckRows(client, userId),
@@ -1229,6 +1268,7 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
               `,
               [userId],
             ),
+            await userSettingsRows(client, userId),
           ]
         : [
             [],
@@ -1240,6 +1280,7 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
             { rows: [] },
             { rows: [] },
             { rows: [] },
+            [],
           ];
 
       const serverRevision = await latestRevision(client);
@@ -1260,6 +1301,7 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
           matchingRecords: matchingRecords.rows,
           matchingAttempts: matchingAttempts.rows,
           studyDataResets: studyDataResets.rows,
+          userSettings,
         },
       };
     } catch (error) {
@@ -1287,6 +1329,7 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
       matchingRecords,
       matchingAttempts,
       studyDataResets,
+      userSettings,
     ] = await Promise.all([
       assignedDeckRows(pool, userId, sinceRevision, deviceId),
       assignedContentRows(pool, userId, sinceRevision),
@@ -1355,6 +1398,7 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
         `,
         [userId, sinceRevision],
       ),
+      userSettingsRows(pool, userId, sinceRevision, deviceId),
     ]);
 
     return {
@@ -1370,6 +1414,7 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
         matchingRecords: matchingRecords.rows,
         matchingAttempts: matchingAttempts.rows,
         studyDataResets: studyDataResets.rows,
+        userSettings,
       },
     };
   });

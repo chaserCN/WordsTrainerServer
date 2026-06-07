@@ -106,6 +106,14 @@ function optionalInteger(value: unknown, field: string, defaultValue: number): n
   return numberValue;
 }
 
+function randomCardCount(value: unknown, field: string): number {
+  const numberValue = optionalNumber(value, field);
+  if (numberValue == null || !Number.isInteger(numberValue) || numberValue < 1 || numberValue > 200) {
+    badRequest(`${field} must be an integer between 1 and 200`);
+  }
+  return numberValue;
+}
+
 function adminTimeZone(value: unknown): string {
   const text = optionalString(value, "timeZone") ?? "Europe/Kyiv";
   if (!/^[A-Za-z0-9_+\-./]{1,64}$/.test(text)) {
@@ -450,6 +458,30 @@ async function requireUser(client: Queryable, userId: string): Promise<void> {
   }
 }
 
+async function selectUserWithSettings(client: Queryable, userId: string): Promise<pg.QueryResultRow> {
+  const result = await client.query(
+    `
+    SELECT users.id,
+           users.display_name,
+           users.display_name_localized,
+           users.grammatical_gender,
+           users.role,
+           users.avatar_media_id,
+           COALESCE(user_settings.random_card_count, 30)::int AS random_card_count,
+           users.created_at,
+           users.updated_at
+    FROM users
+    LEFT JOIN user_settings ON user_settings.user_id = users.id
+    WHERE users.id = $1
+    `,
+    [userId],
+  );
+  if (!result.rowCount) {
+    notFound("user not found");
+  }
+  return result.rows[0];
+}
+
 async function requireDeck(client: Queryable, deckId: string): Promise<void> {
   const result = await client.query("SELECT 1 FROM decks WHERE id = $1", [deckId]);
   if (!result.rowCount) {
@@ -514,9 +546,11 @@ export async function registerAdminRoutes(
              users.grammatical_gender,
              users.role,
              users.avatar_media_id,
+             COALESCE(user_settings.random_card_count, 30)::int AS random_card_count,
              users.created_at,
              users.updated_at
       FROM users
+      LEFT JOIN user_settings ON user_settings.user_id = users.id
       ORDER BY users.created_at DESC
     `);
     return { users: result.rows };
@@ -531,17 +565,42 @@ export async function registerAdminRoutes(
     const gender = grammaticalGender(data.grammaticalGender, "grammaticalGender");
     const role = appRole(data.role, "role");
     const avatarMediaId = optionalUUID(data.avatarMediaId, "avatarMediaId");
+    const hasRandomCardCount = Object.hasOwn(data, "randomCardCount");
+    const requestedRandomCardCount = hasRandomCardCount
+      ? randomCardCount(data.randomCardCount, "randomCardCount")
+      : null;
 
-    const result = await pool.query(
-      `
-      INSERT INTO users (display_name, display_name_localized, grammatical_gender, role, avatar_media_id)
-      VALUES ($1, $2, $3, $4, $5)
-      RETURNING id, display_name, display_name_localized, grammatical_gender, role, avatar_media_id, created_at, updated_at
-      `,
-      [displayName, displayNameLocalized, gender, role, avatarMediaId],
-    );
-    reply.status(201);
-    return { user: result.rows[0] };
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const result = await client.query(
+        `
+        INSERT INTO users (display_name, display_name_localized, grammatical_gender, role, avatar_media_id)
+        VALUES ($1, $2, $3, $4, $5)
+        RETURNING id
+        `,
+        [displayName, displayNameLocalized, gender, role, avatarMediaId],
+      );
+      const userId = result.rows[0].id;
+      if (requestedRandomCardCount != null) {
+        await client.query(
+          `
+          INSERT INTO user_settings (user_id, random_card_count, server_revision, updated_at)
+          VALUES ($1, $2, nextval('server_revision_seq'), now())
+          `,
+          [userId, requestedRandomCardCount],
+        );
+      }
+      const user = await selectUserWithSettings(client, userId);
+      await client.query("COMMIT");
+      reply.status(201);
+      return { user };
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
   });
 
   app.put<{ Params: IdParams }>("/v1/admin/users/:userId", async (request) => {
@@ -552,8 +611,16 @@ export async function registerAdminRoutes(
     const hasGrammaticalGender = Object.hasOwn(data, "grammaticalGender");
     const hasRole = Object.hasOwn(data, "role");
     const hasAvatarMediaId = Object.hasOwn(data, "avatarMediaId");
+    const hasRandomCardCount = Object.hasOwn(data, "randomCardCount");
 
-    if (!hasDisplayName && !hasDisplayNameLocalized && !hasGrammaticalGender && !hasRole && !hasAvatarMediaId) {
+    if (
+      !hasDisplayName
+      && !hasDisplayNameLocalized
+      && !hasGrammaticalGender
+      && !hasRole
+      && !hasAvatarMediaId
+      && !hasRandomCardCount
+    ) {
       badRequest("at least one user field is required");
     }
 
@@ -564,37 +631,64 @@ export async function registerAdminRoutes(
     const gender = hasGrammaticalGender ? grammaticalGender(data.grammaticalGender, "grammaticalGender") : null;
     const role = hasRole ? appRole(data.role, "role") : null;
     const avatarMediaId = hasAvatarMediaId ? optionalUUID(data.avatarMediaId, "avatarMediaId") : null;
+    const requestedRandomCardCount = hasRandomCardCount
+      ? randomCardCount(data.randomCardCount, "randomCardCount")
+      : null;
 
-    const result = await pool.query(
-      `
-      UPDATE users
-      SET display_name = CASE WHEN $2 THEN $3 ELSE display_name END,
-          display_name_localized = CASE WHEN $4 THEN $5 ELSE display_name_localized END,
-          grammatical_gender = CASE WHEN $6 THEN $7 ELSE grammatical_gender END,
-          role = CASE WHEN $8 THEN $9::app_role ELSE role END,
-          avatar_media_id = CASE WHEN $10 THEN $11::uuid ELSE avatar_media_id END,
-          updated_at = now()
-      WHERE id = $1
-      RETURNING id, display_name, display_name_localized, grammatical_gender, role, avatar_media_id, created_at, updated_at
-      `,
-      [
-        userId,
-        hasDisplayName,
-        displayName,
-        hasDisplayNameLocalized,
-        displayNameLocalized,
-        hasGrammaticalGender,
-        gender,
-        hasRole,
-        role,
-        hasAvatarMediaId,
-        avatarMediaId,
-      ],
-    );
-    if (!result.rowCount) {
-      notFound("user not found");
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const result = await client.query(
+        `
+        UPDATE users
+        SET display_name = CASE WHEN $2 THEN $3 ELSE display_name END,
+            display_name_localized = CASE WHEN $4 THEN $5 ELSE display_name_localized END,
+            grammatical_gender = CASE WHEN $6 THEN $7 ELSE grammatical_gender END,
+            role = CASE WHEN $8 THEN $9::app_role ELSE role END,
+            avatar_media_id = CASE WHEN $10 THEN $11::uuid ELSE avatar_media_id END,
+            updated_at = CASE WHEN ($2 OR $4 OR $6 OR $8 OR $10) THEN now() ELSE updated_at END
+        WHERE id = $1
+        RETURNING id
+        `,
+        [
+          userId,
+          hasDisplayName,
+          displayName,
+          hasDisplayNameLocalized,
+          displayNameLocalized,
+          hasGrammaticalGender,
+          gender,
+          hasRole,
+          role,
+          hasAvatarMediaId,
+          avatarMediaId,
+        ],
+      );
+      if (!result.rowCount) {
+        notFound("user not found");
+      }
+      if (requestedRandomCardCount != null) {
+        await client.query(
+          `
+          INSERT INTO user_settings (user_id, random_card_count, server_revision, updated_at)
+          VALUES ($1, $2, nextval('server_revision_seq'), now())
+          ON CONFLICT (user_id) DO UPDATE SET
+            random_card_count = excluded.random_card_count,
+            server_revision = nextval('server_revision_seq'),
+            updated_at = now()
+          `,
+          [userId, requestedRandomCardCount],
+        );
+      }
+      const user = await selectUserWithSettings(client, userId);
+      await client.query("COMMIT");
+      return { user };
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
     }
-    return { user: result.rows[0] };
   });
 
   app.get<{ Params: IdParams }>("/v1/admin/users/:userId", async (request) => {
@@ -602,9 +696,18 @@ export async function registerAdminRoutes(
     const [user, assignments, stats] = await Promise.all([
       pool.query(
         `
-        SELECT id, display_name, display_name_localized, grammatical_gender, role, avatar_media_id, created_at, updated_at
+        SELECT users.id,
+               users.display_name,
+               users.display_name_localized,
+               users.grammatical_gender,
+               users.role,
+               users.avatar_media_id,
+               COALESCE(user_settings.random_card_count, 30)::int AS random_card_count,
+               users.created_at,
+               users.updated_at
         FROM users
-        WHERE id = $1
+        LEFT JOIN user_settings ON user_settings.user_id = users.id
+        WHERE users.id = $1
         `,
         [userId],
       ),

@@ -659,6 +659,8 @@ test("mobile bootstrap and sync are usable when server has no assigned content",
   assert.deepEqual(bootstrap.content.distractors, []);
   assert.deepEqual(bootstrap.media, []);
   assert.deepEqual(bootstrap.progress, []);
+  assert.equal(bootstrap.userSettings.length, 1);
+  assert.equal(bootstrap.userSettings[0].random_card_count, 30);
   assert.equal(bootstrap.serverRevision, "0");
 
   const changes = await syncJson(ctx, "GET", "/v1/sync/changes?sinceRevision=0", learner.token, undefined, learner.userId);
@@ -667,6 +669,7 @@ test("mobile bootstrap and sync are usable when server has no assigned content",
   assert.deepEqual(changes.progress, []);
   assert.deepEqual(changes.reviews, []);
   assert.deepEqual(changes.matchingRecords, []);
+  assert.deepEqual(changes.userSettings, []);
 
   const emptySync = await syncJson(ctx, "POST", "/v1/sync/events", learner.token, {}, learner.userId);
   assert.deepEqual(emptySync.acceptedReviewIds, []);
@@ -961,6 +964,7 @@ test("admin can edit user and deck metadata with partial updates and clears", as
   }, 201);
   assert.equal(user.user.display_name_localized, "Метадата");
   assert.equal(user.user.grammatical_gender, "female");
+  assert.equal(user.user.random_card_count, 30);
   const userId = user.user.id;
 
   const renamedUser = await adminJson(ctx, "PUT", `/v1/admin/users/${userId}`, {
@@ -987,9 +991,16 @@ test("admin can edit user and deck metadata with partial updates and clears", as
   });
   assert.equal(clearedUserAvatar.user.avatar_media_id, null);
 
+  const retunedUser = await adminJson(ctx, "PUT", `/v1/admin/users/${userId}`, {
+    randomCardCount: 17,
+  });
+  assert.equal(retunedUser.user.random_card_count, 17);
+
   await adminJson(ctx, "PUT", `/v1/admin/users/${userId}`, {}, 400);
   await adminJson(ctx, "PUT", `/v1/admin/users/${userId}`, { role: "coach" }, 400);
   await adminJson(ctx, "PUT", `/v1/admin/users/${userId}`, { grammaticalGender: "plural" }, 400);
+  await adminJson(ctx, "PUT", `/v1/admin/users/${userId}`, { randomCardCount: 0 }, 400);
+  await adminJson(ctx, "PUT", `/v1/admin/users/${userId}`, { randomCardCount: 201 }, 400);
   await adminJson(ctx, "PUT", `/v1/admin/users/${randomUUID()}`, { displayName: "Missing" }, 404);
 
   const deckAvatarId = await createMedia(ctx, "metadata-deck-avatar");
@@ -1015,6 +1026,25 @@ test("admin can edit user and deck metadata with partial updates and clears", as
   assert.equal(baseline.assignments[0].language_code, "en");
   assert.equal(baseline.assignments[0].avatar_system_name, "books.vertical.fill");
   assert.equal(baseline.assignments[0].avatar_media_id, deckAvatarId);
+  assert.equal(baseline.userSettings.length, 1);
+  assert.equal(baseline.userSettings[0].random_card_count, 17);
+
+  const settingsBaselineRevision = baseline.serverRevision;
+  const reducedRandomQueue = await adminJson(ctx, "PUT", `/v1/admin/users/${userId}`, {
+    randomCardCount: 9,
+  });
+  assert.equal(reducedRandomQueue.user.random_card_count, 9);
+
+  const settingsChanges = await syncJson(
+    ctx,
+    "GET",
+    `/v1/sync/changes?sinceRevision=${settingsBaselineRevision}`,
+    ctx.syncToken,
+    undefined,
+    userId,
+  );
+  assert.equal(settingsChanges.userSettings.length, 1);
+  assert.equal(settingsChanges.userSettings[0].random_card_count, 9);
 
   const relanguagedDeck = await adminJson(ctx, "PUT", `/v1/admin/decks/${deck.deck.id}`, {
     languageCode: "es",
