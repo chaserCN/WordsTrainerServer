@@ -214,6 +214,7 @@ async function assignedDeckRows(
     ? `AND (
         deck_assignments.server_revision > $2
         OR deck_versions.server_revision > $2
+        OR user_deck_groups.server_revision > $2
         OR (
           user_deck_preferences.server_revision > $2
           AND ($3::uuid IS NULL
@@ -242,16 +243,24 @@ async function assignedDeckRows(
            deck_versions.published_at,
            COALESCE(user_deck_preferences.is_enabled, true) AS user_enabled,
            user_deck_preferences.updated_at AS preference_updated_at,
-           user_deck_preferences.server_revision AS preference_revision
+           user_deck_preferences.server_revision AS preference_revision,
+           user_deck_groups.id AS deck_group_id,
+           user_deck_groups.title AS deck_group_title,
+           user_deck_groups.sort_order AS deck_group_sort_order,
+           user_deck_groups.server_revision AS deck_group_revision,
+           deck_assignments.sort_order AS deck_sort_order
     FROM deck_assignments
     JOIN decks ON decks.id = deck_assignments.deck_id
     LEFT JOIN deck_versions ON deck_versions.id = decks.current_version_id
+    LEFT JOIN user_deck_groups
+      ON user_deck_groups.user_id = deck_assignments.user_id
+      AND user_deck_groups.id = deck_assignments.group_id
     LEFT JOIN user_deck_preferences
       ON user_deck_preferences.user_id = deck_assignments.user_id
       AND user_deck_preferences.deck_id = deck_assignments.deck_id
     WHERE deck_assignments.user_id = $1
       ${revisionFilter}
-    ORDER BY decks.title
+    ORDER BY user_deck_groups.sort_order NULLS LAST, user_deck_groups.title NULLS LAST, deck_assignments.sort_order, decks.title
     `,
     params,
   );
@@ -372,6 +381,7 @@ async function latestRevision(pool: Queryable): Promise<string> {
     SELECT GREATEST(
       COALESCE((SELECT MAX(server_revision) FROM deck_versions), 0),
       COALESCE((SELECT MAX(server_revision) FROM deck_assignments), 0),
+      COALESCE((SELECT MAX(server_revision) FROM user_deck_groups), 0),
       COALESCE((SELECT MAX(server_revision) FROM user_deck_preferences), 0),
       COALESCE((SELECT MAX(server_revision) FROM user_settings), 0),
       COALESCE((SELECT MAX(server_revision) FROM card_progress), 0),

@@ -783,6 +783,83 @@ test("mobile bootstrap skips content for cached deck versions", async (t) => {
   assert.equal(cachedBootstrap.media.length, 1);
 });
 
+test("admin can group a user's deck assignments and sync group metadata", async (t) => {
+  const ctx = await createTestApp(t);
+  if (!ctx) return;
+
+  const learner = await createUser(ctx, "Grouped Deck Learner");
+  const otherLearner = await createUser(ctx, "Other Group Owner");
+  const deck = await createPublishedDeck(ctx, learner.userId, "English 1-2000");
+
+  const group = await adminJson(ctx, "POST", `/v1/admin/users/${learner.userId}/deck-groups`, {
+    title: "English",
+    sortOrder: 20,
+  }, 201);
+  assert.equal(group.group.title, "English");
+  assert.equal(group.group.sort_order, 20);
+
+  const otherGroup = await adminJson(ctx, "POST", `/v1/admin/users/${otherLearner.userId}/deck-groups`, {
+    title: "English",
+  }, 201);
+  await adminJson(ctx, "PUT", `/v1/admin/users/${learner.userId}/deck-assignments/${deck.deckId}/group`, {
+    groupId: otherGroup.group.id,
+  }, 404);
+
+  const assigned = await adminJson(ctx, "PUT", `/v1/admin/users/${learner.userId}/deck-assignments/${deck.deckId}/group`, {
+    groupId: group.group.id,
+    sortOrder: 5,
+  });
+  assert.equal(assigned.assignment.group_id, group.group.id);
+  assert.equal(assigned.assignment.sort_order, 5);
+
+  const listed = await adminJson(ctx, "GET", `/v1/admin/users/${learner.userId}/deck-groups`);
+  assert.equal(listed.groups.length, 1);
+  assert.equal(listed.groups[0].id, group.group.id);
+
+  const bootstrap = await syncJson(ctx, "GET", "/v1/bootstrap", learner.token, undefined, learner.userId);
+  assert.equal(bootstrap.assignments.length, 1);
+  assert.equal(bootstrap.assignments[0].deck_group_id, group.group.id);
+  assert.equal(bootstrap.assignments[0].deck_group_title, "English");
+  assert.equal(bootstrap.assignments[0].deck_group_sort_order, 20);
+  assert.equal(bootstrap.assignments[0].deck_sort_order, 5);
+
+  const renamed = await adminJson(ctx, "PUT", `/v1/admin/users/${learner.userId}/deck-groups/${group.group.id}`, {
+    title: "English B2",
+    sortOrder: 1,
+  });
+  assert.equal(renamed.group.title, "English B2");
+  assert.equal(renamed.group.sort_order, 1);
+
+  const renameChanges = await syncJson(
+    ctx,
+    "GET",
+    `/v1/sync/changes?sinceRevision=${bootstrap.serverRevision}`,
+    learner.token,
+    undefined,
+    learner.userId,
+  );
+  assert.equal(renameChanges.assignments.length, 1);
+  assert.equal(renameChanges.assignments[0].deck_group_id, group.group.id);
+  assert.equal(renameChanges.assignments[0].deck_group_title, "English B2");
+  assert.equal(renameChanges.assignments[0].deck_group_sort_order, 1);
+
+  const deleted = await adminJson(ctx, "DELETE", `/v1/admin/users/${learner.userId}/deck-groups/${group.group.id}`);
+  assert.equal(deleted.group.id, group.group.id);
+  assert.deepEqual(deleted.ungroupedDeckIds, [deck.deckId]);
+
+  const deleteChanges = await syncJson(
+    ctx,
+    "GET",
+    `/v1/sync/changes?sinceRevision=${renameChanges.serverRevision}`,
+    learner.token,
+    undefined,
+    learner.userId,
+  );
+  assert.equal(deleteChanges.assignments.length, 1);
+  assert.equal(deleteChanges.assignments[0].deck_group_id, null);
+  assert.equal(deleteChanges.assignments[0].deck_group_title, null);
+});
+
 test("admin can create object storage upload urls and mobile downloads ready media through storage redirect", async (t) => {
   const objectStorage: AppConfig["objectStorage"] = {
     bucket: "flashgame-test",

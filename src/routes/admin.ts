@@ -114,6 +114,25 @@ function randomCardCount(value: unknown, field: string): number {
   return numberValue;
 }
 
+function nonEmptyTitle(value: unknown, field: string): string {
+  const title = requiredString(value, field).trim();
+  if (!title) {
+    badRequest(`${field} must not be empty`);
+  }
+  return title;
+}
+
+function optionalSortOrder(value: unknown, field: string, defaultValue: number): number {
+  const sortOrder = optionalNumber(value, field);
+  if (sortOrder == null) {
+    return defaultValue;
+  }
+  if (!Number.isInteger(sortOrder)) {
+    badRequest(`${field} must be an integer`);
+  }
+  return sortOrder;
+}
+
 function adminTimeZone(value: unknown): string {
   const text = optionalString(value, "timeZone") ?? "Europe/Kyiv";
   if (!/^[A-Za-z0-9_+\-./]{1,64}$/.test(text)) {
@@ -501,16 +520,41 @@ async function cloneUserAssignments(
   await requireUser(client, targetUserId);
   const result = await client.query(
     `
-    INSERT INTO deck_assignments (user_id, deck_id, deck_version_id, status, server_revision)
-    SELECT $2, deck_id, NULL, status, nextval('server_revision_seq')
+    WITH source_groups AS (
+      SELECT id AS source_group_id, title, sort_order
+      FROM user_deck_groups
+      WHERE user_id = $1
+    ),
+    target_groups AS (
+      INSERT INTO user_deck_groups (user_id, title, sort_order, server_revision)
+      SELECT $2, title, sort_order, nextval('server_revision_seq')
+      FROM source_groups
+      ON CONFLICT (user_id, title) DO UPDATE SET
+        sort_order = excluded.sort_order,
+        server_revision = nextval('server_revision_seq'),
+        updated_at = now()
+      RETURNING id, title
+    )
+    INSERT INTO deck_assignments (user_id, deck_id, deck_version_id, status, group_id, sort_order, server_revision)
+    SELECT $2,
+           deck_assignments.deck_id,
+           NULL,
+           deck_assignments.status,
+           target_groups.id,
+           deck_assignments.sort_order,
+           nextval('server_revision_seq')
     FROM deck_assignments
-    WHERE user_id = $1
+    LEFT JOIN source_groups ON source_groups.source_group_id = deck_assignments.group_id
+    LEFT JOIN target_groups ON target_groups.title = source_groups.title
+    WHERE deck_assignments.user_id = $1
     ON CONFLICT (user_id, deck_id) DO UPDATE SET
       deck_version_id = NULL,
       status = excluded.status,
+      group_id = excluded.group_id,
+      sort_order = excluded.sort_order,
       server_revision = nextval('server_revision_seq'),
       updated_at = now()
-    RETURNING user_id, deck_id, deck_version_id, status, server_revision, assigned_at, updated_at
+    RETURNING user_id, deck_id, deck_version_id, status, group_id, sort_order, server_revision, assigned_at, updated_at
     `,
     [sourceUserId, targetUserId],
   );
@@ -521,6 +565,26 @@ async function requireGroup(client: Queryable, groupId: string): Promise<void> {
   const result = await client.query("SELECT 1 FROM study_groups WHERE id = $1", [groupId]);
   if (!result.rowCount) {
     notFound("group not found");
+  }
+}
+
+async function requireUserDeckGroup(client: Queryable, userId: string, groupId: string): Promise<void> {
+  const result = await client.query(
+    "SELECT 1 FROM user_deck_groups WHERE user_id = $1 AND id = $2",
+    [userId, groupId],
+  );
+  if (!result.rowCount) {
+    notFound("deck group not found");
+  }
+}
+
+async function requireDeckAssignment(client: Queryable, userId: string, deckId: string): Promise<void> {
+  const result = await client.query(
+    "SELECT 1 FROM deck_assignments WHERE user_id = $1 AND deck_id = $2",
+    [userId, deckId],
+  );
+  if (!result.rowCount) {
+    notFound("deck assignment not found");
   }
 }
 
@@ -717,6 +781,8 @@ export async function registerAdminRoutes(
                deck_assignments.deck_id,
                NULL::uuid AS deck_version_id,
                deck_assignments.status,
+               deck_assignments.group_id,
+               deck_assignments.sort_order,
                deck_assignments.server_revision,
                deck_assignments.assigned_at,
                deck_assignments.updated_at,
@@ -728,12 +794,17 @@ export async function registerAdminRoutes(
                NULL::int AS assigned_version_number,
                NULL::deck_version_status AS assigned_version_status,
                current_versions.version_number AS current_version_number,
-               current_versions.status AS current_version_status
+               current_versions.status AS current_version_status,
+               user_deck_groups.title AS deck_group_title,
+               user_deck_groups.sort_order AS deck_group_sort_order
         FROM deck_assignments
         JOIN decks ON decks.id = deck_assignments.deck_id
         LEFT JOIN deck_versions AS current_versions ON current_versions.id = decks.current_version_id
+        LEFT JOIN user_deck_groups
+          ON user_deck_groups.user_id = deck_assignments.user_id
+          AND user_deck_groups.id = deck_assignments.group_id
         WHERE deck_assignments.user_id = $1
-        ORDER BY decks.title
+        ORDER BY user_deck_groups.sort_order NULLS LAST, user_deck_groups.title NULLS LAST, deck_assignments.sort_order, decks.title
         `,
         [userId],
       ),
@@ -759,6 +830,180 @@ export async function registerAdminRoutes(
       assignments: assignments.rows,
       stats: stats.rows[0],
     };
+  });
+
+  app.get<{ Params: IdParams }>("/v1/admin/users/:userId/deck-groups", async (request) => {
+    const userId = requiredUUID(request.params.userId, "userId");
+    await requireUser(pool, userId);
+    const result = await pool.query(
+      `
+      SELECT id, user_id, title, sort_order, server_revision, created_at, updated_at
+      FROM user_deck_groups
+      WHERE user_id = $1
+      ORDER BY sort_order, title
+      `,
+      [userId],
+    );
+    return { groups: result.rows };
+  });
+
+  app.post<{ Params: IdParams }>("/v1/admin/users/:userId/deck-groups", async (request, reply) => {
+    const userId = requiredUUID(request.params.userId, "userId");
+    const data = body(request.body);
+    const title = nonEmptyTitle(data.title, "title");
+    const sortOrder = optionalSortOrder(data.sortOrder, "sortOrder", 0);
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await requireUser(client, userId);
+      const result = await client.query(
+        `
+        INSERT INTO user_deck_groups (user_id, title, sort_order)
+        VALUES ($1, $2, $3)
+        RETURNING id, user_id, title, sort_order, server_revision, created_at, updated_at
+        `,
+        [userId, title, sortOrder],
+      );
+      await client.query("COMMIT");
+      reply.status(201);
+      return { group: result.rows[0] };
+    } catch (error) {
+      await client.query("ROLLBACK");
+      if ((error as { code?: string }).code === "23505") {
+        badRequest("deck group title must be unique for user");
+      }
+      throw error;
+    } finally {
+      client.release();
+    }
+  });
+
+  app.put<{ Params: IdParams }>("/v1/admin/users/:userId/deck-groups/:groupId", async (request) => {
+    const userId = requiredUUID(request.params.userId, "userId");
+    const groupId = requiredUUID(request.params.groupId, "groupId");
+    const data = body(request.body);
+    const hasTitle = Object.hasOwn(data, "title");
+    const hasSortOrder = Object.hasOwn(data, "sortOrder");
+    if (!hasTitle && !hasSortOrder) {
+      badRequest("at least one deck group field is required");
+    }
+    const title = hasTitle ? nonEmptyTitle(data.title, "title") : null;
+    const sortOrder = hasSortOrder ? optionalSortOrder(data.sortOrder, "sortOrder", 0) : null;
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await requireUser(client, userId);
+      const result = await client.query(
+        `
+        UPDATE user_deck_groups
+        SET title = CASE WHEN $3 THEN $4 ELSE title END,
+            sort_order = CASE WHEN $5 THEN $6 ELSE sort_order END,
+            server_revision = nextval('server_revision_seq'),
+            updated_at = now()
+        WHERE user_id = $1 AND id = $2
+        RETURNING id, user_id, title, sort_order, server_revision, created_at, updated_at
+        `,
+        [userId, groupId, hasTitle, title, hasSortOrder, sortOrder],
+      );
+      if (!result.rowCount) {
+        notFound("deck group not found");
+      }
+      await client.query("COMMIT");
+      return { group: result.rows[0] };
+    } catch (error) {
+      await client.query("ROLLBACK");
+      if ((error as { code?: string }).code === "23505") {
+        badRequest("deck group title must be unique for user");
+      }
+      throw error;
+    } finally {
+      client.release();
+    }
+  });
+
+  app.delete<{ Params: IdParams }>("/v1/admin/users/:userId/deck-groups/:groupId", async (request) => {
+    const userId = requiredUUID(request.params.userId, "userId");
+    const groupId = requiredUUID(request.params.groupId, "groupId");
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await requireUser(client, userId);
+      await requireUserDeckGroup(client, userId, groupId);
+      const ungrouped = await client.query(
+        `
+        UPDATE deck_assignments
+        SET group_id = NULL,
+            server_revision = nextval('server_revision_seq'),
+            updated_at = now()
+        WHERE user_id = $1 AND group_id = $2
+        RETURNING deck_id
+        `,
+        [userId, groupId],
+      );
+      const deleted = await client.query(
+        `
+        DELETE FROM user_deck_groups
+        WHERE user_id = $1 AND id = $2
+        RETURNING id, user_id, title, sort_order, server_revision, created_at, updated_at
+        `,
+        [userId, groupId],
+      );
+      await client.query("COMMIT");
+      return {
+        group: deleted.rows[0],
+        ungroupedDeckIds: ungrouped.rows.map((row) => row.deck_id),
+      };
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  });
+
+  app.put<{ Params: IdParams }>("/v1/admin/users/:userId/deck-assignments/:deckId/group", async (request) => {
+    const userId = requiredUUID(request.params.userId, "userId");
+    const deckId = requiredUUID(request.params.deckId, "deckId");
+    const data = body(request.body);
+    const hasGroupId = Object.hasOwn(data, "groupId");
+    const hasSortOrder = Object.hasOwn(data, "sortOrder");
+    if (!hasGroupId && !hasSortOrder) {
+      badRequest("groupId or sortOrder is required");
+    }
+    const groupId = hasGroupId ? optionalUUID(data.groupId, "groupId") : undefined;
+    const sortOrder = hasSortOrder ? optionalSortOrder(data.sortOrder, "sortOrder", 0) : null;
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await requireUser(client, userId);
+      await requireDeckAssignment(client, userId, deckId);
+      if (groupId) {
+        await requireUserDeckGroup(client, userId, groupId);
+      }
+      const result = await client.query(
+        `
+        UPDATE deck_assignments
+        SET group_id = CASE WHEN $3 THEN $4::uuid ELSE group_id END,
+            sort_order = CASE WHEN $5 THEN $6 ELSE sort_order END,
+            server_revision = nextval('server_revision_seq'),
+            updated_at = now()
+        WHERE user_id = $1 AND deck_id = $2
+        RETURNING user_id, deck_id, deck_version_id, status, group_id, sort_order, server_revision, assigned_at, updated_at
+        `,
+        [userId, deckId, hasGroupId, groupId ?? null, hasSortOrder, sortOrder],
+      );
+      await client.query("COMMIT");
+      return { assignment: result.rows[0] };
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
   });
 
   app.get<{ Params: IdParams; Querystring: DailyActivityQuery }>("/v1/admin/users/:userId/daily-activity", async (request) => {
@@ -2170,24 +2415,31 @@ export async function registerAdminRoutes(
       badRequest("deckVersionId is no longer supported; assignments always follow the current deck version");
     }
     const status = contentStatus(data.status, "status");
+    const groupId = Object.hasOwn(data, "groupId") ? optionalUUID(data.groupId, "groupId") : null;
+    const sortOrder = optionalSortOrder(data.sortOrder, "sortOrder", 0);
 
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
       await requireUser(client, userId);
       await requireDeck(client, deckId);
+      if (groupId) {
+        await requireUserDeckGroup(client, userId, groupId);
+      }
       const result = await client.query(
         `
-        INSERT INTO deck_assignments (user_id, deck_id, deck_version_id, status)
-        VALUES ($1, $2, NULL, $3)
+        INSERT INTO deck_assignments (user_id, deck_id, deck_version_id, status, group_id, sort_order)
+        VALUES ($1, $2, NULL, $3, $4, $5)
         ON CONFLICT (user_id, deck_id) DO UPDATE SET
           deck_version_id = NULL,
           status = excluded.status,
+          group_id = excluded.group_id,
+          sort_order = excluded.sort_order,
           server_revision = nextval('server_revision_seq'),
           updated_at = now()
-        RETURNING user_id, deck_id, deck_version_id, status, server_revision, assigned_at, updated_at
+        RETURNING user_id, deck_id, deck_version_id, status, group_id, sort_order, server_revision, assigned_at, updated_at
         `,
-        [userId, deckId, status],
+        [userId, deckId, status, groupId, sortOrder],
       );
       await client.query("COMMIT");
       reply.status(201);

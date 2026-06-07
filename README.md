@@ -105,7 +105,7 @@ Core tables:
 - `users`
 - `study_groups`, `group_members`
 - `media_objects`
-- `decks`, `deck_versions`, `deck_assignments`, `user_deck_preferences`
+- `decks`, `deck_versions`, `deck_assignments`, `user_deck_groups`, `user_deck_preferences`
 - `deck_version_cards`, `deck_version_examples`
 - `deck_version_word_forms`, `deck_version_distractors`
 - `card_progress`, `study_reviews`
@@ -128,6 +128,11 @@ GET  /v1/admin/users
 POST /v1/admin/users
 PUT  /v1/admin/users/:userId
 GET  /v1/admin/users/:userId/daily-activity?dayKey=YYYY-MM-DD&timeZone=Europe/Kyiv
+GET  /v1/admin/users/:userId/deck-groups
+POST /v1/admin/users/:userId/deck-groups
+PUT  /v1/admin/users/:userId/deck-groups/:groupId
+DELETE /v1/admin/users/:userId/deck-groups/:groupId
+PUT  /v1/admin/users/:userId/deck-assignments/:deckId/group
 GET  /v1/admin/groups
 POST /v1/admin/groups
 GET  /v1/admin/groups/:groupId
@@ -157,6 +162,10 @@ PUT  /v1/admin/decks/:deckId/versions/:versionId/examples/:exampleId/distractors
 POST /v1/admin/decks/:deckId/publish
 POST /v1/admin/decks/:deckId/assignments
 ```
+
+`/v1/admin/users/:userId/deck-groups` manages per-user deck sections such as
+English or Spanish. These are UI/content-organization groups and are separate
+from `study_groups`, which model household/access membership.
 
 Content editing endpoints and publish both accept only `draft` deck versions.
 After a version is published, the macOS editor must create a new draft version,
