@@ -16,6 +16,7 @@ import {
 } from "../http.js";
 import { bodyLimits, createRateLimit, endpointRateLimits } from "../limits.js";
 import type { ObjectStorageService } from "../storage.js";
+import { hasForceFullSync, requestForceFullSync } from "../sync-control.js";
 
 type IdParams = {
   userId?: string;
@@ -617,7 +618,12 @@ export async function registerAdminRoutes(
       LEFT JOIN user_settings ON user_settings.user_id = users.id
       ORDER BY users.created_at DESC
     `);
-    return { users: result.rows };
+    return {
+      users: result.rows.map((user) => ({
+        ...user,
+        force_full_sync_pending: hasForceFullSync(user.id),
+      })),
+    };
   });
 
   app.post("/v1/admin/users", async (request, reply) => {
@@ -826,7 +832,10 @@ export async function registerAdminRoutes(
       notFound("user not found");
     }
     return {
-      user: user.rows[0],
+      user: {
+        ...user.rows[0],
+        force_full_sync_pending: hasForceFullSync(userId),
+      },
       assignments: assignments.rows,
       stats: stats.rows[0],
     };
@@ -1219,6 +1228,18 @@ export async function registerAdminRoutes(
     } finally {
       client.release();
     }
+  });
+
+  app.post<{ Params: IdParams }>("/v1/admin/users/:userId/force-full-sync", async (request) => {
+    const userId = requiredUUID(request.params.userId, "userId");
+    await requireUser(pool, userId);
+    requestForceFullSync(userId);
+    return {
+      userId,
+      forceFullSync: {
+        pending: true,
+      },
+    };
   });
 
   app.post<{ Params: IdParams }>("/v1/admin/users/:userId/reset-study-data", async (request) => {

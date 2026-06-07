@@ -4,6 +4,7 @@ import { requireHouseholdSync, selectedUserHeader } from "../auth.js";
 import type { AppConfig } from "../config.js";
 import {
   badRequest,
+  HttpError,
   optionalNumber,
   optionalString,
   optionalUUID,
@@ -11,6 +12,7 @@ import {
   requiredUUID,
 } from "../http.js";
 import { bodyLimits, createRateLimit, endpointRateLimits } from "../limits.js";
+import { consumeForceFullSync } from "../sync-control.js";
 
 type Queryable = Pick<pg.Pool, "query">;
 
@@ -403,6 +405,71 @@ async function allUserRows(pool: Queryable): Promise<UserRow[]> {
     FROM users
     ORDER BY display_name
     `,
+  );
+  return result.rows;
+}
+
+async function assignedMediaRows(
+  pool: Queryable,
+  userId: string,
+  cachedDeckVersionIds: string[] = [],
+): Promise<pg.QueryResult["rows"]> {
+  const result = await pool.query(
+    `
+    SELECT media_objects.id,
+           media_objects.storage_key,
+           media_objects.sha256,
+           media_objects.mime_type,
+           media_objects.byte_size::int AS byte_size,
+           media_objects.width::int AS width,
+           media_objects.height::int AS height,
+           media_objects.updated_at
+    FROM media_objects
+    WHERE media_objects.id IN (
+      SELECT decks.avatar_media_id
+      FROM deck_assignments
+      JOIN decks ON decks.id = deck_assignments.deck_id
+      WHERE deck_assignments.user_id = $1 AND decks.avatar_media_id IS NOT NULL
+      UNION
+      SELECT users.avatar_media_id
+      FROM users
+      WHERE users.avatar_media_id IS NOT NULL
+      UNION
+      SELECT deck_version_cards.image_media_id
+      FROM deck_assignments
+      JOIN decks ON decks.id = deck_assignments.deck_id
+      JOIN deck_version_cards ON deck_version_cards.deck_version_id = decks.current_version_id
+      WHERE deck_assignments.user_id = $1
+        AND NOT (deck_version_cards.deck_version_id = ANY($2::uuid[]))
+        AND deck_version_cards.image_media_id IS NOT NULL
+      UNION
+      SELECT deck_version_cards.audio_word_media_id
+      FROM deck_assignments
+      JOIN decks ON decks.id = deck_assignments.deck_id
+      JOIN deck_version_cards ON deck_version_cards.deck_version_id = decks.current_version_id
+      WHERE deck_assignments.user_id = $1
+        AND NOT (deck_version_cards.deck_version_id = ANY($2::uuid[]))
+        AND deck_version_cards.audio_word_media_id IS NOT NULL
+      UNION
+      SELECT deck_version_examples.image_media_id
+      FROM deck_assignments
+      JOIN decks ON decks.id = deck_assignments.deck_id
+      JOIN deck_version_examples ON deck_version_examples.deck_version_id = decks.current_version_id
+      WHERE deck_assignments.user_id = $1
+        AND NOT (deck_version_examples.deck_version_id = ANY($2::uuid[]))
+        AND deck_version_examples.image_media_id IS NOT NULL
+      UNION
+      SELECT deck_version_examples.audio_example_media_id
+      FROM deck_assignments
+      JOIN decks ON decks.id = deck_assignments.deck_id
+      JOIN deck_version_examples ON deck_version_examples.deck_version_id = decks.current_version_id
+      WHERE deck_assignments.user_id = $1
+        AND NOT (deck_version_examples.deck_version_id = ANY($2::uuid[]))
+        AND deck_version_examples.audio_example_media_id IS NOT NULL
+    )
+    ORDER BY media_objects.storage_key
+    `,
+    [userId, cachedDeckVersionIds],
   );
   return result.rows;
 }
@@ -1160,63 +1227,7 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
         ? [
             await assignedDeckRows(client, userId),
             await assignedContentRows(client, userId, undefined, cachedVersions),
-            await client.query(
-              `
-              SELECT media_objects.id,
-                     media_objects.storage_key,
-                     media_objects.sha256,
-                     media_objects.mime_type,
-                     media_objects.byte_size::int AS byte_size,
-                     media_objects.width::int AS width,
-                     media_objects.height::int AS height,
-                     media_objects.updated_at
-              FROM media_objects
-              WHERE media_objects.id IN (
-                SELECT decks.avatar_media_id
-                FROM deck_assignments
-                JOIN decks ON decks.id = deck_assignments.deck_id
-                WHERE deck_assignments.user_id = $1 AND decks.avatar_media_id IS NOT NULL
-                UNION
-                SELECT users.avatar_media_id
-                FROM users
-                WHERE users.avatar_media_id IS NOT NULL
-                UNION
-                SELECT deck_version_cards.image_media_id
-                FROM deck_assignments
-                JOIN decks ON decks.id = deck_assignments.deck_id
-                JOIN deck_version_cards ON deck_version_cards.deck_version_id = decks.current_version_id
-                WHERE deck_assignments.user_id = $1
-                  AND NOT (deck_version_cards.deck_version_id = ANY($2::uuid[]))
-                  AND deck_version_cards.image_media_id IS NOT NULL
-                UNION
-                SELECT deck_version_cards.audio_word_media_id
-                FROM deck_assignments
-                JOIN decks ON decks.id = deck_assignments.deck_id
-                JOIN deck_version_cards ON deck_version_cards.deck_version_id = decks.current_version_id
-                WHERE deck_assignments.user_id = $1
-                  AND NOT (deck_version_cards.deck_version_id = ANY($2::uuid[]))
-                  AND deck_version_cards.audio_word_media_id IS NOT NULL
-                UNION
-                SELECT deck_version_examples.image_media_id
-                FROM deck_assignments
-                JOIN decks ON decks.id = deck_assignments.deck_id
-                JOIN deck_version_examples ON deck_version_examples.deck_version_id = decks.current_version_id
-                WHERE deck_assignments.user_id = $1
-                  AND NOT (deck_version_examples.deck_version_id = ANY($2::uuid[]))
-                  AND deck_version_examples.image_media_id IS NOT NULL
-                UNION
-                SELECT deck_version_examples.audio_example_media_id
-                FROM deck_assignments
-                JOIN decks ON decks.id = deck_assignments.deck_id
-                JOIN deck_version_examples ON deck_version_examples.deck_version_id = decks.current_version_id
-                WHERE deck_assignments.user_id = $1
-                  AND NOT (deck_version_examples.deck_version_id = ANY($2::uuid[]))
-                  AND deck_version_examples.audio_example_media_id IS NOT NULL
-              )
-              ORDER BY media_objects.storage_key
-              `,
-              [userId, cachedVersions],
-            ),
+            { rows: await assignedMediaRows(client, userId, cachedVersions) },
             await client.query(
               `
                 SELECT user_id,
@@ -1327,12 +1338,18 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
   }, async (request) => {
     requireHouseholdSync(request, config);
     const userId = await selectedSyncUserId(request, pool);
+    if (consumeForceFullSync(userId)) {
+      throw new HttpError(409, "full_sync_required", "Full sync is required for this user");
+    }
     const sinceRevision = parseRevision(request.query.sinceRevision).toString();
     const deviceId = requestDeviceId(request.headers[clientDeviceIdHeader]);
+    const cachedVersions = cachedDeckVersionIds(request);
 
     const [
+      users,
       assignments,
       content,
+      media,
       progress,
       reviews,
       practiceReviews,
@@ -1341,8 +1358,10 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
       studyDataResets,
       userSettings,
     ] = await Promise.all([
+      allUserRows(pool),
       assignedDeckRows(pool, userId, sinceRevision, deviceId),
       assignedContentRows(pool, userId, sinceRevision),
+      assignedMediaRows(pool, userId, cachedVersions),
       pool.query(
         `
         SELECT *
@@ -1416,8 +1435,10 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
       fromRevision: sinceRevision,
       toRevision: await latestRevision(pool),
       changes: {
+        users,
         assignments,
         content,
+        media,
         progress: progress.rows,
         reviews: reviews.rows,
         practiceReviews: practiceReviews.rows,

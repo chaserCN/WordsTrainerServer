@@ -127,6 +127,7 @@ Admin/editor bootstrap endpoints:
 GET  /v1/admin/users
 POST /v1/admin/users
 PUT  /v1/admin/users/:userId
+POST /v1/admin/users/:userId/force-full-sync
 GET  /v1/admin/users/:userId/daily-activity?dayKey=YYYY-MM-DD&timeZone=Europe/Kyiv
 GET  /v1/admin/users/:userId/deck-groups
 POST /v1/admin/users/:userId/deck-groups
@@ -204,6 +205,11 @@ PUT /v1/admin/decks/:deckId
 
 Both endpoints accept partial bodies. Pass `null` for `avatarMediaId` or
 `avatarSystemName` to clear it.
+
+`GET /v1/admin/users` and `GET /v1/admin/users/:userId` include
+`force_full_sync_pending`. It is `true` after
+`POST /v1/admin/users/:userId/force-full-sync` and becomes `false` when that
+user's next `/v1/sync/changes` consumes the one-shot full-sync fallback.
 
 Media upload flow:
 

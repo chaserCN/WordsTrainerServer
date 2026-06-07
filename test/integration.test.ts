@@ -700,6 +700,53 @@ test("mobile bootstrap and sync are usable when server has no assigned content",
   assert.equal(staleSelectedUser.users.length, 1);
 });
 
+test("admin can force exactly one full sync fallback for a user", async (t) => {
+  const ctx = await createTestApp(t);
+  if (!ctx) return;
+
+  const learner = await createUser(ctx, "Forced Bootstrap Learner");
+  const bootstrap = await syncJson(ctx, "GET", "/v1/bootstrap", learner.token, undefined, learner.userId);
+  const beforeRequest = await adminJson(ctx, "GET", `/v1/admin/users/${learner.userId}`);
+  assert.equal(beforeRequest.user.force_full_sync_pending, false);
+
+  const requested = await adminJson(ctx, "POST", `/v1/admin/users/${learner.userId}/force-full-sync`);
+  assert.equal(requested.userId, learner.userId);
+  assert.equal(requested.forceFullSync.pending, true);
+
+  const listedAfterRequest = await adminJson(ctx, "GET", "/v1/admin/users");
+  assert.equal(
+    listedAfterRequest.users.find((user: any) => user.id === learner.userId).force_full_sync_pending,
+    true,
+  );
+  const detailAfterRequest = await adminJson(ctx, "GET", `/v1/admin/users/${learner.userId}`);
+  assert.equal(detailAfterRequest.user.force_full_sync_pending, true);
+
+  const forced = await syncJson(
+    ctx,
+    "GET",
+    `/v1/sync/changes?sinceRevision=${bootstrap.serverRevision}`,
+    learner.token,
+    undefined,
+    learner.userId,
+    409,
+  );
+  assert.equal(forced.error, "full_sync_required");
+
+  const detailAfterForcedDelta = await adminJson(ctx, "GET", `/v1/admin/users/${learner.userId}`);
+  assert.equal(detailAfterForcedDelta.user.force_full_sync_pending, false);
+
+  const nextDelta = await syncJson(
+    ctx,
+    "GET",
+    `/v1/sync/changes?sinceRevision=${bootstrap.serverRevision}`,
+    learner.token,
+    undefined,
+    learner.userId,
+  );
+  assert.equal(nextDelta.users.length, 1);
+  assert.equal(nextDelta.users[0].id, learner.userId);
+});
+
 test("admin can upload local media and mobile can download it by media id", async (t) => {
   const ctx = await createTestApp(t);
   if (!ctx) return;
@@ -1012,6 +1059,11 @@ test("admin/editor can create, edit, publish, and assign usable deck content", a
   assert.equal(updatedDeck.deck.avatar_system_name, "sparkles");
   assert.equal(updatedDeck.deck.avatar_media_id, deckAvatarMediaId);
 
+  const updatedUserAvatarMediaId = await createMedia(ctx, "user-avatar-updated");
+  await adminJson(ctx, "PUT", `/v1/admin/users/${learner.userId}`, {
+    avatarMediaId: updatedUserAvatarMediaId,
+  });
+
   const metadataChanges = await syncJson(
     ctx,
     "GET",
@@ -1024,6 +1076,10 @@ test("admin/editor can create, edit, publish, and assign usable deck content", a
   assert.equal(metadataChanges.assignments[0].title, "Spanish cafe essentials");
   assert.equal(metadataChanges.assignments[0].avatar_system_name, "sparkles");
   assert.equal(metadataChanges.assignments[0].avatar_media_id, deckAvatarMediaId);
+  assert.equal(metadataChanges.users.length, 1);
+  assert.equal(metadataChanges.users[0].id, learner.userId);
+  assert.equal(metadataChanges.users[0].avatar_media_id, updatedUserAvatarMediaId);
+  assert.ok(metadataChanges.media.some((media: any) => media.id === updatedUserAvatarMediaId));
 });
 
 test("admin can edit user and deck metadata with partial updates and clears", async (t) => {
