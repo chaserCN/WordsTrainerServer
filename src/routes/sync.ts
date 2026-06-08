@@ -486,6 +486,7 @@ async function assignedMediaRows(
         AND NOT (deck_version_sentence_questions.deck_version_id = ANY($2::uuid[]))
         AND deck_version_sentence_questions.audio_answer_media_id IS NOT NULL
     )
+    AND media_objects.upload_status = 'ready'
     ORDER BY media_objects.storage_key
     `,
     [userId, cachedDeckVersionIds],
