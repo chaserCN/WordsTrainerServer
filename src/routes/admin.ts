@@ -23,6 +23,7 @@ type IdParams = {
   deckId?: string;
   versionId?: string;
   cardId?: string;
+  senseId?: string;
   exampleId?: string;
   mediaId?: string;
   groupId?: string;
@@ -239,14 +240,17 @@ async function listOrphanMediaObjects(
       AND NOT EXISTS (
         SELECT 1
         FROM deck_version_cards
-        WHERE deck_version_cards.image_media_id = media_objects.id
-           OR deck_version_cards.audio_word_media_id = media_objects.id
+        WHERE deck_version_cards.audio_word_media_id = media_objects.id
       )
       AND NOT EXISTS (
         SELECT 1
-        FROM deck_version_examples
-        WHERE deck_version_examples.image_media_id = media_objects.id
-           OR deck_version_examples.audio_example_media_id = media_objects.id
+        FROM deck_version_card_senses
+        WHERE deck_version_card_senses.image_media_id = media_objects.id
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM deck_version_sentence_questions
+        WHERE deck_version_sentence_questions.audio_answer_media_id = media_objects.id
       )
     ORDER BY created_at, id
     `,
@@ -275,14 +279,17 @@ async function deleteOrphanMediaObjects(
         AND NOT EXISTS (
           SELECT 1
           FROM deck_version_cards
-          WHERE deck_version_cards.image_media_id = media_objects.id
-             OR deck_version_cards.audio_word_media_id = media_objects.id
+          WHERE deck_version_cards.audio_word_media_id = media_objects.id
         )
         AND NOT EXISTS (
           SELECT 1
-          FROM deck_version_examples
-          WHERE deck_version_examples.image_media_id = media_objects.id
-             OR deck_version_examples.audio_example_media_id = media_objects.id
+          FROM deck_version_card_senses
+          WHERE deck_version_card_senses.image_media_id = media_objects.id
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM deck_version_sentence_questions
+          WHERE deck_version_sentence_questions.audio_answer_media_id = media_objects.id
         )
     )
     RETURNING id, storage_key, sha256, mime_type, byte_size, created_at, updated_at
@@ -315,14 +322,17 @@ async function listOrphanMediaObjectsByIds(
       AND NOT EXISTS (
         SELECT 1
         FROM deck_version_cards
-        WHERE deck_version_cards.image_media_id = media_objects.id
-           OR deck_version_cards.audio_word_media_id = media_objects.id
+        WHERE deck_version_cards.audio_word_media_id = media_objects.id
       )
       AND NOT EXISTS (
         SELECT 1
-        FROM deck_version_examples
-        WHERE deck_version_examples.image_media_id = media_objects.id
-           OR deck_version_examples.audio_example_media_id = media_objects.id
+        FROM deck_version_card_senses
+        WHERE deck_version_card_senses.image_media_id = media_objects.id
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM deck_version_sentence_questions
+        WHERE deck_version_sentence_questions.audio_answer_media_id = media_objects.id
       )
     ORDER BY created_at, id
     `,
@@ -353,14 +363,17 @@ async function deleteOrphanMediaObjectsByIds(
       AND NOT EXISTS (
         SELECT 1
         FROM deck_version_cards
-        WHERE deck_version_cards.image_media_id = media_objects.id
-           OR deck_version_cards.audio_word_media_id = media_objects.id
+        WHERE deck_version_cards.audio_word_media_id = media_objects.id
       )
       AND NOT EXISTS (
         SELECT 1
-        FROM deck_version_examples
-        WHERE deck_version_examples.image_media_id = media_objects.id
-           OR deck_version_examples.audio_example_media_id = media_objects.id
+        FROM deck_version_card_senses
+        WHERE deck_version_card_senses.image_media_id = media_objects.id
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM deck_version_sentence_questions
+        WHERE deck_version_sentence_questions.audio_answer_media_id = media_objects.id
       )
     RETURNING id, storage_key, sha256, mime_type, byte_size, created_at, updated_at
     `,
@@ -457,17 +470,99 @@ async function requireCard(client: Queryable, versionId: string, cardId: string)
   }
 }
 
-async function requireExample(client: Queryable, versionId: string, exampleId: string): Promise<void> {
+async function requireSense(client: Queryable, versionId: string, cardId: string, senseId: string): Promise<void> {
   const result = await client.query(
     `
     SELECT 1
-    FROM deck_version_examples
-    WHERE deck_version_id = $1 AND example_id = $2
+    FROM deck_version_card_senses
+    WHERE deck_version_id = $1 AND card_id = $2 AND sense_id = $3
     `,
-    [versionId, exampleId],
+    [versionId, cardId, senseId],
   );
   if (!result.rowCount) {
-    notFound("example not found");
+    notFound("sense not found");
+  }
+}
+
+async function requireSentenceQuestion(client: Queryable, versionId: string, senseId: string): Promise<void> {
+  const result = await client.query(
+    `
+    SELECT 1
+    FROM deck_version_sentence_questions
+    WHERE deck_version_id = $1 AND sense_id = $2
+    `,
+    [versionId, senseId],
+  );
+  if (!result.rowCount) {
+    notFound("sentence question not found");
+  }
+}
+
+async function requirePublishableDeckVersion(client: Queryable, versionId: string): Promise<void> {
+  const result = await client.query<{ message: string }>(
+    `
+    WITH active_cards AS (
+      SELECT card_id, primary_sense_id
+      FROM deck_version_cards
+      WHERE deck_version_id = $1 AND status = 'active'
+    ),
+    active_senses AS (
+      SELECT sense_id, card_id
+      FROM deck_version_card_senses
+      WHERE deck_version_id = $1 AND status = 'active'
+    ),
+    violations AS (
+      SELECT 'deck version must contain at least one active card' AS message
+      WHERE NOT EXISTS (SELECT 1 FROM active_cards)
+      UNION ALL
+      SELECT format('card %s must have primarySenseId', active_cards.card_id) AS message
+      FROM active_cards
+      WHERE active_cards.primary_sense_id IS NULL
+      UNION ALL
+      SELECT format('card %s primarySenseId %s must reference an active sense on the card', active_cards.card_id, active_cards.primary_sense_id) AS message
+      FROM active_cards
+      WHERE active_cards.primary_sense_id IS NOT NULL
+        AND NOT EXISTS (
+          SELECT 1
+          FROM active_senses
+          WHERE active_senses.card_id = active_cards.card_id
+            AND active_senses.sense_id = active_cards.primary_sense_id
+        )
+      UNION ALL
+      SELECT format('card %s must have at least one active sense', active_cards.card_id) AS message
+      FROM active_cards
+      WHERE NOT EXISTS (
+        SELECT 1
+        FROM active_senses
+        WHERE active_senses.card_id = active_cards.card_id
+      )
+      UNION ALL
+      SELECT format('sense %s must have example', active_senses.sense_id) AS message
+      FROM active_senses
+      WHERE NOT EXISTS (
+        SELECT 1
+        FROM deck_version_sense_examples
+        WHERE deck_version_sense_examples.deck_version_id = $1
+          AND deck_version_sense_examples.sense_id = active_senses.sense_id
+      )
+      UNION ALL
+      SELECT format('sense %s must have sentenceQuestion', active_senses.sense_id) AS message
+      FROM active_senses
+      WHERE NOT EXISTS (
+        SELECT 1
+        FROM deck_version_sentence_questions
+        WHERE deck_version_sentence_questions.deck_version_id = $1
+          AND deck_version_sentence_questions.sense_id = active_senses.sense_id
+      )
+    )
+    SELECT message
+    FROM violations
+    LIMIT 5
+    `,
+    [versionId],
+  );
+  if (result.rowCount) {
+    badRequest(`deck version is not publishable: ${result.rows.map((row) => row.message).join("; ")}`);
   }
 }
 
@@ -819,7 +914,7 @@ export async function registerAdminRoutes(
         SELECT
           (SELECT COUNT(*) FROM deck_assignments WHERE user_id = $1) AS assignment_count,
           (SELECT COUNT(*) FROM deck_assignments WHERE user_id = $1 AND status = 'active') AS active_assignment_count,
-          (SELECT COUNT(*) FROM card_progress WHERE user_id = $1) AS progress_count,
+          (SELECT COUNT(*) FROM sense_progress WHERE user_id = $1) AS progress_count,
           (SELECT COUNT(*) FROM study_reviews WHERE user_id = $1) AS review_count,
           (SELECT COUNT(*) FROM practice_reviews WHERE user_id = $1) AS practice_review_count,
           (SELECT COUNT(*) FROM deck_matching_records WHERE user_id = $1) AS matching_record_count,
@@ -1261,7 +1356,7 @@ export async function registerAdminRoutes(
         SELECT
           (SELECT COUNT(*) FROM study_reviews WHERE user_id = $1 AND ($2::uuid IS NULL OR deck_id = $2)) AS review_count,
           (SELECT COUNT(*) FROM practice_reviews WHERE user_id = $1 AND ($2::uuid IS NULL OR deck_id = $2)) AS practice_review_count,
-          (SELECT COUNT(*) FROM card_progress WHERE user_id = $1 AND ($2::uuid IS NULL OR deck_id = $2)) AS progress_count,
+          (SELECT COUNT(*) FROM sense_progress WHERE user_id = $1 AND ($2::uuid IS NULL OR deck_id = $2)) AS progress_count,
           (SELECT COUNT(*) FROM deck_matching_records WHERE user_id = $1 AND ($2::uuid IS NULL OR deck_id = $2)) AS matching_record_count,
           (SELECT COUNT(*) FROM matching_attempts WHERE user_id = $1 AND ($2::uuid IS NULL OR deck_id = $2)) AS matching_attempt_count
         `,
@@ -1277,7 +1372,7 @@ export async function registerAdminRoutes(
           params,
         );
         await client.query(
-          "DELETE FROM card_progress WHERE user_id = $1 AND ($2::uuid IS NULL OR deck_id = $2)",
+          "DELETE FROM sense_progress WHERE user_id = $1 AND ($2::uuid IS NULL OR deck_id = $2)",
           params,
         );
         await client.query(
@@ -1783,10 +1878,10 @@ export async function registerAdminRoutes(
              deck_versions.created_at,
              deck_versions.published_at,
              COUNT(DISTINCT deck_version_cards.card_id)::int AS card_count,
-             COUNT(DISTINCT deck_version_examples.example_id)::int AS example_count
+             COUNT(DISTINCT deck_version_sense_examples.sense_id)::int AS example_count
       FROM deck_versions
       LEFT JOIN deck_version_cards ON deck_version_cards.deck_version_id = deck_versions.id
-      LEFT JOIN deck_version_examples ON deck_version_examples.deck_version_id = deck_versions.id
+      LEFT JOIN deck_version_sense_examples ON deck_version_sense_examples.deck_version_id = deck_versions.id
       WHERE deck_versions.deck_id = $1
       GROUP BY deck_versions.id
       ORDER BY deck_versions.version_number DESC
@@ -1858,13 +1953,11 @@ export async function registerAdminRoutes(
           `
           SELECT DISTINCT media_id AS id
           FROM (
-            SELECT image_media_id AS media_id FROM deck_version_cards WHERE deck_version_id = ANY($1::uuid[])
-            UNION
             SELECT audio_word_media_id AS media_id FROM deck_version_cards WHERE deck_version_id = ANY($1::uuid[])
             UNION
-            SELECT image_media_id AS media_id FROM deck_version_examples WHERE deck_version_id = ANY($1::uuid[])
+            SELECT image_media_id AS media_id FROM deck_version_card_senses WHERE deck_version_id = ANY($1::uuid[])
             UNION
-            SELECT audio_example_media_id AS media_id FROM deck_version_examples WHERE deck_version_id = ANY($1::uuid[])
+            SELECT audio_answer_media_id AS media_id FROM deck_version_sentence_questions WHERE deck_version_id = ANY($1::uuid[])
           ) version_media
           WHERE media_id IS NOT NULL
           `,
@@ -2014,17 +2107,23 @@ export async function registerAdminRoutes(
       notFound("deck version not found");
     }
 
-    const [cards, examples, forms, distractors, mediaObjects] = await Promise.all([
+    const [cards, senses, examples, sentenceQuestions, forms, distractors, mediaObjects] = await Promise.all([
       pool.query("SELECT * FROM deck_version_cards WHERE deck_version_id = $1 ORDER BY sort_order, display_word", [
         versionId,
       ]),
-      pool.query("SELECT * FROM deck_version_examples WHERE deck_version_id = $1 ORDER BY card_id, sort_order", [
+      pool.query("SELECT * FROM deck_version_card_senses WHERE deck_version_id = $1 ORDER BY card_id, sort_order", [
+        versionId,
+      ]),
+      pool.query("SELECT * FROM deck_version_sense_examples WHERE deck_version_id = $1 ORDER BY card_id, sort_order", [
+        versionId,
+      ]),
+      pool.query("SELECT * FROM deck_version_sentence_questions WHERE deck_version_id = $1 ORDER BY card_id, sort_order", [
         versionId,
       ]),
       pool.query("SELECT * FROM deck_version_word_forms WHERE deck_version_id = $1 ORDER BY card_id, sort_order", [
         versionId,
       ]),
-      pool.query("SELECT * FROM deck_version_distractors WHERE deck_version_id = $1 ORDER BY example_id, priority", [
+      pool.query("SELECT * FROM deck_version_question_distractors WHERE deck_version_id = $1 ORDER BY sense_id, priority", [
         versionId,
       ]),
       pool.query(
@@ -2041,13 +2140,11 @@ export async function registerAdminRoutes(
                media_objects.updated_at
         FROM media_objects
         WHERE media_objects.id IN (
-          SELECT image_media_id FROM deck_version_cards WHERE deck_version_id = $1 AND image_media_id IS NOT NULL
-          UNION
           SELECT audio_word_media_id FROM deck_version_cards WHERE deck_version_id = $1 AND audio_word_media_id IS NOT NULL
           UNION
-          SELECT image_media_id FROM deck_version_examples WHERE deck_version_id = $1 AND image_media_id IS NOT NULL
+          SELECT image_media_id FROM deck_version_card_senses WHERE deck_version_id = $1 AND image_media_id IS NOT NULL
           UNION
-          SELECT audio_example_media_id FROM deck_version_examples WHERE deck_version_id = $1 AND audio_example_media_id IS NOT NULL
+          SELECT audio_answer_media_id FROM deck_version_sentence_questions WHERE deck_version_id = $1 AND audio_answer_media_id IS NOT NULL
           UNION
           SELECT avatar_media_id FROM decks WHERE id = $2 AND avatar_media_id IS NOT NULL
         )
@@ -2060,7 +2157,9 @@ export async function registerAdminRoutes(
     return {
       version: version.rows[0],
       cards: cards.rows,
+      senses: senses.rows,
       examples: examples.rows,
+      sentenceQuestions: sentenceQuestions.rows,
       forms: forms.rows,
       distractors: distractors.rows,
       mediaObjects: mediaObjects.rows,
@@ -2078,15 +2177,9 @@ export async function registerAdminRoutes(
       const lemma = requiredString(data.lemma, "lemma");
       const displayWord = requiredString(data.displayWord, "displayWord");
       const partOfSpeech = optionalString(data.partOfSpeech, "partOfSpeech");
-      const translation = requiredString(data.translation, "translation");
-      const shortDefinition = optionalString(data.shortDefinition, "shortDefinition");
-      const memoryHint = optionalString(data.memoryHint, "memoryHint");
       const etymology = optionalString(data.etymology, "etymology");
-      const usageNote = optionalString(data.usageNote, "usageNote");
-      const synonymNote = optionalString(data.synonymNote, "synonymNote");
-      const grammarNote = optionalString(data.grammarNote, "grammarNote");
       const notes = optionalString(data.notes, "notes");
-      const imageMediaId = optionalUUID(data.imageMediaId, "imageMediaId");
+      const primarySenseId = optionalUUID(data.primarySenseId, "primarySenseId");
       const audioWordMediaId = optionalUUID(data.audioWordMediaId, "audioWordMediaId");
       const sortOrder = optionalInteger(data.sortOrder, "sortOrder", 0);
 
@@ -2100,33 +2193,21 @@ export async function registerAdminRoutes(
           lemma,
           display_word,
           part_of_speech,
-          translation,
-          short_definition,
-          memory_hint,
           etymology,
-          usage_note,
-          synonym_note,
-          grammar_note,
           notes,
-          image_media_id,
+          primary_sense_id,
           audio_word_media_id,
           sort_order
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
         ON CONFLICT (deck_version_id, card_id) DO UPDATE SET
           status = excluded.status,
           lemma = excluded.lemma,
           display_word = excluded.display_word,
           part_of_speech = excluded.part_of_speech,
-          translation = excluded.translation,
-          short_definition = excluded.short_definition,
-          memory_hint = excluded.memory_hint,
           etymology = excluded.etymology,
-          usage_note = excluded.usage_note,
-          synonym_note = excluded.synonym_note,
-          grammar_note = excluded.grammar_note,
           notes = excluded.notes,
-          image_media_id = excluded.image_media_id,
+          primary_sense_id = excluded.primary_sense_id,
           audio_word_media_id = excluded.audio_word_media_id,
           sort_order = excluded.sort_order
         RETURNING *
@@ -2138,20 +2219,61 @@ export async function registerAdminRoutes(
           lemma,
           displayWord,
           partOfSpeech,
-          translation,
-          shortDefinition,
-          memoryHint,
           etymology,
-          usageNote,
-          synonymNote,
-          grammarNote,
           notes,
-          imageMediaId,
+          primarySenseId,
           audioWordMediaId,
           sortOrder,
         ],
       );
       return { card: result.rows[0] };
+    },
+  );
+
+  app.put<{ Params: IdParams }>(
+    "/v1/admin/decks/:deckId/versions/:versionId/cards/:cardId/senses/:senseId",
+    async (request) => {
+      const deckId = requiredUUID(request.params.deckId, "deckId");
+      const versionId = requiredUUID(request.params.versionId, "versionId");
+      const cardId = requiredUUID(request.params.cardId, "cardId");
+      const senseId = requiredUUID(request.params.senseId, "senseId");
+      const data = body(request.body);
+      const status = contentStatus(data.status, "status");
+      const displayPattern = optionalString(data.displayPattern, "displayPattern");
+      const translation = requiredString(data.translation, "translation");
+      const note = optionalString(data.note, "note");
+      const imageMediaId = optionalUUID(data.imageMediaId, "imageMediaId");
+      const sortOrder = optionalInteger(data.sortOrder, "sortOrder", 0);
+
+      await requireDraftVersion(pool, deckId, versionId);
+      await requireCard(pool, versionId, cardId);
+      const result = await pool.query(
+        `
+        INSERT INTO deck_version_card_senses (
+          deck_version_id,
+          sense_id,
+          card_id,
+          status,
+          display_pattern,
+          translation,
+          note,
+          image_media_id,
+          sort_order
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        ON CONFLICT (deck_version_id, sense_id) DO UPDATE SET
+          card_id = excluded.card_id,
+          status = excluded.status,
+          display_pattern = excluded.display_pattern,
+          translation = excluded.translation,
+          note = excluded.note,
+          image_media_id = excluded.image_media_id,
+          sort_order = excluded.sort_order
+        RETURNING *
+        `,
+        [versionId, senseId, cardId, status, displayPattern, translation, note, imageMediaId, sortOrder],
+      );
+      return { sense: result.rows[0] };
     },
   );
 
@@ -2179,92 +2301,91 @@ export async function registerAdminRoutes(
   );
 
   app.put<{ Params: IdParams }>(
-    "/v1/admin/decks/:deckId/versions/:versionId/cards/:cardId/examples/:exampleId",
+    "/v1/admin/decks/:deckId/versions/:versionId/cards/:cardId/senses/:senseId/example",
     async (request) => {
       const deckId = requiredUUID(request.params.deckId, "deckId");
       const versionId = requiredUUID(request.params.versionId, "versionId");
       const cardId = requiredUUID(request.params.cardId, "cardId");
-      const exampleId = requiredUUID(request.params.exampleId, "exampleId");
+      const senseId = requiredUUID(request.params.senseId, "senseId");
       const data = body(request.body);
-      const template = requiredString(data.template, "template");
-      const answer = requiredString(data.answer, "answer");
-      const answerFormKey = optionalString(data.answerFormKey, "answerFormKey");
+      const text = requiredString(data.text, "text");
       const translation = optionalString(data.translation, "translation");
       const note = optionalString(data.note, "note");
-      const imageMediaId = optionalUUID(data.imageMediaId, "imageMediaId");
-      const audioExampleMediaId = optionalUUID(data.audioExampleMediaId, "audioExampleMediaId");
       const sortOrder = optionalInteger(data.sortOrder, "sortOrder", 0);
 
-      requireSingleBlank(template);
       await requireDraftVersion(pool, deckId, versionId);
       await requireCard(pool, versionId, cardId);
+      await requireSense(pool, versionId, cardId, senseId);
 
       const result = await pool.query(
         `
-        INSERT INTO deck_version_examples (
+        INSERT INTO deck_version_sense_examples (
           deck_version_id,
-          example_id,
           card_id,
-          template,
-          answer,
-          answer_form_key,
+          sense_id,
+          text,
           translation,
           note,
-          image_media_id,
-          audio_example_media_id,
           sort_order
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-        ON CONFLICT (deck_version_id, example_id) DO UPDATE SET
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        ON CONFLICT (deck_version_id, sense_id) DO UPDATE SET
           card_id = excluded.card_id,
-          template = excluded.template,
-          answer = excluded.answer,
-          answer_form_key = excluded.answer_form_key,
+          text = excluded.text,
           translation = excluded.translation,
           note = excluded.note,
-          image_media_id = excluded.image_media_id,
-          audio_example_media_id = excluded.audio_example_media_id,
           sort_order = excluded.sort_order
         RETURNING *
         `,
-        [
-          versionId,
-          exampleId,
-          cardId,
-          template,
-          answer,
-          answerFormKey,
-          translation,
-          note,
-          imageMediaId,
-          audioExampleMediaId,
-          sortOrder,
-        ],
+        [versionId, cardId, senseId, text, translation, note, sortOrder],
       );
       return { example: result.rows[0] };
     },
   );
 
-  app.delete<{ Params: IdParams }>(
-    "/v1/admin/decks/:deckId/versions/:versionId/examples/:exampleId",
+  app.put<{ Params: IdParams }>(
+    "/v1/admin/decks/:deckId/versions/:versionId/cards/:cardId/senses/:senseId/sentence-question",
     async (request) => {
       const deckId = requiredUUID(request.params.deckId, "deckId");
       const versionId = requiredUUID(request.params.versionId, "versionId");
-      const exampleId = requiredUUID(request.params.exampleId, "exampleId");
+      const cardId = requiredUUID(request.params.cardId, "cardId");
+      const senseId = requiredUUID(request.params.senseId, "senseId");
+      const data = body(request.body);
+      const template = requiredString(data.template, "template");
+      const answer = requiredString(data.answer, "answer");
+      const answerFormKey = optionalString(data.answerFormKey, "answerFormKey");
+      const audioAnswerMediaId = optionalUUID(data.audioAnswerMediaId, "audioAnswerMediaId");
+      const sortOrder = optionalInteger(data.sortOrder, "sortOrder", 0);
 
+      requireSingleBlank(template);
       await requireDraftVersion(pool, deckId, versionId);
+      await requireCard(pool, versionId, cardId);
+      await requireSense(pool, versionId, cardId, senseId);
       const result = await pool.query(
         `
-        DELETE FROM deck_version_examples
-        WHERE deck_version_id = $1 AND example_id = $2
-        RETURNING example_id
+        INSERT INTO deck_version_sentence_questions (
+          deck_version_id,
+          card_id,
+          sense_id,
+          template,
+          answer,
+          answer_form_key,
+          audio_answer_media_id,
+          sort_order
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        ON CONFLICT (deck_version_id, sense_id) DO UPDATE SET
+          card_id = excluded.card_id,
+          template = excluded.template,
+          answer = excluded.answer,
+          answer_form_key = excluded.answer_form_key,
+          audio_answer_media_id = excluded.audio_answer_media_id,
+          sort_order = excluded.sort_order
+        RETURNING *
         `,
-        [versionId, exampleId],
+        [versionId, cardId, senseId, template, answer, answerFormKey, audioAnswerMediaId, sortOrder],
       );
-      if (!result.rowCount) {
-        notFound("example not found");
-      }
-      return { deletedExampleId: result.rows[0].example_id };
+      return { sentenceQuestion: result.rows[0] };
     },
   );
 
@@ -2320,11 +2441,12 @@ export async function registerAdminRoutes(
   );
 
   app.put<{ Params: IdParams }>(
-    "/v1/admin/decks/:deckId/versions/:versionId/examples/:exampleId/distractors",
+    "/v1/admin/decks/:deckId/versions/:versionId/cards/:cardId/senses/:senseId/distractors",
     async (request) => {
       const deckId = requiredUUID(request.params.deckId, "deckId");
       const versionId = requiredUUID(request.params.versionId, "versionId");
-      const exampleId = requiredUUID(request.params.exampleId, "exampleId");
+      const cardId = requiredUUID(request.params.cardId, "cardId");
+      const senseId = requiredUUID(request.params.senseId, "senseId");
       const data = body(request.body);
       const distractors = requiredArray(data.distractors, "distractors").map((distractor) => ({
         id: optionalUUID(distractor.id, "distractors.id") ?? randomUUID(),
@@ -2337,18 +2459,20 @@ export async function registerAdminRoutes(
       try {
         await client.query("BEGIN");
         await requireDraftVersion(client, deckId, versionId);
-        await requireExample(client, versionId, exampleId);
+        await requireCard(client, versionId, cardId);
+        await requireSense(client, versionId, cardId, senseId);
+        await requireSentenceQuestion(client, versionId, senseId);
         await client.query(
-          "DELETE FROM deck_version_distractors WHERE deck_version_id = $1 AND example_id = $2",
-          [versionId, exampleId],
+          "DELETE FROM deck_version_question_distractors WHERE deck_version_id = $1 AND sense_id = $2",
+          [versionId, senseId],
         );
         for (const distractor of distractors) {
           await client.query(
             `
-            INSERT INTO deck_version_distractors (
+            INSERT INTO deck_version_question_distractors (
               id,
               deck_version_id,
-              example_id,
+              sense_id,
               text,
               source_card_id,
               priority
@@ -2358,7 +2482,7 @@ export async function registerAdminRoutes(
             [
               distractor.id,
               versionId,
-              exampleId,
+              senseId,
               distractor.text,
               distractor.sourceCardId,
               distractor.priority,
@@ -2368,11 +2492,11 @@ export async function registerAdminRoutes(
         const result = await client.query(
           `
           SELECT *
-          FROM deck_version_distractors
-          WHERE deck_version_id = $1 AND example_id = $2
+          FROM deck_version_question_distractors
+          WHERE deck_version_id = $1 AND sense_id = $2
           ORDER BY priority, text
           `,
-          [versionId, exampleId],
+          [versionId, senseId],
         );
         await client.query("COMMIT");
         return { distractors: result.rows };
@@ -2394,6 +2518,7 @@ export async function registerAdminRoutes(
     try {
       await client.query("BEGIN");
       await requireDraftVersion(client, deckId, versionId);
+      await requirePublishableDeckVersion(client, versionId);
       const version = await client.query(
         `
         UPDATE deck_versions

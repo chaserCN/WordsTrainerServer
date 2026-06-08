@@ -48,6 +48,7 @@ type ReviewEventInput = {
   deckId: string;
   deckVersionId: string | null;
   cardId: string;
+  senseId: string;
   mode: string;
   outcome: string;
   source: string;
@@ -63,6 +64,7 @@ type PracticeReviewInput = {
   deckId: string;
   deckVersionId: string | null;
   cardId: string;
+  senseId: string;
   mode: string;
   outcome: string;
   source: string;
@@ -71,6 +73,7 @@ type PracticeReviewInput = {
 };
 
 type ProgressInput = {
+  senseId: string;
   cardId: string;
   deckId: string;
   fsrsData: unknown;
@@ -113,7 +116,7 @@ type SyncTargetValidation = {
   deckPreferences: DeckPreferenceInput[];
   rejectedReviewIds: string[];
   rejectedPracticeReviewIds: string[];
-  rejectedProgressCardIds: string[];
+  rejectedProgressSenseIds: string[];
   rejectedMatchingRecordDeckIds: string[];
   rejectedMatchingAttemptIds: string[];
   rejectedDeckPreferenceDeckIds: string[];
@@ -276,7 +279,9 @@ async function assignedContentRows(
   cachedDeckVersionIds: string[] = [],
 ): Promise<{
   cards: pg.QueryResult["rows"];
+  senses: pg.QueryResult["rows"];
   examples: pg.QueryResult["rows"];
+  sentenceQuestions: pg.QueryResult["rows"];
   forms: pg.QueryResult["rows"];
   distractors: pg.QueryResult["rows"];
 }> {
@@ -303,7 +308,7 @@ async function assignedContentRows(
         ${contentFilters}
     )
   `;
-  const [cards, examples, forms, distractors] = await Promise.all([
+  const [cards, senses, examples, sentenceQuestions, forms, distractors] = await Promise.all([
     pool.query(
       `
       ${assignedVersions}
@@ -317,10 +322,30 @@ async function assignedContentRows(
     pool.query(
       `
       ${assignedVersions}
-      SELECT deck_version_examples.*
+      SELECT deck_version_card_senses.*
       FROM assigned_versions
-      JOIN deck_version_examples ON deck_version_examples.deck_version_id = assigned_versions.id
-      ORDER BY deck_version_examples.card_id, deck_version_examples.sort_order
+      JOIN deck_version_card_senses ON deck_version_card_senses.deck_version_id = assigned_versions.id
+      ORDER BY deck_version_card_senses.card_id, deck_version_card_senses.sort_order
+      `,
+      params,
+    ),
+    pool.query(
+      `
+      ${assignedVersions}
+      SELECT deck_version_sense_examples.*
+      FROM assigned_versions
+      JOIN deck_version_sense_examples ON deck_version_sense_examples.deck_version_id = assigned_versions.id
+      ORDER BY deck_version_sense_examples.card_id, deck_version_sense_examples.sort_order
+      `,
+      params,
+    ),
+    pool.query(
+      `
+      ${assignedVersions}
+      SELECT deck_version_sentence_questions.*
+      FROM assigned_versions
+      JOIN deck_version_sentence_questions ON deck_version_sentence_questions.deck_version_id = assigned_versions.id
+      ORDER BY deck_version_sentence_questions.card_id, deck_version_sentence_questions.sort_order
       `,
       params,
     ),
@@ -337,17 +362,19 @@ async function assignedContentRows(
     pool.query(
       `
       ${assignedVersions}
-      SELECT deck_version_distractors.*
+      SELECT deck_version_question_distractors.*
       FROM assigned_versions
-      JOIN deck_version_distractors ON deck_version_distractors.deck_version_id = assigned_versions.id
-      ORDER BY deck_version_distractors.example_id, deck_version_distractors.priority
+      JOIN deck_version_question_distractors ON deck_version_question_distractors.deck_version_id = assigned_versions.id
+      ORDER BY deck_version_question_distractors.sense_id, deck_version_question_distractors.priority
       `,
       params,
     ),
   ]);
   return {
     cards: cards.rows,
+    senses: senses.rows,
     examples: examples.rows,
+    sentenceQuestions: sentenceQuestions.rows,
     forms: forms.rows,
     distractors: distractors.rows,
   };
@@ -386,7 +413,7 @@ async function latestRevision(pool: Queryable): Promise<string> {
       COALESCE((SELECT MAX(server_revision) FROM user_deck_groups), 0),
       COALESCE((SELECT MAX(server_revision) FROM user_deck_preferences), 0),
       COALESCE((SELECT MAX(server_revision) FROM user_settings), 0),
-      COALESCE((SELECT MAX(server_revision) FROM card_progress), 0),
+      COALESCE((SELECT MAX(server_revision) FROM sense_progress), 0),
       COALESCE((SELECT MAX(server_revision) FROM study_reviews), 0),
       COALESCE((SELECT MAX(server_revision) FROM practice_reviews), 0),
       COALESCE((SELECT MAX(server_revision) FROM deck_matching_records), 0),
@@ -435,13 +462,13 @@ async function assignedMediaRows(
       FROM users
       WHERE users.avatar_media_id IS NOT NULL
       UNION
-      SELECT deck_version_cards.image_media_id
+      SELECT deck_version_card_senses.image_media_id
       FROM deck_assignments
       JOIN decks ON decks.id = deck_assignments.deck_id
-      JOIN deck_version_cards ON deck_version_cards.deck_version_id = decks.current_version_id
+      JOIN deck_version_card_senses ON deck_version_card_senses.deck_version_id = decks.current_version_id
       WHERE deck_assignments.user_id = $1
-        AND NOT (deck_version_cards.deck_version_id = ANY($2::uuid[]))
-        AND deck_version_cards.image_media_id IS NOT NULL
+        AND NOT (deck_version_card_senses.deck_version_id = ANY($2::uuid[]))
+        AND deck_version_card_senses.image_media_id IS NOT NULL
       UNION
       SELECT deck_version_cards.audio_word_media_id
       FROM deck_assignments
@@ -451,21 +478,13 @@ async function assignedMediaRows(
         AND NOT (deck_version_cards.deck_version_id = ANY($2::uuid[]))
         AND deck_version_cards.audio_word_media_id IS NOT NULL
       UNION
-      SELECT deck_version_examples.image_media_id
+      SELECT deck_version_sentence_questions.audio_answer_media_id
       FROM deck_assignments
       JOIN decks ON decks.id = deck_assignments.deck_id
-      JOIN deck_version_examples ON deck_version_examples.deck_version_id = decks.current_version_id
+      JOIN deck_version_sentence_questions ON deck_version_sentence_questions.deck_version_id = decks.current_version_id
       WHERE deck_assignments.user_id = $1
-        AND NOT (deck_version_examples.deck_version_id = ANY($2::uuid[]))
-        AND deck_version_examples.image_media_id IS NOT NULL
-      UNION
-      SELECT deck_version_examples.audio_example_media_id
-      FROM deck_assignments
-      JOIN decks ON decks.id = deck_assignments.deck_id
-      JOIN deck_version_examples ON deck_version_examples.deck_version_id = decks.current_version_id
-      WHERE deck_assignments.user_id = $1
-        AND NOT (deck_version_examples.deck_version_id = ANY($2::uuid[]))
-        AND deck_version_examples.audio_example_media_id IS NOT NULL
+        AND NOT (deck_version_sentence_questions.deck_version_id = ANY($2::uuid[]))
+        AND deck_version_sentence_questions.audio_answer_media_id IS NOT NULL
     )
     ORDER BY media_objects.storage_key
     `,
@@ -507,7 +526,9 @@ async function userSettingsRows(
 function emptyContent() {
   return {
     cards: [],
+    senses: [],
     examples: [],
+    sentenceQuestions: [],
     forms: [],
     distractors: [],
   };
@@ -552,6 +573,7 @@ function parseReviews(value: unknown): ReviewEventInput[] {
       deckId: requiredUUID(review.deckId, `reviews[${index}].deckId`),
       deckVersionId: optionalUUID(review.deckVersionId, `reviews[${index}].deckVersionId`),
       cardId: requiredUUID(review.cardId, `reviews[${index}].cardId`),
+      senseId: requiredUUID(review.senseId, `reviews[${index}].senseId`),
       mode: studyMode(review.mode, `reviews[${index}].mode`),
       outcome: reviewOutcome(review.outcome, `reviews[${index}].outcome`),
       source: reviewSource(review.source, `reviews[${index}].source`),
@@ -581,6 +603,7 @@ function parsePracticeReviews(value: unknown): PracticeReviewInput[] {
       deckId: requiredUUID(review.deckId, `practiceReviews[${index}].deckId`),
       deckVersionId: optionalUUID(review.deckVersionId, `practiceReviews[${index}].deckVersionId`),
       cardId: requiredUUID(review.cardId, `practiceReviews[${index}].cardId`),
+      senseId: requiredUUID(review.senseId, `practiceReviews[${index}].senseId`),
       mode: practiceReviewMode(review.mode, `practiceReviews[${index}].mode`),
       outcome: reviewOutcome(review.outcome, `practiceReviews[${index}].outcome`),
       source: reviewSource(review.source, `practiceReviews[${index}].source`),
@@ -607,6 +630,7 @@ function parseProgress(value: unknown): ProgressInput[] {
       badRequest(`progress[${index}].fsrsData must be an object`);
     }
     return {
+      senseId: requiredUUID(progress.senseId, `progress[${index}].senseId`),
       cardId: requiredUUID(progress.cardId, `progress[${index}].cardId`),
       deckId: requiredUUID(progress.deckId, `progress[${index}].deckId`),
       fsrsData,
@@ -704,10 +728,12 @@ type ReviewTarget = {
   deckId: string;
   deckVersionId: string | null;
   cardId: string;
+  senseId: string;
 };
 
 type ProgressTarget = {
   deckId: string;
+  senseId: string;
   cardId: string;
 };
 
@@ -727,11 +753,11 @@ function nullableKey(value: string | null): string {
 }
 
 function reviewTargetKey(target: ReviewTarget): string {
-  return `${target.deckId}:${nullableKey(target.deckVersionId)}:${target.cardId}`;
+  return `${target.deckId}:${nullableKey(target.deckVersionId)}:${target.cardId}:${target.senseId}`;
 }
 
 function progressTargetKey(target: ProgressTarget): string {
-  return `${target.deckId}:${target.cardId}`;
+  return `${target.deckId}:${target.cardId}:${target.senseId}`;
 }
 
 function matchingTargetKey(target: MatchingTarget): string {
@@ -746,18 +772,22 @@ function uniqueByKey<T>(items: T[], key: (item: T) => string): T[] {
   return [...new Map(items.map((item) => [key(item), item])).values()];
 }
 
-function reviewTargetRows(targets: ReviewTarget[]): Array<{ deck_id: string; deck_version_id: string | null; card_id: string }> {
+function reviewTargetRows(
+  targets: ReviewTarget[],
+): Array<{ deck_id: string; deck_version_id: string | null; card_id: string; sense_id: string }> {
   return targets.map((target) => ({
     deck_id: target.deckId,
     deck_version_id: target.deckVersionId,
     card_id: target.cardId,
+    sense_id: target.senseId,
   }));
 }
 
-function progressTargetRows(targets: ProgressTarget[]): Array<{ deck_id: string; card_id: string }> {
+function progressTargetRows(targets: ProgressTarget[]): Array<{ deck_id: string; card_id: string; sense_id: string }> {
   return targets.map((target) => ({
     deck_id: target.deckId,
     card_id: target.cardId,
+    sense_id: target.senseId,
   }));
 }
 
@@ -810,7 +840,7 @@ async function validateSyncTargets(
   const acceptedDeckPreferences: DeckPreferenceInput[] = [];
   const rejectedReviewIds: string[] = [];
   const rejectedPracticeReviewIds: string[] = [];
-  const rejectedProgressCardIds: string[] = [];
+  const rejectedProgressSenseIds: string[] = [];
   const rejectedMatchingRecordDeckIds: string[] = [];
   const rejectedMatchingAttemptIds: string[] = [];
   const rejectedDeckPreferenceDeckIds: string[] = [];
@@ -836,7 +866,7 @@ async function validateSyncTargets(
     if (allowedProgressTargets.has(key)) {
       acceptedProgressItems.push(progress);
     } else {
-      rejectedProgressCardIds.push(progress.cardId);
+      rejectedProgressSenseIds.push(progress.senseId);
     }
   }
   for (const record of matchingRecords) {
@@ -872,7 +902,7 @@ async function validateSyncTargets(
     deckPreferences: acceptedDeckPreferences,
     rejectedReviewIds,
     rejectedPracticeReviewIds,
-    rejectedProgressCardIds,
+    rejectedProgressSenseIds,
     rejectedMatchingRecordDeckIds,
     rejectedMatchingAttemptIds,
     rejectedDeckPreferenceDeckIds,
@@ -889,6 +919,7 @@ async function allowedReviewTargetKeys(
       deckId: review.deckId,
       deckVersionId: review.deckVersionId,
       cardId: review.cardId,
+      senseId: review.senseId,
     })),
     reviewTargetKey,
   );
@@ -900,19 +931,22 @@ async function allowedReviewTargetKeys(
     deck_id: string;
     deck_version_id: string | null;
     card_id: string;
+    sense_id: string;
   }>(
     `
     WITH input_targets AS (
       SELECT DISTINCT
         deck_id::uuid AS deck_id,
         deck_version_id::uuid AS deck_version_id,
-        card_id::uuid AS card_id
+        card_id::uuid AS card_id,
+        sense_id::uuid AS sense_id
       FROM jsonb_to_recordset($2::jsonb)
-        AS target(deck_id text, deck_version_id text, card_id text)
+        AS target(deck_id text, deck_version_id text, card_id text, sense_id text)
     )
     SELECT input_targets.deck_id::text,
            input_targets.deck_version_id::text,
-           input_targets.card_id::text
+           input_targets.card_id::text,
+           input_targets.sense_id::text
     FROM input_targets
     JOIN deck_assignments
       ON deck_assignments.user_id = $1
@@ -926,6 +960,11 @@ async function allowedReviewTargetKeys(
     JOIN deck_version_cards
       ON deck_version_cards.deck_version_id = deck_versions.id
       AND deck_version_cards.card_id = input_targets.card_id
+    JOIN deck_version_card_senses
+      ON deck_version_card_senses.deck_version_id = deck_versions.id
+      AND deck_version_card_senses.card_id = input_targets.card_id
+      AND deck_version_card_senses.sense_id = input_targets.sense_id
+      AND deck_version_card_senses.status = 'active'
     `,
     [userId, JSON.stringify(reviewTargetRows(targets))],
   );
@@ -933,6 +972,7 @@ async function allowedReviewTargetKeys(
     deckId: row.deck_id,
     deckVersionId: row.deck_version_id,
     cardId: row.card_id,
+    senseId: row.sense_id,
   })));
 }
 
@@ -946,6 +986,7 @@ async function allowedPracticeReviewTargetKeys(
       deckId: review.deckId,
       deckVersionId: review.deckVersionId,
       cardId: review.cardId,
+      senseId: review.senseId,
     })),
     reviewTargetKey,
   );
@@ -957,19 +998,22 @@ async function allowedPracticeReviewTargetKeys(
     deck_id: string;
     deck_version_id: string | null;
     card_id: string;
+    sense_id: string;
   }>(
     `
     WITH input_targets AS (
       SELECT DISTINCT
         deck_id::uuid AS deck_id,
         deck_version_id::uuid AS deck_version_id,
-        card_id::uuid AS card_id
+        card_id::uuid AS card_id,
+        sense_id::uuid AS sense_id
       FROM jsonb_to_recordset($2::jsonb)
-        AS target(deck_id text, deck_version_id text, card_id text)
+        AS target(deck_id text, deck_version_id text, card_id text, sense_id text)
     )
     SELECT input_targets.deck_id::text,
            input_targets.deck_version_id::text,
-           input_targets.card_id::text
+           input_targets.card_id::text,
+           input_targets.sense_id::text
     FROM input_targets
     JOIN deck_assignments
       ON deck_assignments.user_id = $1
@@ -983,6 +1027,11 @@ async function allowedPracticeReviewTargetKeys(
     JOIN deck_version_cards
       ON deck_version_cards.deck_version_id = deck_versions.id
       AND deck_version_cards.card_id = input_targets.card_id
+    JOIN deck_version_card_senses
+      ON deck_version_card_senses.deck_version_id = deck_versions.id
+      AND deck_version_card_senses.card_id = input_targets.card_id
+      AND deck_version_card_senses.sense_id = input_targets.sense_id
+      AND deck_version_card_senses.status = 'active'
     `,
     [userId, JSON.stringify(reviewTargetRows(targets))],
   );
@@ -990,6 +1039,7 @@ async function allowedPracticeReviewTargetKeys(
     deckId: row.deck_id,
     deckVersionId: row.deck_version_id,
     cardId: row.card_id,
+    senseId: row.sense_id,
   })));
 }
 
@@ -1001,6 +1051,7 @@ async function allowedProgressTargetKeys(
   const targets = uniqueByKey(
     progressItems.map((progress) => ({
       deckId: progress.deckId,
+      senseId: progress.senseId,
       cardId: progress.cardId,
     })),
     progressTargetKey,
@@ -1011,18 +1062,21 @@ async function allowedProgressTargetKeys(
 
   const result = await client.query<{
     deck_id: string;
+    sense_id: string;
     card_id: string;
   }>(
     `
     WITH input_targets AS (
       SELECT DISTINCT
         deck_id::uuid AS deck_id,
-        card_id::uuid AS card_id
+        card_id::uuid AS card_id,
+        sense_id::uuid AS sense_id
       FROM jsonb_to_recordset($2::jsonb)
-        AS target(deck_id text, card_id text)
+        AS target(deck_id text, card_id text, sense_id text)
     )
     SELECT input_targets.deck_id::text,
-           input_targets.card_id::text
+           input_targets.card_id::text,
+           input_targets.sense_id::text
     FROM input_targets
     JOIN deck_assignments
       ON deck_assignments.user_id = $1
@@ -1035,11 +1089,17 @@ async function allowedProgressTargetKeys(
     JOIN deck_version_cards
       ON deck_version_cards.deck_version_id = deck_versions.id
       AND deck_version_cards.card_id = input_targets.card_id
+    JOIN deck_version_card_senses
+      ON deck_version_card_senses.deck_version_id = deck_versions.id
+      AND deck_version_card_senses.card_id = input_targets.card_id
+      AND deck_version_card_senses.sense_id = input_targets.sense_id
+      AND deck_version_card_senses.status = 'active'
     `,
     [userId, JSON.stringify(progressTargetRows(targets))],
   );
   return new Set(result.rows.map((row) => progressTargetKey({
     deckId: row.deck_id,
+    senseId: row.sense_id,
     cardId: row.card_id,
   })));
 }
@@ -1088,15 +1148,11 @@ async function allowedMatchingTargetKeys(
       ON deck_versions.id = decks.current_version_id
       AND deck_versions.status = 'published'
       AND (input_targets.deck_version_id IS NULL OR input_targets.deck_version_id = decks.current_version_id)
-    JOIN deck_version_cards
-      ON deck_version_cards.deck_version_id = deck_versions.id
-      AND deck_version_cards.status = 'active'
-    JOIN LATERAL (
-      SELECT GREATEST(1, COUNT(*) FILTER (WHERE btrim(part) <> ''))::int AS pair_count
-      FROM regexp_split_to_table(deck_version_cards.translation, ';') AS part
-    ) card_pairs ON true
+    JOIN deck_version_card_senses
+      ON deck_version_card_senses.deck_version_id = deck_versions.id
+      AND deck_version_card_senses.status = 'active'
     GROUP BY input_targets.deck_id, input_targets.deck_version_id, input_targets.pair_count
-    HAVING SUM(card_pairs.pair_count)::int = input_targets.pair_count
+    HAVING COUNT(deck_version_card_senses.sense_id)::int = input_targets.pair_count
     `,
     [userId, JSON.stringify(matchingTargetRows(targets))],
   );
@@ -1231,6 +1287,7 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
             await client.query(
               `
                 SELECT user_id,
+                       sense_id,
                        card_id,
                        deck_id,
                        fsrs_data,
@@ -1238,7 +1295,7 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
                        state,
                        updated_at,
                        server_revision
-                FROM card_progress
+                FROM sense_progress
                 WHERE user_id = $1
                 ORDER BY updated_at DESC
                 `,
@@ -1365,7 +1422,7 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
       pool.query(
         `
         SELECT *
-        FROM card_progress
+        FROM sense_progress
         WHERE user_id = $1
           AND server_revision > $2
           AND ($3::uuid IS NULL OR modified_by_device_id IS NULL OR modified_by_device_id <> $3::uuid)
@@ -1474,7 +1531,7 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
       const duplicateReviewIds: string[] = [];
       const acceptedPracticeReviewIds: string[] = [];
       const duplicatePracticeReviewIds: string[] = [];
-      const progressCardIds: string[] = [];
+      const progressSenseIds: string[] = [];
       const matchingRecordDeckIds: string[] = [];
       const acceptedMatchingAttemptIds: string[] = [];
       const duplicateMatchingAttemptIds: string[] = [];
@@ -1495,12 +1552,12 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
         const result = await client.query<{ client_event_id: string }>(
           `
           INSERT INTO study_reviews (
-            user_id, client_event_id, deck_id, deck_version_id, card_id,
+            user_id, client_event_id, deck_id, deck_version_id, card_id, sense_id,
             mode, outcome, source, reviewed_at, duration_ms, was_new, previous_state, new_state,
             modified_by_device_id
           ) VALUES (
-            $1, $2, $3, $4, $5,
-            $6, $7, $8, $9::timestamptz, $10, $11, $12, $13, $14::uuid
+            $1, $2, $3, $4, $5, $6,
+            $7, $8, $9, $10::timestamptz, $11, $12, $13, $14, $15::uuid
           )
           ON CONFLICT (user_id, client_event_id) DO NOTHING
           RETURNING client_event_id
@@ -1511,6 +1568,7 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
             review.deckId,
             review.deckVersionId,
             review.cardId,
+            review.senseId,
             review.mode,
             review.outcome,
             review.source,
@@ -1533,11 +1591,11 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
         const result = await client.query<{ client_event_id: string }>(
           `
           INSERT INTO practice_reviews (
-            user_id, client_event_id, deck_id, deck_version_id, card_id,
+            user_id, client_event_id, deck_id, deck_version_id, card_id, sense_id,
             mode, outcome, source, practiced_at, duration_ms, modified_by_device_id
           ) VALUES (
-            $1, $2, $3, $4, $5,
-            $6, $7, $8, $9::timestamptz, $10, $11::uuid
+            $1, $2, $3, $4, $5, $6,
+            $7, $8, $9, $10::timestamptz, $11, $12::uuid
           )
           ON CONFLICT (user_id, client_event_id) DO NOTHING
           RETURNING client_event_id
@@ -1548,6 +1606,7 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
             review.deckId,
             review.deckVersionId,
             review.cardId,
+            review.senseId,
             review.mode,
             review.outcome,
             review.source,
@@ -1564,14 +1623,15 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
       }
 
       for (const progress of validated.progressItems) {
-        const result = await client.query<{ card_id: string }>(
+        const result = await client.query<{ sense_id: string }>(
           `
-          INSERT INTO card_progress (
-            user_id, card_id, deck_id, fsrs_data, due_at, state, updated_at, modified_by_device_id
+          INSERT INTO sense_progress (
+            user_id, sense_id, card_id, deck_id, fsrs_data, due_at, state, updated_at, modified_by_device_id
           ) VALUES (
-            $1, $2, $3, $4::jsonb, $5::timestamptz, $6, COALESCE($7::timestamptz, now()), $8::uuid
+            $1, $2, $3, $4, $5::jsonb, $6::timestamptz, $7, COALESCE($8::timestamptz, now()), $9::uuid
           )
-          ON CONFLICT (user_id, card_id) DO UPDATE SET
+          ON CONFLICT (user_id, sense_id) DO UPDATE SET
+            card_id = excluded.card_id,
             deck_id = excluded.deck_id,
             fsrs_data = excluded.fsrs_data,
             due_at = excluded.due_at,
@@ -1580,17 +1640,19 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
             modified_by_device_id = excluded.modified_by_device_id,
             server_revision = nextval('server_revision_seq')
           WHERE (
-              card_progress.deck_id IS DISTINCT FROM excluded.deck_id
-              OR card_progress.fsrs_data IS DISTINCT FROM excluded.fsrs_data
-              OR card_progress.due_at IS DISTINCT FROM excluded.due_at
-              OR card_progress.state IS DISTINCT FROM excluded.state
-              OR card_progress.updated_at IS DISTINCT FROM excluded.updated_at
+              sense_progress.card_id IS DISTINCT FROM excluded.card_id
+              OR sense_progress.deck_id IS DISTINCT FROM excluded.deck_id
+              OR sense_progress.fsrs_data IS DISTINCT FROM excluded.fsrs_data
+              OR sense_progress.due_at IS DISTINCT FROM excluded.due_at
+              OR sense_progress.state IS DISTINCT FROM excluded.state
+              OR sense_progress.updated_at IS DISTINCT FROM excluded.updated_at
             )
-            AND excluded.updated_at >= card_progress.updated_at
-          RETURNING card_id
+            AND excluded.updated_at >= sense_progress.updated_at
+          RETURNING sense_id
           `,
           [
             userId,
+            progress.senseId,
             progress.cardId,
             progress.deckId,
             JSON.stringify(progress.fsrsData),
@@ -1601,7 +1663,7 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
           ],
         );
         if (result.rowCount) {
-          progressCardIds.push(progress.cardId);
+          progressSenseIds.push(progress.senseId);
         }
       }
 
@@ -1707,7 +1769,7 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
         acceptedPracticeReviewCount: acceptedPracticeReviewIds.length,
         duplicatePracticeReviewCount: duplicatePracticeReviewIds.length,
         progressCount: progressItems.length,
-        acceptedProgressCount: progressCardIds.length,
+        acceptedProgressCount: progressSenseIds.length,
         matchingRecordCount: matchingRecords.length,
         acceptedMatchingRecordCount: matchingRecordDeckIds.length,
         matchingAttemptCount: matchingAttempts.length,
@@ -1717,7 +1779,7 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
         acceptedDeckPreferenceCount: deckPreferenceDeckIds.length,
         rejectedReviewCount: validated.rejectedReviewIds.length,
         rejectedPracticeReviewCount: validated.rejectedPracticeReviewIds.length,
-        rejectedProgressCount: validated.rejectedProgressCardIds.length,
+        rejectedProgressCount: validated.rejectedProgressSenseIds.length,
         rejectedMatchingRecordCount: validated.rejectedMatchingRecordDeckIds.length,
         rejectedMatchingAttemptCount: validated.rejectedMatchingAttemptIds.length,
         rejectedDeckPreferenceCount: validated.rejectedDeckPreferenceDeckIds.length,
@@ -1728,7 +1790,7 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
         accepted: {
           reviewIds: acceptedReviewIds,
           practiceReviewIds: acceptedPracticeReviewIds,
-          progressCardIds,
+          progressSenseIds,
           matchingRecordDeckIds,
           matchingAttemptIds: acceptedMatchingAttemptIds,
           deckPreferenceDeckIds,
@@ -1741,7 +1803,7 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
         rejected: {
           reviewIds: validated.rejectedReviewIds,
           practiceReviewIds: validated.rejectedPracticeReviewIds,
-          progressCardIds: validated.rejectedProgressCardIds,
+          progressSenseIds: validated.rejectedProgressSenseIds,
           matchingRecordDeckIds: validated.rejectedMatchingRecordDeckIds,
           matchingAttemptIds: validated.rejectedMatchingAttemptIds,
           deckPreferenceDeckIds: validated.rejectedDeckPreferenceDeckIds,

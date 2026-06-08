@@ -7,6 +7,7 @@ CREATE TABLE IF NOT EXISTS practice_reviews (
     deck_id uuid NOT NULL REFERENCES decks(id) ON DELETE CASCADE,
     deck_version_id uuid REFERENCES deck_versions(id),
     card_id uuid NOT NULL,
+    sense_id uuid NOT NULL,
     mode study_mode NOT NULL,
     outcome review_outcome NOT NULL,
     source text NOT NULL DEFAULT 'today_practice'
@@ -22,6 +23,7 @@ CREATE TABLE IF NOT EXISTS practice_reviews (
 CREATE INDEX IF NOT EXISTS idx_practice_reviews_user_practiced ON practice_reviews(user_id, practiced_at);
 CREATE INDEX IF NOT EXISTS idx_practice_reviews_deck_practiced ON practice_reviews(deck_id, practiced_at);
 CREATE INDEX IF NOT EXISTS idx_practice_reviews_card ON practice_reviews(user_id, card_id);
+CREATE INDEX IF NOT EXISTS idx_practice_reviews_sense ON practice_reviews(user_id, sense_id);
 CREATE INDEX IF NOT EXISTS idx_practice_reviews_revision ON practice_reviews(server_revision);
 
 CREATE TABLE IF NOT EXISTS matching_attempts (

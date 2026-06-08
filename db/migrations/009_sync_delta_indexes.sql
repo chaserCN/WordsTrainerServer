@@ -4,8 +4,8 @@ CREATE INDEX IF NOT EXISTS idx_deck_assignments_user_revision
 CREATE INDEX IF NOT EXISTS idx_user_deck_preferences_user_revision
     ON user_deck_preferences(user_id, server_revision);
 
-CREATE INDEX IF NOT EXISTS idx_card_progress_user_revision
-    ON card_progress(user_id, server_revision);
+CREATE INDEX IF NOT EXISTS idx_sense_progress_user_revision
+    ON sense_progress(user_id, server_revision);
 
 CREATE INDEX IF NOT EXISTS idx_study_reviews_user_revision
     ON study_reviews(user_id, server_revision);

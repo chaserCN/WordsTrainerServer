@@ -100,15 +100,9 @@ CREATE TABLE deck_version_cards (
     lemma text NOT NULL,
     display_word text NOT NULL,
     part_of_speech text,
-    translation text NOT NULL,
-    short_definition text,
-    memory_hint text,
     etymology text,
-    usage_note text,
-    synonym_note text,
-    grammar_note text,
     notes text,
-    image_media_id uuid REFERENCES media_objects(id),
+    primary_sense_id uuid,
     audio_word_media_id uuid REFERENCES media_objects(id),
     sort_order integer NOT NULL DEFAULT 0,
     PRIMARY KEY (deck_version_id, card_id)
@@ -116,25 +110,63 @@ CREATE TABLE deck_version_cards (
 
 CREATE INDEX idx_deck_version_cards_card_id ON deck_version_cards(card_id);
 
-CREATE TABLE deck_version_examples (
+CREATE TABLE deck_version_card_senses (
     deck_version_id uuid NOT NULL REFERENCES deck_versions(id) ON DELETE CASCADE,
-    example_id uuid NOT NULL,
+    sense_id uuid NOT NULL,
     card_id uuid NOT NULL,
-    template text NOT NULL,
-    answer text NOT NULL,
-    answer_form_key text,
-    translation text,
+    status content_status NOT NULL DEFAULT 'active',
+    display_pattern text,
+    translation text NOT NULL,
     note text,
     image_media_id uuid REFERENCES media_objects(id),
-    audio_example_media_id uuid REFERENCES media_objects(id),
     sort_order integer NOT NULL DEFAULT 0,
-    PRIMARY KEY (deck_version_id, example_id),
+    PRIMARY KEY (deck_version_id, sense_id),
     FOREIGN KEY (deck_version_id, card_id)
         REFERENCES deck_version_cards(deck_version_id, card_id)
         ON DELETE CASCADE
 );
 
-CREATE INDEX idx_deck_version_examples_card ON deck_version_examples(deck_version_id, card_id);
+CREATE INDEX idx_deck_version_card_senses_card
+    ON deck_version_card_senses(deck_version_id, card_id, sort_order);
+
+CREATE TABLE deck_version_sense_examples (
+    deck_version_id uuid NOT NULL REFERENCES deck_versions(id) ON DELETE CASCADE,
+    card_id uuid NOT NULL,
+    sense_id uuid NOT NULL,
+    text text NOT NULL,
+    translation text,
+    note text,
+    sort_order integer NOT NULL DEFAULT 0,
+    PRIMARY KEY (deck_version_id, sense_id),
+    FOREIGN KEY (deck_version_id, card_id)
+        REFERENCES deck_version_cards(deck_version_id, card_id)
+        ON DELETE CASCADE,
+    FOREIGN KEY (deck_version_id, sense_id)
+        REFERENCES deck_version_card_senses(deck_version_id, sense_id)
+        ON DELETE CASCADE
+);
+
+CREATE INDEX idx_deck_version_sense_examples_card ON deck_version_sense_examples(deck_version_id, card_id);
+
+CREATE TABLE deck_version_sentence_questions (
+    deck_version_id uuid NOT NULL REFERENCES deck_versions(id) ON DELETE CASCADE,
+    card_id uuid NOT NULL,
+    sense_id uuid NOT NULL,
+    template text NOT NULL,
+    answer text NOT NULL,
+    answer_form_key text,
+    audio_answer_media_id uuid REFERENCES media_objects(id),
+    sort_order integer NOT NULL DEFAULT 0,
+    PRIMARY KEY (deck_version_id, sense_id),
+    FOREIGN KEY (deck_version_id, card_id)
+        REFERENCES deck_version_cards(deck_version_id, card_id)
+        ON DELETE CASCADE,
+    FOREIGN KEY (deck_version_id, sense_id)
+        REFERENCES deck_version_card_senses(deck_version_id, sense_id)
+        ON DELETE CASCADE
+);
+
+CREATE INDEX idx_deck_version_sentence_questions_card ON deck_version_sentence_questions(deck_version_id, card_id);
 
 CREATE TABLE deck_version_word_forms (
     deck_version_id uuid NOT NULL REFERENCES deck_versions(id) ON DELETE CASCADE,
@@ -148,23 +180,24 @@ CREATE TABLE deck_version_word_forms (
         ON DELETE CASCADE
 );
 
-CREATE TABLE deck_version_distractors (
+CREATE TABLE deck_version_question_distractors (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     deck_version_id uuid NOT NULL REFERENCES deck_versions(id) ON DELETE CASCADE,
-    example_id uuid NOT NULL,
+    sense_id uuid NOT NULL,
     text text NOT NULL,
     source_card_id uuid,
     priority integer NOT NULL DEFAULT 0,
-    FOREIGN KEY (deck_version_id, example_id)
-        REFERENCES deck_version_examples(deck_version_id, example_id)
+    FOREIGN KEY (deck_version_id, sense_id)
+        REFERENCES deck_version_sentence_questions(deck_version_id, sense_id)
         ON DELETE CASCADE
 );
 
-CREATE INDEX idx_deck_version_distractors_example
-    ON deck_version_distractors(deck_version_id, example_id);
+CREATE INDEX idx_deck_version_question_distractors_sense
+    ON deck_version_question_distractors(deck_version_id, sense_id);
 
-CREATE TABLE card_progress (
+CREATE TABLE sense_progress (
     user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    sense_id uuid NOT NULL,
     card_id uuid NOT NULL,
     deck_id uuid NOT NULL REFERENCES decks(id) ON DELETE CASCADE,
     fsrs_data jsonb NOT NULL,
@@ -173,11 +206,11 @@ CREATE TABLE card_progress (
     updated_at timestamptz NOT NULL DEFAULT now(),
     modified_by_device_id uuid,
     server_revision bigint NOT NULL DEFAULT nextval('server_revision_seq'),
-    PRIMARY KEY (user_id, card_id)
+    PRIMARY KEY (user_id, sense_id)
 );
 
-CREATE INDEX idx_card_progress_user_due ON card_progress(user_id, due_at);
-CREATE INDEX idx_card_progress_revision ON card_progress(server_revision);
+CREATE INDEX idx_sense_progress_user_due ON sense_progress(user_id, due_at);
+CREATE INDEX idx_sense_progress_revision ON sense_progress(server_revision);
 
 CREATE TABLE study_reviews (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -186,6 +219,7 @@ CREATE TABLE study_reviews (
     deck_id uuid NOT NULL REFERENCES decks(id) ON DELETE CASCADE,
     deck_version_id uuid REFERENCES deck_versions(id),
     card_id uuid NOT NULL,
+    sense_id uuid NOT NULL,
     mode study_mode NOT NULL,
     outcome review_outcome NOT NULL,
     source text NOT NULL DEFAULT 'deck_session'
@@ -204,6 +238,7 @@ CREATE TABLE study_reviews (
 CREATE INDEX idx_study_reviews_user_reviewed ON study_reviews(user_id, reviewed_at);
 CREATE INDEX idx_study_reviews_deck_reviewed ON study_reviews(deck_id, reviewed_at);
 CREATE INDEX idx_study_reviews_card ON study_reviews(user_id, card_id);
+CREATE INDEX idx_study_reviews_sense ON study_reviews(user_id, sense_id);
 CREATE INDEX idx_study_reviews_revision ON study_reviews(server_revision);
 
 CREATE TABLE practice_reviews (
@@ -213,6 +248,7 @@ CREATE TABLE practice_reviews (
     deck_id uuid NOT NULL REFERENCES decks(id) ON DELETE CASCADE,
     deck_version_id uuid REFERENCES deck_versions(id),
     card_id uuid NOT NULL,
+    sense_id uuid NOT NULL,
     mode study_mode NOT NULL,
     outcome review_outcome NOT NULL,
     source text NOT NULL DEFAULT 'today_practice'
@@ -228,6 +264,7 @@ CREATE TABLE practice_reviews (
 CREATE INDEX idx_practice_reviews_user_practiced ON practice_reviews(user_id, practiced_at);
 CREATE INDEX idx_practice_reviews_deck_practiced ON practice_reviews(deck_id, practiced_at);
 CREATE INDEX idx_practice_reviews_card ON practice_reviews(user_id, card_id);
+CREATE INDEX idx_practice_reviews_sense ON practice_reviews(user_id, sense_id);
 CREATE INDEX idx_practice_reviews_revision ON practice_reviews(server_revision);
 
 CREATE TABLE deck_matching_records (

@@ -27,7 +27,7 @@ type PublishedDeck = {
   deckId: string;
   versionId: string;
   cardIds: string[];
-  exampleIds: string[];
+  senseIds: string[];
 };
 
 const __filename = fileURLToPath(import.meta.url);
@@ -380,14 +380,14 @@ function flattenSyncResponse(url: string, payload: any): any {
       duplicateReviewIds: payload.duplicates?.reviewIds ?? [],
       acceptedPracticeReviewIds: payload.accepted?.practiceReviewIds ?? [],
       duplicatePracticeReviewIds: payload.duplicates?.practiceReviewIds ?? [],
-      progressCardIds: payload.accepted?.progressCardIds ?? [],
+      progressSenseIds: payload.accepted?.progressSenseIds ?? [],
       matchingRecordDeckIds: payload.accepted?.matchingRecordDeckIds ?? [],
       acceptedMatchingAttemptIds: payload.accepted?.matchingAttemptIds ?? [],
       duplicateMatchingAttemptIds: payload.duplicates?.matchingAttemptIds ?? [],
       deckPreferenceDeckIds: payload.accepted?.deckPreferenceDeckIds ?? [],
       rejectedReviewIds: payload.rejected?.reviewIds ?? [],
       rejectedPracticeReviewIds: payload.rejected?.practiceReviewIds ?? [],
-      rejectedProgressCardIds: payload.rejected?.progressCardIds ?? [],
+      rejectedProgressSenseIds: payload.rejected?.progressSenseIds ?? [],
       rejectedMatchingRecordDeckIds: payload.rejected?.matchingRecordDeckIds ?? [],
       rejectedMatchingAttemptIds: payload.rejected?.matchingAttemptIds ?? [],
       rejectedDeckPreferenceDeckIds: payload.rejected?.deckPreferenceDeckIds ?? [],
@@ -473,6 +473,38 @@ async function createUser(ctx: TestApp, displayName: string): Promise<{ userId: 
   };
 }
 
+async function createMinimalDraftContent(
+  ctx: TestApp,
+  deckId: string,
+  versionId: string,
+): Promise<{ cardId: string; senseId: string }> {
+  const cardId = randomUUID();
+  const senseId = randomUUID();
+  await adminJson(ctx, "PUT", `/v1/admin/decks/${deckId}/versions/${versionId}/cards/${cardId}`, {
+    lemma: "reliable",
+    displayWord: "reliable",
+    primarySenseId: senseId,
+  });
+  await adminJson(ctx, "PUT", `/v1/admin/decks/${deckId}/versions/${versionId}/cards/${cardId}/senses/${senseId}`, {
+    translation: "надежный",
+  });
+  await adminJson(ctx, "PUT", `/v1/admin/decks/${deckId}/versions/${versionId}/cards/${cardId}/senses/${senseId}/example`, {
+    text: "The bridge is reliable.",
+    translation: "Мост <b>надежный</b>.",
+  });
+  await adminJson(
+    ctx,
+    "PUT",
+    `/v1/admin/decks/${deckId}/versions/${versionId}/cards/${cardId}/senses/${senseId}/sentence-question`,
+    {
+      template: "The bridge is {{blank}}.",
+      answer: "reliable",
+      answerFormKey: "base",
+    },
+  );
+  return { cardId, senseId };
+}
+
 async function createPublishedDeck(ctx: TestApp, userId: string, title = "Spanish cafe basics"): Promise<PublishedDeck> {
   const avatarMediaId = await createMedia(ctx, "deck-avatar");
   const cardImageMediaId = await createMedia(ctx, "card-image");
@@ -492,18 +524,15 @@ async function createPublishedDeck(ctx: TestApp, userId: string, title = "Spanis
   }, 201);
   const versionId = version.version.id;
   const cardIds = [randomUUID(), randomUUID()];
-  const exampleIds = [randomUUID(), randomUUID()];
+  const senseIds = [randomUUID(), randomUUID()];
 
   await adminJson(ctx, "PUT", `/v1/admin/decks/${deckId}/versions/${versionId}/cards/${cardIds[0]}`, {
     status: "active",
     lemma: "pedir",
     displayWord: "pedir",
     partOfSpeech: "verb",
-    translation: "to order",
-    shortDefinition: "Ask for something in a cafe or restaurant.",
-    memoryHint: "Pedir sounds like putting in an order.",
+    primarySenseId: senseIds[0],
     notes: "Initial draft note",
-    imageMediaId: cardImageMediaId,
     sortOrder: 1,
   });
   await adminJson(ctx, "PUT", `/v1/admin/decks/${deckId}/versions/${versionId}/cards/${cardIds[0]}`, {
@@ -511,31 +540,47 @@ async function createPublishedDeck(ctx: TestApp, userId: string, title = "Spanis
     lemma: "pedir",
     displayWord: "pido",
     partOfSpeech: "verb",
-    translation: "I order",
-    shortDefinition: "First-person cafe ordering phrase.",
-    memoryHint: "Pido is the form the learner will say.",
+    primarySenseId: senseIds[0],
     notes: "Edited before publish",
-    imageMediaId: cardImageMediaId,
     sortOrder: 1,
   });
+  await adminJson(
+    ctx,
+    "PUT",
+    `/v1/admin/decks/${deckId}/versions/${versionId}/cards/${cardIds[0]}/senses/${senseIds[0]}`,
+    {
+      status: "active",
+      translation: "I order",
+      note: "Pido is the form the learner will say.",
+      imageMediaId: cardImageMediaId,
+      sortOrder: 1,
+    },
+  );
   await adminJson(ctx, "PUT", `/v1/admin/decks/${deckId}/versions/${versionId}/cards/${cardIds[1]}`, {
     status: "active",
     lemma: "la cuenta",
     displayWord: "la cuenta",
     partOfSpeech: "noun",
-    translation: "the bill",
-    shortDefinition: "What you ask for before paying.",
+    primarySenseId: senseIds[1],
     sortOrder: 2,
   });
+  await adminJson(
+    ctx,
+    "PUT",
+    `/v1/admin/decks/${deckId}/versions/${versionId}/cards/${cardIds[1]}/senses/${senseIds[1]}`,
+    {
+      status: "active",
+      translation: "the bill",
+      sortOrder: 1,
+    },
+  );
 
   await adminJson(
     ctx,
     "PUT",
-    `/v1/admin/decks/${deckId}/versions/${versionId}/cards/${cardIds[0]}/examples/${exampleIds[0]}`,
+    `/v1/admin/decks/${deckId}/versions/${versionId}/cards/${cardIds[0]}/senses/${senseIds[0]}/example`,
     {
-      template: "Yo {{blank}} un cafe.",
-      answer: "pido",
-      answerFormKey: "present_yo",
+      text: "Yo pido un cafe.",
       translation: "I order a coffee.",
       note: "Everyday cafe sentence",
       sortOrder: 1,
@@ -544,11 +589,31 @@ async function createPublishedDeck(ctx: TestApp, userId: string, title = "Spanis
   await adminJson(
     ctx,
     "PUT",
-    `/v1/admin/decks/${deckId}/versions/${versionId}/cards/${cardIds[1]}/examples/${exampleIds[1]}`,
+    `/v1/admin/decks/${deckId}/versions/${versionId}/cards/${cardIds[1]}/senses/${senseIds[1]}/example`,
+    {
+      text: "La cuenta, por favor.",
+      translation: "The bill, please.",
+      sortOrder: 1,
+    },
+  );
+  await adminJson(
+    ctx,
+    "PUT",
+    `/v1/admin/decks/${deckId}/versions/${versionId}/cards/${cardIds[0]}/senses/${senseIds[0]}/sentence-question`,
+    {
+      template: "Yo {{blank}} un cafe.",
+      answer: "pido",
+      answerFormKey: "present_yo",
+      sortOrder: 1,
+    },
+  );
+  await adminJson(
+    ctx,
+    "PUT",
+    `/v1/admin/decks/${deckId}/versions/${versionId}/cards/${cardIds[1]}/senses/${senseIds[1]}/sentence-question`,
     {
       template: "La {{blank}}, por favor.",
       answer: "cuenta",
-      translation: "The bill, please.",
       sortOrder: 1,
     },
   );
@@ -558,7 +623,7 @@ async function createPublishedDeck(ctx: TestApp, userId: string, title = "Spanis
       { formKey: "present_yo", text: "pido", sortOrder: 1 },
     ],
   });
-  await adminJson(ctx, "PUT", `/v1/admin/decks/${deckId}/versions/${versionId}/examples/${exampleIds[0]}/distractors`, {
+  await adminJson(ctx, "PUT", `/v1/admin/decks/${deckId}/versions/${versionId}/cards/${cardIds[0]}/senses/${senseIds[0]}/distractors`, {
     distractors: [
       { text: "pago", priority: 2, sourceCardId: cardIds[1] },
       { text: "quiero", priority: 1 },
@@ -572,7 +637,7 @@ async function createPublishedDeck(ctx: TestApp, userId: string, title = "Spanis
     status: "active",
   }, 201);
 
-  return { deckId, versionId, cardIds, exampleIds };
+  return { deckId, versionId, cardIds, senseIds };
 }
 
 function reviewEvent(deck: PublishedDeck, overrides: Record<string, unknown> = {}): Record<string, unknown> {
@@ -581,6 +646,7 @@ function reviewEvent(deck: PublishedDeck, overrides: Record<string, unknown> = {
     deckId: deck.deckId,
     deckVersionId: deck.versionId,
     cardId: deck.cardIds[0],
+    senseId: deck.senseIds[0],
     mode: "flashcards",
     outcome: "remembered",
     reviewedAt: "2026-06-01T09:30:00.000Z",
@@ -598,6 +664,7 @@ function practiceReviewEvent(deck: PublishedDeck, overrides: Record<string, unkn
     deckId: deck.deckId,
     deckVersionId: deck.versionId,
     cardId: deck.cardIds[0],
+    senseId: deck.senseIds[0],
     mode: "clozeTyping",
     outcome: "correct",
     source: "today_practice",
@@ -610,6 +677,7 @@ function practiceReviewEvent(deck: PublishedDeck, overrides: Record<string, unkn
 function progressEvent(deck: PublishedDeck, overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     cardId: deck.cardIds[0],
+    senseId: deck.senseIds[0],
     deckId: deck.deckId,
     fsrsData: { state: "review", reps: 1, due: "2026-06-03T09:30:00.000Z" },
     dueAt: "2026-06-03T09:30:00.000Z",
@@ -655,6 +723,7 @@ test("mobile bootstrap and sync are usable when server has no assigned content",
   assert.deepEqual(bootstrap.assignments, []);
   assert.deepEqual(bootstrap.content.cards, []);
   assert.deepEqual(bootstrap.content.examples, []);
+  assert.deepEqual(bootstrap.content.sentenceQuestions, []);
   assert.deepEqual(bootstrap.content.forms, []);
   assert.deepEqual(bootstrap.content.distractors, []);
   assert.deepEqual(bootstrap.media, []);
@@ -674,7 +743,7 @@ test("mobile bootstrap and sync are usable when server has no assigned content",
   const emptySync = await syncJson(ctx, "POST", "/v1/sync/events", learner.token, {}, learner.userId);
   assert.deepEqual(emptySync.acceptedReviewIds, []);
   assert.deepEqual(emptySync.duplicateReviewIds, []);
-  assert.deepEqual(emptySync.progressCardIds, []);
+  assert.deepEqual(emptySync.progressSenseIds, []);
   assert.deepEqual(emptySync.matchingRecordDeckIds, []);
 
   const badSelectedUser = await syncJson(
@@ -808,6 +877,7 @@ test("mobile bootstrap skips content for cached deck versions", async (t) => {
   assert.equal(fullBootstrap.assignments[0].current_version_id, deck.versionId);
   assert.equal(fullBootstrap.content.cards.length, 2);
   assert.equal(fullBootstrap.content.examples.length, 2);
+  assert.equal(fullBootstrap.content.sentenceQuestions.length, 2);
   assert.equal(fullBootstrap.media.length, 2);
 
   const cachedBootstrapResponse = await ctx.app.inject({
@@ -825,6 +895,7 @@ test("mobile bootstrap skips content for cached deck versions", async (t) => {
   assert.equal(cachedBootstrap.assignments[0].current_version_id, deck.versionId);
   assert.deepEqual(cachedBootstrap.content.cards, []);
   assert.deepEqual(cachedBootstrap.content.examples, []);
+  assert.deepEqual(cachedBootstrap.content.sentenceQuestions, []);
   assert.deepEqual(cachedBootstrap.content.forms, []);
   assert.deepEqual(cachedBootstrap.content.distractors, []);
   assert.equal(cachedBootstrap.media.length, 1);
@@ -1043,6 +1114,7 @@ test("admin/editor can create, edit, publish, and assign usable deck content", a
   assert.equal(bootstrap.assignments[0].version_status, "published");
   assert.equal(bootstrap.content.cards.length, 2);
   assert.equal(bootstrap.content.examples.length, 2);
+  assert.equal(bootstrap.content.sentenceQuestions.length, 2);
   assert.equal(bootstrap.content.forms.length, 2);
   assert.equal(bootstrap.content.distractors.length, 2);
   assert.equal(bootstrap.content.cards[0].deck_version_id, deck.versionId);
@@ -1080,6 +1152,74 @@ test("admin/editor can create, edit, publish, and assign usable deck content", a
   assert.equal(metadataChanges.users[0].id, learner.userId);
   assert.equal(metadataChanges.users[0].avatar_media_id, updatedUserAvatarMediaId);
   assert.ok(metadataChanges.media.some((media: any) => media.id === updatedUserAvatarMediaId));
+});
+
+test("admin publish rejects incomplete active sense content", async (t) => {
+  const ctx = await createTestApp(t);
+  if (!ctx) return;
+
+  const deck = await adminJson(ctx, "POST", "/v1/admin/decks", {
+    title: "Incomplete publish deck",
+    languageCode: "en",
+  }, 201);
+  const version = await adminJson(ctx, "POST", `/v1/admin/decks/${deck.deck.id}/versions`, {
+    manifest: {},
+  }, 201);
+  const versionId = version.version.id;
+  const cardId = randomUUID();
+  const senseId = randomUUID();
+
+  const emptyPublish = await adminJson(ctx, "POST", `/v1/admin/decks/${deck.deck.id}/publish`, {
+    versionId,
+  }, 400);
+  assert.match(emptyPublish.message, /at least one active card/);
+
+  await adminJson(ctx, "PUT", `/v1/admin/decks/${deck.deck.id}/versions/${versionId}/cards/${cardId}`, {
+    lemma: "reliable",
+    displayWord: "reliable",
+  });
+  const noPrimary = await adminJson(ctx, "POST", `/v1/admin/decks/${deck.deck.id}/publish`, {
+    versionId,
+  }, 400);
+  assert.match(noPrimary.message, /primarySenseId/);
+
+  await adminJson(ctx, "PUT", `/v1/admin/decks/${deck.deck.id}/versions/${versionId}/cards/${cardId}`, {
+    lemma: "reliable",
+    displayWord: "reliable",
+    primarySenseId: senseId,
+  });
+  await adminJson(ctx, "PUT", `/v1/admin/decks/${deck.deck.id}/versions/${versionId}/cards/${cardId}/senses/${senseId}`, {
+    translation: "надежный",
+  });
+  const missingSenseContent = await adminJson(ctx, "POST", `/v1/admin/decks/${deck.deck.id}/publish`, {
+    versionId,
+  }, 400);
+  assert.match(missingSenseContent.message, /must have example/);
+  assert.match(missingSenseContent.message, /must have sentenceQuestion/);
+
+  await adminJson(ctx, "PUT", `/v1/admin/decks/${deck.deck.id}/versions/${versionId}/cards/${cardId}/senses/${senseId}/example`, {
+    text: "The bridge is reliable.",
+    translation: "Мост <b>надежный</b>.",
+  });
+  const missingQuestion = await adminJson(ctx, "POST", `/v1/admin/decks/${deck.deck.id}/publish`, {
+    versionId,
+  }, 400);
+  assert.match(missingQuestion.message, /must have sentenceQuestion/);
+
+  await adminJson(
+    ctx,
+    "PUT",
+    `/v1/admin/decks/${deck.deck.id}/versions/${versionId}/cards/${cardId}/senses/${senseId}/sentence-question`,
+    {
+      template: "The bridge is {{blank}}.",
+      answer: "reliable",
+      answerFormKey: "base",
+    },
+  );
+  const published = await adminJson(ctx, "POST", `/v1/admin/decks/${deck.deck.id}/publish`, {
+    versionId,
+  });
+  assert.equal(published.version.status, "published");
 });
 
 test("admin can edit user and deck metadata with partial updates and clears", async (t) => {
@@ -1147,6 +1287,7 @@ test("admin can edit user and deck metadata with partial updates and clears", as
   const version = await adminJson(ctx, "POST", `/v1/admin/decks/${deck.deck.id}/versions`, {
     manifest: {},
   }, 201);
+  await createMinimalDraftContent(ctx, deck.deck.id, version.version.id);
   await adminJson(ctx, "POST", `/v1/admin/decks/${deck.deck.id}/publish`, {
     versionId: version.version.id,
   });
@@ -1224,7 +1365,7 @@ test("admin can edit user and deck metadata with partial updates and clears", as
   await adminJson(ctx, "PUT", `/v1/admin/decks/${randomUUID()}`, { title: "Missing deck" }, 404);
 });
 
-test("admin can delete draft cards and examples with dependent content", async (t) => {
+test("admin can delete draft cards with dependent sense content", async (t) => {
   const ctx = await createTestApp(t);
   if (!ctx) return;
 
@@ -1238,39 +1379,61 @@ test("admin can delete draft cards and examples with dependent content", async (
   }, 201);
   const keptCardId = randomUUID();
   const deletedCardId = randomUUID();
-  const deletedExampleId = randomUUID();
-  const cascadingExampleId = randomUUID();
+  const keptSenseId = randomUUID();
+  const deletedSenseId = randomUUID();
 
   await adminJson(ctx, "PUT", `/v1/admin/decks/${deck.deck.id}/versions/${version.version.id}/cards/${keptCardId}`, {
     lemma: "keep",
     displayWord: "keep",
-    translation: "оставить",
+    primarySenseId: keptSenseId,
     sortOrder: 1,
+  });
+  await adminJson(ctx, "PUT", `/v1/admin/decks/${deck.deck.id}/versions/${version.version.id}/cards/${keptCardId}/senses/${keptSenseId}`, {
+    translation: "оставить",
   });
   await adminJson(ctx, "PUT", `/v1/admin/decks/${deck.deck.id}/versions/${version.version.id}/cards/${deletedCardId}`, {
     lemma: "remove",
     displayWord: "remove",
-    translation: "удалить",
+    primarySenseId: deletedSenseId,
     sortOrder: 2,
+  });
+  await adminJson(ctx, "PUT", `/v1/admin/decks/${deck.deck.id}/versions/${version.version.id}/cards/${deletedCardId}/senses/${deletedSenseId}`, {
+    translation: "удалить",
   });
   await adminJson(
     ctx,
     "PUT",
-    `/v1/admin/decks/${deck.deck.id}/versions/${version.version.id}/cards/${keptCardId}/examples/${deletedExampleId}`,
+    `/v1/admin/decks/${deck.deck.id}/versions/${version.version.id}/cards/${keptCardId}/senses/${keptSenseId}/example`,
     {
-      template: "I will {{blank}} this example.",
-      answer: "keep",
+      text: "I will keep this example.",
       translation: "Я оставлю этот пример.",
     },
   );
   await adminJson(
     ctx,
     "PUT",
-    `/v1/admin/decks/${deck.deck.id}/versions/${version.version.id}/cards/${deletedCardId}/examples/${cascadingExampleId}`,
+    `/v1/admin/decks/${deck.deck.id}/versions/${version.version.id}/cards/${deletedCardId}/senses/${deletedSenseId}/example`,
+    {
+      text: "Please remove this card.",
+      translation: "Пожалуйста, удали эту карточку.",
+    },
+  );
+  await adminJson(
+    ctx,
+    "PUT",
+    `/v1/admin/decks/${deck.deck.id}/versions/${version.version.id}/cards/${keptCardId}/senses/${keptSenseId}/sentence-question`,
+    {
+      template: "I will {{blank}} this example.",
+      answer: "keep",
+    },
+  );
+  await adminJson(
+    ctx,
+    "PUT",
+    `/v1/admin/decks/${deck.deck.id}/versions/${version.version.id}/cards/${deletedCardId}/senses/${deletedSenseId}/sentence-question`,
     {
       template: "Please {{blank}} this card.",
       answer: "remove",
-      translation: "Пожалуйста, удали эту карточку.",
     },
   );
   await adminJson(ctx, "PUT", `/v1/admin/decks/${deck.deck.id}/versions/${version.version.id}/cards/${deletedCardId}/forms`, {
@@ -1279,7 +1442,7 @@ test("admin can delete draft cards and examples with dependent content", async (
   await adminJson(
     ctx,
     "PUT",
-    `/v1/admin/decks/${deck.deck.id}/versions/${version.version.id}/examples/${deletedExampleId}/distractors`,
+    `/v1/admin/decks/${deck.deck.id}/versions/${version.version.id}/cards/${keptCardId}/senses/${keptSenseId}/distractors`,
     {
       distractors: [{ text: "discard", priority: 1 }],
     },
@@ -1287,25 +1450,17 @@ test("admin can delete draft cards and examples with dependent content", async (
   await adminJson(
     ctx,
     "PUT",
-    `/v1/admin/decks/${deck.deck.id}/versions/${version.version.id}/examples/${cascadingExampleId}/distractors`,
+    `/v1/admin/decks/${deck.deck.id}/versions/${version.version.id}/cards/${deletedCardId}/senses/${deletedSenseId}/distractors`,
     {
       distractors: [{ text: "retain", priority: 1 }],
     },
   );
 
-  const deletedExample = await adminJson(
-    ctx,
-    "DELETE",
-    `/v1/admin/decks/${deck.deck.id}/versions/${version.version.id}/examples/${deletedExampleId}`,
-  );
-  assert.equal(deletedExample.deletedExampleId, deletedExampleId);
-
-  const afterExampleDelete = await adminJson(ctx, "GET", `/v1/admin/decks/${deck.deck.id}/versions/${version.version.id}`);
-  assert.equal(afterExampleDelete.cards.length, 2);
-  assert.equal(afterExampleDelete.examples.length, 1);
-  assert.equal(afterExampleDelete.examples[0].example_id, cascadingExampleId);
-  assert.equal(afterExampleDelete.distractors.length, 1);
-  assert.equal(afterExampleDelete.distractors[0].example_id, cascadingExampleId);
+  const beforeCardDelete = await adminJson(ctx, "GET", `/v1/admin/decks/${deck.deck.id}/versions/${version.version.id}`);
+  assert.equal(beforeCardDelete.cards.length, 2);
+  assert.equal(beforeCardDelete.examples.length, 2);
+  assert.equal(beforeCardDelete.sentenceQuestions.length, 2);
+  assert.equal(beforeCardDelete.distractors.length, 2);
 
   const deletedCard = await adminJson(
     ctx,
@@ -1316,12 +1471,12 @@ test("admin can delete draft cards and examples with dependent content", async (
 
   const afterCardDelete = await adminJson(ctx, "GET", `/v1/admin/decks/${deck.deck.id}/versions/${version.version.id}`);
   assert.deepEqual(afterCardDelete.cards.map((card: any) => card.card_id), [keptCardId]);
-  assert.deepEqual(afterCardDelete.examples, []);
+  assert.deepEqual(afterCardDelete.examples.map((example: any) => example.sense_id), [keptSenseId]);
+  assert.deepEqual(afterCardDelete.sentenceQuestions.map((question: any) => question.sense_id), [keptSenseId]);
   assert.deepEqual(afterCardDelete.forms, []);
-  assert.deepEqual(afterCardDelete.distractors, []);
+  assert.deepEqual(afterCardDelete.distractors.map((distractor: any) => distractor.sense_id), [keptSenseId]);
 
   await adminJson(ctx, "DELETE", `/v1/admin/decks/${deck.deck.id}/versions/${version.version.id}/cards/${deletedCardId}`, undefined, 404);
-  await adminJson(ctx, "DELETE", `/v1/admin/decks/${deck.deck.id}/versions/${version.version.id}/examples/${deletedExampleId}`, undefined, 404);
 
   await adminJson(ctx, "POST", `/v1/admin/decks/${deck.deck.id}/publish`, {
     versionId: version.version.id,
@@ -1334,7 +1489,8 @@ test("admin can delete draft cards and examples with dependent content", async (
   const bootstrap = await syncJson(ctx, "GET", "/v1/bootstrap", learner.token, undefined, learner.userId);
   assert.equal(bootstrap.content.cards.length, 1);
   assert.equal(bootstrap.content.cards[0].card_id, keptCardId);
-  assert.deepEqual(bootstrap.content.examples, []);
+  assert.deepEqual(bootstrap.content.examples.map((example: any) => example.sense_id), [keptSenseId]);
+  assert.deepEqual(bootstrap.content.sentenceQuestions.map((question: any) => question.sense_id), [keptSenseId]);
 });
 
 test("admin can delete draft deck versions and orphan local media", async (t) => {
@@ -1354,6 +1510,7 @@ test("admin can delete draft deck versions and orphan local media", async (t) =>
   }, 201);
   const draftVersionId = draft.version.id;
   const draftCardId = randomUUID();
+  const draftSenseId = randomUUID();
   const draftAudio = await uploadLocalMedia(ctx, "draft-word.mp3", "audio/mpeg", Buffer.from("draft audio"));
   const orphanAudio = await uploadLocalMedia(ctx, "orphan-word.mp3", "audio/mpeg", Buffer.from("orphan audio"));
   const retainedAvatar = await uploadLocalMedia(ctx, "retained-avatar.jpg", "image/jpeg", Buffer.from("avatar"));
@@ -1364,9 +1521,12 @@ test("admin can delete draft deck versions and orphan local media", async (t) =>
   await adminJson(ctx, "PUT", `/v1/admin/decks/${deck.deckId}/versions/${draftVersionId}/cards/${draftCardId}`, {
     lemma: "draft",
     displayWord: "draft",
-    translation: "черновик",
+    primarySenseId: draftSenseId,
     audioWordMediaId: draftAudio.id,
     sortOrder: 1,
+  });
+  await adminJson(ctx, "PUT", `/v1/admin/decks/${deck.deckId}/versions/${draftVersionId}/cards/${draftCardId}/senses/${draftSenseId}`, {
+    translation: "черновик",
   });
 
   const versionsBefore = await adminJson(ctx, "GET", `/v1/admin/decks/${deck.deckId}/versions`);
@@ -1501,8 +1661,34 @@ test("admin can prune old deck versions and only their orphaned media", async (t
     {
       lemma: "pedir",
       displayWord: "pido v2",
-      translation: "I order, refreshed",
+      primarySenseId: deck.senseIds[0],
       sortOrder: 1,
+    },
+  );
+  await adminJson(
+    ctx,
+    "PUT",
+    `/v1/admin/decks/${deck.deckId}/versions/${secondVersion.version.id}/cards/${deck.cardIds[0]}/senses/${deck.senseIds[0]}`,
+    {
+      translation: "I order, refreshed",
+    },
+  );
+  await adminJson(
+    ctx,
+    "PUT",
+    `/v1/admin/decks/${deck.deckId}/versions/${secondVersion.version.id}/cards/${deck.cardIds[0]}/senses/${deck.senseIds[0]}/example`,
+    {
+      text: "Yo pido agua.",
+      translation: "I order water.",
+    },
+  );
+  await adminJson(
+    ctx,
+    "PUT",
+    `/v1/admin/decks/${deck.deckId}/versions/${secondVersion.version.id}/cards/${deck.cardIds[0]}/senses/${deck.senseIds[0]}/sentence-question`,
+    {
+      template: "Yo {{blank}} agua.",
+      answer: "pido",
     },
   );
   await adminJson(ctx, "POST", `/v1/admin/decks/${deck.deckId}/publish`, {
@@ -1588,18 +1774,34 @@ test("admin can remove a published card by publishing a new draft version withou
     lemma: "pedir",
     displayWord: "pido",
     partOfSpeech: "verb",
-    translation: "I order",
-    shortDefinition: "First-person cafe ordering phrase.",
+    primarySenseId: deck.senseIds[0],
     sortOrder: 1,
   });
   await adminJson(
     ctx,
     "PUT",
-    `/v1/admin/decks/${deck.deckId}/versions/${nextVersionId}/cards/${keptCardId}/examples/${randomUUID()}`,
+    `/v1/admin/decks/${deck.deckId}/versions/${nextVersionId}/cards/${keptCardId}/senses/${deck.senseIds[0]}`,
+    {
+      translation: "I order",
+    },
+  );
+  await adminJson(
+    ctx,
+    "PUT",
+    `/v1/admin/decks/${deck.deckId}/versions/${nextVersionId}/cards/${keptCardId}/senses/${deck.senseIds[0]}/example`,
+    {
+      text: "Yo pido agua.",
+      translation: "I order water.",
+      sortOrder: 1,
+    },
+  );
+  await adminJson(
+    ctx,
+    "PUT",
+    `/v1/admin/decks/${deck.deckId}/versions/${nextVersionId}/cards/${keptCardId}/senses/${deck.senseIds[0]}/sentence-question`,
     {
       template: "Yo {{blank}} agua.",
       answer: "pido",
-      translation: "I order water.",
       sortOrder: 1,
     },
   );
@@ -1625,6 +1827,8 @@ test("admin can remove a published card by publishing a new draft version withou
   assert.notEqual(changes.content.cards[0].card_id, removedCardId);
   assert.equal(changes.content.examples.length, 1);
   assert.equal(changes.content.examples[0].card_id, keptCardId);
+  assert.equal(changes.content.sentenceQuestions.length, 1);
+  assert.equal(changes.content.sentenceQuestions[0].card_id, keptCardId);
 
   const refreshed = await syncJson(ctx, "GET", "/v1/bootstrap", learner.token, undefined, learner.userId);
   assert.equal(refreshed.assignments[0].version_number, 2);
@@ -1638,7 +1842,7 @@ test("admin can edit published card content through a new version while preservi
   const learner = await createUser(ctx, "Version Edit Learner");
   const deck = await createPublishedDeck(ctx, learner.userId, "Versioned edit deck");
   const editedCardId = deck.cardIds[0];
-  const staleExampleId = deck.exampleIds[0];
+  const staleSenseId = deck.senseIds[0];
 
   await syncJson(ctx, "POST", "/v1/sync/events", learner.token, {
     progress: [
@@ -1666,36 +1870,43 @@ test("admin can edit published card content through a new version while preservi
     },
     400,
   );
-  await adminJson(
-    ctx,
-    "DELETE",
-    `/v1/admin/decks/${deck.deckId}/versions/${deck.versionId}/examples/${staleExampleId}`,
-    undefined,
-    400,
-  );
-
   const nextVersion = await adminJson(ctx, "POST", `/v1/admin/decks/${deck.deckId}/versions`, {
     manifest: { source: "edit-card-refresh" },
   }, 201);
   const nextVersionId = nextVersion.version.id;
-  const newExampleId = randomUUID();
   await adminJson(ctx, "PUT", `/v1/admin/decks/${deck.deckId}/versions/${nextVersionId}/cards/${editedCardId}`, {
     status: "active",
     lemma: "pedir",
     displayWord: "pido actualizado",
     partOfSpeech: "verb",
-    translation: "I order, updated",
-    shortDefinition: "Updated first-person ordering phrase.",
+    primarySenseId: deck.senseIds[0],
     sortOrder: 1,
   });
   await adminJson(
     ctx,
     "PUT",
-    `/v1/admin/decks/${deck.deckId}/versions/${nextVersionId}/cards/${editedCardId}/examples/${newExampleId}`,
+    `/v1/admin/decks/${deck.deckId}/versions/${nextVersionId}/cards/${editedCardId}/senses/${deck.senseIds[0]}`,
+    {
+      translation: "I order, updated",
+    },
+  );
+  await adminJson(
+    ctx,
+    "PUT",
+    `/v1/admin/decks/${deck.deckId}/versions/${nextVersionId}/cards/${editedCardId}/senses/${deck.senseIds[0]}/example`,
+    {
+      text: "Yo pido una limonada.",
+      translation: "I order a lemonade.",
+      sortOrder: 1,
+    },
+  );
+  await adminJson(
+    ctx,
+    "PUT",
+    `/v1/admin/decks/${deck.deckId}/versions/${nextVersionId}/cards/${editedCardId}/senses/${deck.senseIds[0]}/sentence-question`,
     {
       template: "Yo {{blank}} una limonada.",
       answer: "pido",
-      translation: "I order a lemonade.",
       sortOrder: 1,
     },
   );
@@ -1715,8 +1926,8 @@ test("admin can edit published card content through a new version while preservi
   assert.equal(changes.content.cards.length, 1);
   assert.equal(changes.content.cards[0].card_id, editedCardId);
   assert.equal(changes.content.cards[0].display_word, "pido actualizado");
-  assert.deepEqual(changes.content.examples.map((example: any) => example.example_id), [newExampleId]);
-  assert.ok(!changes.content.examples.some((example: any) => example.example_id === staleExampleId));
+  assert.deepEqual(changes.content.examples.map((example: any) => example.sense_id), [staleSenseId]);
+  assert.deepEqual(changes.content.sentenceQuestions.map((question: any) => question.sense_id), [staleSenseId]);
   assert.deepEqual(changes.content.forms, []);
   assert.deepEqual(changes.content.distractors, []);
 
@@ -1735,7 +1946,7 @@ test("admin can edit published card content through a new version while preservi
       }),
     ],
   }, learner.userId);
-  assert.deepEqual(progressUpdate.progressCardIds, [editedCardId]);
+  assert.deepEqual(progressUpdate.progressSenseIds, [deck.senseIds[0]]);
 });
 
 test("admin can hide and restore a deck through assignment status without deleting history", async (t) => {
@@ -1782,8 +1993,8 @@ test("admin can hide and restore a deck through assignment status without deleti
   const archivedSync = await syncJson(ctx, "POST", "/v1/sync/events", learner.token, {
     progress: [progressEvent(deck)],
   }, learner.userId);
-  assert.deepEqual(archivedSync.progressCardIds, []);
-  assert.deepEqual(archivedSync.rejectedProgressCardIds, [deck.cardIds[0]]);
+  assert.deepEqual(archivedSync.progressSenseIds, []);
+  assert.deepEqual(archivedSync.rejectedProgressSenseIds, [deck.senseIds[0]]);
 
   const restored = await adminJson(ctx, "POST", `/v1/admin/decks/${deck.deckId}/assignments`, {
     userId: learner.userId,
@@ -1965,7 +2176,7 @@ test("admin can clone assignments, create a test learner, inspect state, and res
     testLearner.user.id,
   );
   assert.equal(syncResult.acceptedReviewIds.length, 1);
-  assert.deepEqual(syncResult.progressCardIds, [deck.cardIds[0]]);
+  assert.deepEqual(syncResult.progressSenseIds, [deck.senseIds[0]]);
   assert.deepEqual(syncResult.matchingRecordDeckIds, [deck.deckId]);
 
   const detail = await adminJson(ctx, "GET", `/v1/admin/users/${testLearner.user.id}`);
@@ -2135,6 +2346,7 @@ test("mobile sync supports user switching, idempotent reviews, progress updates,
         deckId: deck.deckId,
         deckVersionId: deck.versionId,
         cardId: deck.cardIds[0],
+        senseId: deck.senseIds[0],
         mode: "flashcards",
         outcome: "remembered",
         source: "today_queue",
@@ -2151,6 +2363,7 @@ test("mobile sync supports user switching, idempotent reviews, progress updates,
     progress: [
       {
         cardId: deck.cardIds[0],
+        senseId: deck.senseIds[0],
         deckId: deck.deckId,
         fsrsData: { state: "review", reps: 1, due: dueAt },
         dueAt,
@@ -2184,7 +2397,7 @@ test("mobile sync supports user switching, idempotent reviews, progress updates,
   assert.deepEqual(firstSync.duplicateReviewIds, []);
   assert.deepEqual(firstSync.acceptedPracticeReviewIds, [practiceReviewId]);
   assert.deepEqual(firstSync.duplicatePracticeReviewIds, []);
-  assert.deepEqual(firstSync.progressCardIds, [deck.cardIds[0]]);
+  assert.deepEqual(firstSync.progressSenseIds, [deck.senseIds[0]]);
   assert.deepEqual(firstSync.matchingRecordDeckIds, [deck.deckId]);
   assert.deepEqual(firstSync.acceptedMatchingAttemptIds, [matchingAttemptId]);
 
@@ -2200,7 +2413,7 @@ test("mobile sync supports user switching, idempotent reviews, progress updates,
   assert.deepEqual(duplicateSync.duplicateReviewIds, [clientEventId]);
   assert.deepEqual(duplicateSync.acceptedPracticeReviewIds, []);
   assert.deepEqual(duplicateSync.duplicatePracticeReviewIds, [practiceReviewId]);
-  assert.deepEqual(duplicateSync.progressCardIds, []);
+  assert.deepEqual(duplicateSync.progressSenseIds, []);
   assert.deepEqual(duplicateSync.matchingRecordDeckIds, []);
   assert.deepEqual(duplicateSync.acceptedMatchingAttemptIds, []);
   assert.deepEqual(duplicateSync.duplicateMatchingAttemptIds, [matchingAttemptId]);
@@ -2211,7 +2424,7 @@ test("mobile sync supports user switching, idempotent reviews, progress updates,
       (SELECT COUNT(*) FROM study_reviews WHERE user_id = $1) AS review_count,
       (SELECT source FROM study_reviews WHERE user_id = $1 LIMIT 1) AS review_source,
       (SELECT COUNT(*) FROM practice_reviews WHERE user_id = $1) AS practice_review_count,
-      (SELECT COUNT(*) FROM card_progress WHERE user_id = $1) AS progress_count,
+      (SELECT COUNT(*) FROM sense_progress WHERE user_id = $1) AS progress_count,
       (SELECT COUNT(*) FROM deck_matching_records WHERE user_id = $1) AS matching_count,
       (SELECT COUNT(*) FROM matching_attempts WHERE user_id = $1) AS matching_attempt_count
     `,
@@ -2275,6 +2488,7 @@ test("mobile sync supports user switching, idempotent reviews, progress updates,
       progress: [
         {
           cardId: deck.cardIds[0],
+          senseId: deck.senseIds[0],
           deckId: deck.deckId,
           fsrsData: { state: "review", reps: 2, due: "2026-06-07T09:30:00.000Z" },
           dueAt: "2026-06-07T09:30:00.000Z",
@@ -2285,7 +2499,7 @@ test("mobile sync supports user switching, idempotent reviews, progress updates,
     },
     child.userId,
   );
-  assert.deepEqual(updatedProgress.progressCardIds, [deck.cardIds[0]]);
+  assert.deepEqual(updatedProgress.progressSenseIds, [deck.senseIds[0]]);
   assert.ok(BigInt(updatedProgress.serverRevision) > BigInt(firstSync.serverRevision));
 
   const worseMatchingRecord = await syncJson(
@@ -2390,6 +2604,7 @@ test("admin daily activity separates study, practice, and matching attempts", as
         deckId: deck.deckId,
         deckVersionId: deck.versionId,
         cardId: deck.cardIds[0],
+        senseId: deck.senseIds[0],
         mode: "clozeMultipleChoice",
         outcome: "correct",
         source: "today_practice",
@@ -2494,7 +2709,7 @@ test("sync validation rejects malformed payloads without partial writes", async 
     `
     SELECT
       (SELECT COUNT(*) FROM study_reviews) AS review_count,
-      (SELECT COUNT(*) FROM card_progress) AS progress_count,
+      (SELECT COUNT(*) FROM sense_progress) AS progress_count,
       (SELECT COUNT(*) FROM deck_matching_records) AS matching_count
     `,
   );
@@ -2538,6 +2753,7 @@ test("sync data is isolated for different users sharing the same deck", async (t
         deckId: sharedDeck.deckId,
         deckVersionId: sharedDeck.versionId,
         cardId: sharedDeck.cardIds[0],
+        senseId: sharedDeck.senseIds[0],
         mode: "recall",
         outcome: "forgot",
         reviewedAt: "2026-06-01T10:00:00.000Z",
@@ -2550,6 +2766,7 @@ test("sync data is isolated for different users sharing the same deck", async (t
     progress: [
       {
         cardId: sharedDeck.cardIds[0],
+        senseId: sharedDeck.senseIds[0],
         deckId: sharedDeck.deckId,
         fsrsData: { state: "learning", reps: 1, due: "2026-06-01T10:10:00.000Z" },
         dueAt: "2026-06-01T10:10:00.000Z",
@@ -2574,6 +2791,7 @@ test("sync data is isolated for different users sharing the same deck", async (t
         deckId: sharedDeck.deckId,
         deckVersionId: sharedDeck.versionId,
         cardId: sharedDeck.cardIds[1],
+        senseId: sharedDeck.senseIds[1],
         mode: "cloze_multiple_choice",
         outcome: "correct",
         reviewedAt: "2026-06-01T11:00:00.000Z",
@@ -2586,6 +2804,7 @@ test("sync data is isolated for different users sharing the same deck", async (t
     progress: [
       {
         cardId: sharedDeck.cardIds[1],
+        senseId: sharedDeck.senseIds[1],
         deckId: sharedDeck.deckId,
         fsrsData: { state: "review", reps: 1, due: "2026-06-04T11:00:00.000Z" },
         dueAt: "2026-06-04T11:00:00.000Z",
@@ -2668,6 +2887,7 @@ test("sync data is isolated for different users sharing the same deck", async (t
         deckId: sharedDeck.deckId,
         deckVersionId: sharedDeck.versionId,
         cardId: sharedDeck.cardIds[0],
+        senseId: sharedDeck.senseIds[0],
         mode: "flashcards",
         outcome: "remembered",
         reviewedAt: "2026-06-02T08:00:00.000Z",
@@ -2680,6 +2900,7 @@ test("sync data is isolated for different users sharing the same deck", async (t
     progress: [
       {
         cardId: sharedDeck.cardIds[0],
+        senseId: sharedDeck.senseIds[0],
         deckId: sharedDeck.deckId,
         fsrsData: { state: "review", reps: 2 },
         dueAt: "2026-06-06T08:00:00.000Z",
@@ -2698,7 +2919,7 @@ test("sync data is isolated for different users sharing the same deck", async (t
     ],
   }, bob.userId);
   assert.deepEqual(inactiveSync.rejectedReviewIds, [inactiveReviewId]);
-  assert.deepEqual(inactiveSync.rejectedProgressCardIds, [sharedDeck.cardIds[0]]);
+  assert.deepEqual(inactiveSync.rejectedProgressSenseIds, [sharedDeck.senseIds[0]]);
   assert.deepEqual(inactiveSync.rejectedMatchingRecordDeckIds, [sharedDeck.deckId]);
 });
 
@@ -2730,7 +2951,7 @@ test("sync rejects reviews, progress, and matching records for unassigned target
   const rejectedUnassignedProgress = await syncJson(ctx, "POST", "/v1/sync/events", unassignedLearner.token, {
     progress: [progressEvent(deck)],
   }, unassignedLearner.userId);
-  assert.deepEqual(rejectedUnassignedProgress.rejectedProgressCardIds, [deck.cardIds[0]]);
+  assert.deepEqual(rejectedUnassignedProgress.rejectedProgressSenseIds, [deck.senseIds[0]]);
 
   const rejectedUnassignedMatching = await syncJson(ctx, "POST", "/v1/sync/events", unassignedLearner.token, {
     matchingRecords: [matchingRecord(deck)],
@@ -2758,7 +2979,7 @@ test("sync rejects reviews, progress, and matching records for unassigned target
     `
     SELECT
       (SELECT COUNT(*) FROM study_reviews) AS review_count,
-      (SELECT COUNT(*) FROM card_progress) AS progress_count,
+      (SELECT COUNT(*) FROM sense_progress) AS progress_count,
       (SELECT COUNT(*) FROM deck_matching_records) AS matching_count
     `,
   );
@@ -2774,6 +2995,7 @@ test("sync target validation partially accepts a mixed batch with explicit rejec
   const learner = await createUser(ctx, "Atomic Validation Learner");
   const deck = await createPublishedDeck(ctx, learner.userId, "Atomic validation deck");
   const invalidCardId = randomUUID();
+  const invalidSenseId = randomUUID();
   const firstReviewId = randomUUID();
   const secondReviewId = randomUUID();
 
@@ -2786,6 +3008,7 @@ test("sync target validation partially accepts a mixed batch with explicit rejec
       reviewEvent(deck, {
         clientEventId: secondReviewId,
         cardId: deck.cardIds[1],
+        senseId: deck.senseIds[1],
       }),
     ],
     progress: [
@@ -2795,6 +3018,7 @@ test("sync target validation partially accepts a mixed batch with explicit rejec
       }),
       progressEvent(deck, {
         cardId: invalidCardId,
+        senseId: invalidSenseId,
         updatedAt: "2026-06-02T10:01:00.000Z",
       }),
     ],
@@ -2810,8 +3034,8 @@ test("sync target validation partially accepts a mixed batch with explicit rejec
 
   assert.deepEqual(result.acceptedReviewIds.sort(), [firstReviewId, secondReviewId].sort());
   assert.deepEqual(result.rejectedReviewIds, []);
-  assert.deepEqual(result.progressCardIds, [deck.cardIds[0]]);
-  assert.deepEqual(result.rejectedProgressCardIds, [invalidCardId]);
+  assert.deepEqual(result.progressSenseIds, [deck.senseIds[0]]);
+  assert.deepEqual(result.rejectedProgressSenseIds, [invalidSenseId]);
   assert.deepEqual(result.matchingRecordDeckIds, [deck.deckId]);
   assert.deepEqual(result.rejectedMatchingRecordDeckIds, []);
   assert.deepEqual(result.deckPreferenceDeckIds, [deck.deckId]);
@@ -2821,7 +3045,7 @@ test("sync target validation partially accepts a mixed batch with explicit rejec
     `
     SELECT
       (SELECT COUNT(*) FROM study_reviews WHERE user_id = $1) AS review_count,
-      (SELECT COUNT(*) FROM card_progress WHERE user_id = $1) AS progress_count,
+      (SELECT COUNT(*) FROM sense_progress WHERE user_id = $1) AS progress_count,
       (SELECT COUNT(*) FROM deck_matching_records WHERE user_id = $1) AS matching_count,
       (SELECT COUNT(*) FROM user_deck_preferences WHERE user_id = $1) AS preference_count
     `,
@@ -2961,7 +3185,7 @@ test("sync ignores stale progress updates for the same user and card", async (t)
       }),
     ],
   }, learner.userId);
-  assert.deepEqual(first.progressCardIds, [deck.cardIds[0]]);
+  assert.deepEqual(first.progressSenseIds, [deck.senseIds[0]]);
 
   const stale = await syncJson(ctx, "POST", "/v1/sync/events", learner.token, {
     progress: [
@@ -2973,16 +3197,16 @@ test("sync ignores stale progress updates for the same user and card", async (t)
       }),
     ],
   }, learner.userId);
-  assert.deepEqual(stale.progressCardIds, []);
+  assert.deepEqual(stale.progressSenseIds, []);
   assert.equal(stale.serverRevision, first.serverRevision);
 
   const progress = await ctx.pool.query(
     `
     SELECT fsrs_data, due_at, updated_at
-    FROM card_progress
-    WHERE user_id = $1 AND card_id = $2
+    FROM sense_progress
+    WHERE user_id = $1 AND sense_id = $2
     `,
-    [learner.userId, deck.cardIds[0]],
+    [learner.userId, deck.senseIds[0]],
   );
   assert.equal(progress.rowCount, 1);
   assert.equal(progress.rows[0].fsrs_data.reps, 2);
@@ -3013,6 +3237,7 @@ test("sync accepts iOS study mode names and stores canonical review modes", asyn
       reviewEvent(deck, {
         clientEventId: secondEventId,
         cardId: deck.cardIds[1],
+        senseId: deck.senseIds[1],
         mode: "clozeTyping",
         outcome: "incorrect",
       }),
@@ -3062,8 +3287,34 @@ test("deck assignments always follow the current published version", async (t) =
       status: "active",
       lemma: "pedir",
       displayWord: "pido v2",
-      translation: "I order, refreshed",
+      primarySenseId: deck.senseIds[0],
       sortOrder: 1,
+    },
+  );
+  await adminJson(
+    ctx,
+    "PUT",
+    `/v1/admin/decks/${deck.deckId}/versions/${secondVersion.version.id}/cards/${deck.cardIds[0]}/senses/${deck.senseIds[0]}`,
+    {
+      translation: "I order, refreshed",
+    },
+  );
+  await adminJson(
+    ctx,
+    "PUT",
+    `/v1/admin/decks/${deck.deckId}/versions/${secondVersion.version.id}/cards/${deck.cardIds[0]}/senses/${deck.senseIds[0]}/example`,
+    {
+      text: "Yo pido agua.",
+      translation: "I order water.",
+    },
+  );
+  await adminJson(
+    ctx,
+    "PUT",
+    `/v1/admin/decks/${deck.deckId}/versions/${secondVersion.version.id}/cards/${deck.cardIds[0]}/senses/${deck.senseIds[0]}/sentence-question`,
+    {
+      template: "Yo {{blank}} agua.",
+      answer: "pido",
     },
   );
   await adminJson(ctx, "POST", `/v1/admin/decks/${deck.deckId}/publish`, {
@@ -3108,18 +3359,21 @@ test("client-facing edge cases stay explicit and recoverable", async (t) => {
     manifest: { newCardsPerDay: 5, reviewCardsPerDay: 40 },
   }, 201);
   const cardId = randomUUID();
-  const exampleId = randomUUID();
+  const senseId = randomUUID();
 
   await adminJson(ctx, "PUT", `/v1/admin/decks/${deck.deck.id}/versions/${version.version.id}/cards/${cardId}`, {
     lemma: "reliable",
     displayWord: "reliable",
+    primarySenseId: senseId,
+  });
+  await adminJson(ctx, "PUT", `/v1/admin/decks/${deck.deck.id}/versions/${version.version.id}/cards/${cardId}/senses/${senseId}`, {
     translation: "надежный",
   });
 
   await adminJson(
     ctx,
     "PUT",
-    `/v1/admin/decks/${deck.deck.id}/versions/${version.version.id}/cards/${cardId}/examples/${exampleId}`,
+    `/v1/admin/decks/${deck.deck.id}/versions/${version.version.id}/cards/${cardId}/senses/${senseId}/sentence-question`,
     {
       template: "This sentence has no blank.",
       answer: "reliable",
@@ -3144,6 +3398,20 @@ test("client-facing edge cases stay explicit and recoverable", async (t) => {
   const pendingMedia = await ctx.pool.query("SELECT COUNT(*) FROM media_objects WHERE upload_status = 'pending'");
   assert.equal(Number(pendingMedia.rows[0].count), 0);
 
+  await adminJson(ctx, "PUT", `/v1/admin/decks/${deck.deck.id}/versions/${version.version.id}/cards/${cardId}/senses/${senseId}/example`, {
+    text: "This tool is reliable.",
+    translation: "Этот инструмент <b>надежный</b>.",
+  });
+  await adminJson(
+    ctx,
+    "PUT",
+    `/v1/admin/decks/${deck.deck.id}/versions/${version.version.id}/cards/${cardId}/senses/${senseId}/sentence-question`,
+    {
+      template: "This tool is {{blank}}.",
+      answer: "reliable",
+    },
+  );
+
   const firstPublish = await adminJson(ctx, "POST", `/v1/admin/decks/${deck.deck.id}/publish`, {
     versionId: version.version.id,
   });
@@ -3164,18 +3432,34 @@ test("client-facing edge cases stay explicit and recoverable", async (t) => {
     {
       lemma: "reliable",
       displayWord: "dependable",
-      translation: "надежный",
+      primarySenseId: senseId,
       sortOrder: 1,
     },
   );
   await adminJson(
     ctx,
     "PUT",
-    `/v1/admin/decks/${deck.deck.id}/versions/${secondVersion.version.id}/cards/${cardId}/examples/${randomUUID()}`,
+    `/v1/admin/decks/${deck.deck.id}/versions/${secondVersion.version.id}/cards/${cardId}/senses/${senseId}`,
+    {
+      translation: "надежный",
+    },
+  );
+  await adminJson(
+    ctx,
+    "PUT",
+    `/v1/admin/decks/${deck.deck.id}/versions/${secondVersion.version.id}/cards/${cardId}/senses/${senseId}/example`,
+    {
+      text: "The app feels dependable.",
+      translation: "Приложение ощущается надежным.",
+    },
+  );
+  await adminJson(
+    ctx,
+    "PUT",
+    `/v1/admin/decks/${deck.deck.id}/versions/${secondVersion.version.id}/cards/${cardId}/senses/${senseId}/sentence-question`,
     {
       template: "The app feels {{blank}}.",
       answer: "dependable",
-      translation: "Приложение ощущается надежным.",
     },
   );
   await adminJson(ctx, "POST", `/v1/admin/decks/${deck.deck.id}/publish`, {

@@ -1,4 +1,4 @@
-ALTER TABLE card_progress
+ALTER TABLE sense_progress
     ADD COLUMN IF NOT EXISTS modified_by_device_id uuid;
 
 ALTER TABLE study_reviews
