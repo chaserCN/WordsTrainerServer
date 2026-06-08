@@ -2353,6 +2353,7 @@ export async function registerAdminRoutes(
       const data = body(request.body);
       const template = requiredString(data.template, "template");
       const answer = requiredString(data.answer, "answer");
+      const translation = requiredString(data.translation, "translation");
       const answerFormKey = optionalString(data.answerFormKey, "answerFormKey");
       const audioAnswerMediaId = optionalUUID(data.audioAnswerMediaId, "audioAnswerMediaId");
       const sortOrder = optionalInteger(data.sortOrder, "sortOrder", 0);
@@ -2369,21 +2370,23 @@ export async function registerAdminRoutes(
           sense_id,
           template,
           answer,
+          translation,
           answer_form_key,
           audio_answer_media_id,
           sort_order
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
         ON CONFLICT (deck_version_id, sense_id) DO UPDATE SET
           card_id = excluded.card_id,
           template = excluded.template,
           answer = excluded.answer,
+          translation = excluded.translation,
           answer_form_key = excluded.answer_form_key,
           audio_answer_media_id = excluded.audio_answer_media_id,
           sort_order = excluded.sort_order
         RETURNING *
         `,
-        [versionId, cardId, senseId, template, answer, answerFormKey, audioAnswerMediaId, sortOrder],
+        [versionId, cardId, senseId, template, answer, translation, answerFormKey, audioAnswerMediaId, sortOrder],
       );
       return { sentenceQuestion: result.rows[0] };
     },

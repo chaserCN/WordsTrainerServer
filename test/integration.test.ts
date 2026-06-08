@@ -499,6 +499,7 @@ async function createMinimalDraftContent(
     {
       template: "The bridge is {{blank}}.",
       answer: "reliable",
+      translation: "The bridge is <b>reliable</b>.",
       answerFormKey: "base",
     },
   );
@@ -603,6 +604,7 @@ async function createPublishedDeck(ctx: TestApp, userId: string, title = "Spanis
     {
       template: "Yo {{blank}} un cafe.",
       answer: "pido",
+      translation: "I <b>order</b> a coffee.",
       answerFormKey: "present_yo",
       sortOrder: 1,
     },
@@ -614,6 +616,7 @@ async function createPublishedDeck(ctx: TestApp, userId: string, title = "Spanis
     {
       template: "La {{blank}}, por favor.",
       answer: "cuenta",
+      translation: "The <b>bill</b>, please.",
       sortOrder: 1,
     },
   );
@@ -1213,6 +1216,7 @@ test("admin publish rejects incomplete active sense content", async (t) => {
     {
       template: "The bridge is {{blank}}.",
       answer: "reliable",
+      translation: "The bridge is <b>reliable</b>.",
       answerFormKey: "base",
     },
   );
@@ -1425,6 +1429,7 @@ test("admin can delete draft cards with dependent sense content", async (t) => {
     {
       template: "I will {{blank}} this example.",
       answer: "keep",
+      translation: "I will <b>keep</b> this example.",
     },
   );
   await adminJson(
@@ -1434,6 +1439,7 @@ test("admin can delete draft cards with dependent sense content", async (t) => {
     {
       template: "Please {{blank}} this card.",
       answer: "remove",
+      translation: "Please <b>remove</b> this card.",
     },
   );
   await adminJson(ctx, "PUT", `/v1/admin/decks/${deck.deck.id}/versions/${version.version.id}/cards/${deletedCardId}/forms`, {
@@ -1689,6 +1695,7 @@ test("admin can prune old deck versions and only their orphaned media", async (t
     {
       template: "Yo {{blank}} agua.",
       answer: "pido",
+      translation: "I <b>order</b> water.",
     },
   );
   await adminJson(ctx, "POST", `/v1/admin/decks/${deck.deckId}/publish`, {
@@ -1802,6 +1809,7 @@ test("admin can remove a published card by publishing a new draft version withou
     {
       template: "Yo {{blank}} agua.",
       answer: "pido",
+      translation: "I <b>order</b> water.",
       sortOrder: 1,
     },
   );
@@ -1907,6 +1915,7 @@ test("admin can edit published card content through a new version while preservi
     {
       template: "Yo {{blank}} una limonada.",
       answer: "pido",
+      translation: "I <b>order</b> a lemonade.",
       sortOrder: 1,
     },
   );
@@ -3315,6 +3324,7 @@ test("deck assignments always follow the current published version", async (t) =
     {
       template: "Yo {{blank}} agua.",
       answer: "pido",
+      translation: "I <b>order</b> water.",
     },
   );
   await adminJson(ctx, "POST", `/v1/admin/decks/${deck.deckId}/publish`, {
@@ -3377,6 +3387,7 @@ test("client-facing edge cases stay explicit and recoverable", async (t) => {
     {
       template: "This sentence has no blank.",
       answer: "reliable",
+      translation: "This sentence has no <b>blank</b>.",
     },
     400,
   );
@@ -3409,6 +3420,7 @@ test("client-facing edge cases stay explicit and recoverable", async (t) => {
     {
       template: "This tool is {{blank}}.",
       answer: "reliable",
+      translation: "This tool is <b>reliable</b>.",
     },
   );
 
@@ -3460,6 +3472,7 @@ test("client-facing edge cases stay explicit and recoverable", async (t) => {
     {
       template: "The app feels {{blank}}.",
       answer: "dependable",
+      translation: "The app feels <b>dependable</b>.",
     },
   );
   await adminJson(ctx, "POST", `/v1/admin/decks/${deck.deck.id}/publish`, {

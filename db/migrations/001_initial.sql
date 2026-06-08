@@ -216,6 +216,7 @@ CREATE TABLE deck_version_sentence_questions (
     sense_id uuid NOT NULL,
     template text NOT NULL,
     answer text NOT NULL,
+    translation text NOT NULL,
     answer_form_key text,
     audio_answer_media_id uuid REFERENCES media_objects(id),
     sort_order integer NOT NULL DEFAULT 0,
