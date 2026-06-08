@@ -11,6 +11,7 @@ CREATE TYPE content_status AS ENUM ('active', 'inactive', 'archived');
 CREATE TYPE deck_version_status AS ENUM ('draft', 'published', 'archived');
 CREATE TYPE study_mode AS ENUM ('flashcards', 'recall', 'cloze_multiple_choice', 'cloze_typing', 'matching', 'matching_audio');
 CREATE TYPE review_outcome AS ENUM ('remembered', 'forgot', 'correct', 'incorrect');
+CREATE TYPE media_upload_status AS ENUM ('pending', 'ready', 'failed');
 
 CREATE TABLE media_objects (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -20,18 +21,34 @@ CREATE TABLE media_objects (
     byte_size bigint,
     width integer,
     height integer,
+    upload_status media_upload_status NOT NULL DEFAULT 'ready',
     created_at timestamptz NOT NULL DEFAULT now(),
     updated_at timestamptz NOT NULL DEFAULT now()
 );
 
+CREATE INDEX idx_media_objects_upload_status ON media_objects(upload_status);
+
 CREATE TABLE users (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     display_name text NOT NULL,
+    display_name_localized text NOT NULL,
+    grammatical_gender text NOT NULL DEFAULT 'neutral'
+        CHECK (grammatical_gender IN ('male', 'female', 'neutral')),
     avatar_media_id uuid REFERENCES media_objects(id),
     role app_role NOT NULL DEFAULT 'learner',
     created_at timestamptz NOT NULL DEFAULT now(),
     updated_at timestamptz NOT NULL DEFAULT now()
 );
+
+CREATE TABLE user_settings (
+    user_id uuid PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    random_card_count integer NOT NULL DEFAULT 30 CHECK (random_card_count BETWEEN 1 AND 200),
+    modified_by_device_id uuid,
+    server_revision bigint NOT NULL DEFAULT nextval('server_revision_seq'),
+    updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_user_settings_revision ON user_settings(server_revision);
 
 CREATE TABLE study_groups (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -80,18 +97,63 @@ ALTER TABLE decks
 CREATE INDEX idx_deck_versions_deck_status ON deck_versions(deck_id, status);
 CREATE INDEX idx_deck_versions_revision ON deck_versions(server_revision);
 
+CREATE TABLE user_deck_groups (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    title text NOT NULL CHECK (length(trim(title)) > 0),
+    sort_order integer NOT NULL DEFAULT 0,
+    server_revision bigint NOT NULL DEFAULT nextval('server_revision_seq'),
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (user_id, id),
+    UNIQUE (user_id, title)
+);
+
+CREATE INDEX idx_user_deck_groups_user_order
+    ON user_deck_groups(user_id, sort_order, title);
+
+CREATE INDEX idx_user_deck_groups_revision
+    ON user_deck_groups(server_revision);
+
 CREATE TABLE deck_assignments (
     user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     deck_id uuid NOT NULL REFERENCES decks(id) ON DELETE CASCADE,
     deck_version_id uuid REFERENCES deck_versions(id),
     status content_status NOT NULL DEFAULT 'active',
+    group_id uuid,
+    sort_order integer NOT NULL DEFAULT 0,
     server_revision bigint NOT NULL DEFAULT nextval('server_revision_seq'),
     assigned_at timestamptz NOT NULL DEFAULT now(),
     updated_at timestamptz NOT NULL DEFAULT now(),
-    PRIMARY KEY (user_id, deck_id)
+    PRIMARY KEY (user_id, deck_id),
+    CONSTRAINT fk_deck_assignments_user_group
+        FOREIGN KEY (user_id, group_id)
+        REFERENCES user_deck_groups(user_id, id)
+        ON DELETE SET NULL (group_id)
 );
 
 CREATE INDEX idx_deck_assignments_revision ON deck_assignments(server_revision);
+CREATE INDEX idx_deck_assignments_user_revision
+    ON deck_assignments(user_id, server_revision);
+CREATE INDEX idx_deck_assignments_user_group_order
+    ON deck_assignments(user_id, group_id, sort_order, deck_id);
+
+CREATE TABLE user_deck_preferences (
+    user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    deck_id uuid NOT NULL REFERENCES decks(id) ON DELETE CASCADE,
+    is_enabled boolean NOT NULL DEFAULT true,
+    modified_by_device_id uuid,
+    server_revision bigint NOT NULL DEFAULT nextval('server_revision_seq'),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (user_id, deck_id),
+    FOREIGN KEY (user_id, deck_id)
+        REFERENCES deck_assignments(user_id, deck_id)
+        ON DELETE CASCADE
+);
+
+CREATE INDEX idx_user_deck_preferences_revision ON user_deck_preferences(server_revision);
+CREATE INDEX idx_user_deck_preferences_user_revision
+    ON user_deck_preferences(user_id, server_revision);
 
 CREATE TABLE deck_version_cards (
     deck_version_id uuid NOT NULL REFERENCES deck_versions(id) ON DELETE CASCADE,
@@ -211,6 +273,7 @@ CREATE TABLE sense_progress (
 
 CREATE INDEX idx_sense_progress_user_due ON sense_progress(user_id, due_at);
 CREATE INDEX idx_sense_progress_revision ON sense_progress(server_revision);
+CREATE INDEX idx_sense_progress_user_revision ON sense_progress(user_id, server_revision);
 
 CREATE TABLE study_reviews (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -240,6 +303,7 @@ CREATE INDEX idx_study_reviews_deck_reviewed ON study_reviews(deck_id, reviewed_
 CREATE INDEX idx_study_reviews_card ON study_reviews(user_id, card_id);
 CREATE INDEX idx_study_reviews_sense ON study_reviews(user_id, sense_id);
 CREATE INDEX idx_study_reviews_revision ON study_reviews(server_revision);
+CREATE INDEX idx_study_reviews_user_revision ON study_reviews(user_id, server_revision);
 
 CREATE TABLE practice_reviews (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -266,6 +330,7 @@ CREATE INDEX idx_practice_reviews_deck_practiced ON practice_reviews(deck_id, pr
 CREATE INDEX idx_practice_reviews_card ON practice_reviews(user_id, card_id);
 CREATE INDEX idx_practice_reviews_sense ON practice_reviews(user_id, sense_id);
 CREATE INDEX idx_practice_reviews_revision ON practice_reviews(server_revision);
+CREATE INDEX idx_practice_reviews_user_revision ON practice_reviews(user_id, server_revision);
 
 CREATE TABLE deck_matching_records (
     user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -280,6 +345,8 @@ CREATE TABLE deck_matching_records (
 );
 
 CREATE INDEX idx_deck_matching_records_revision ON deck_matching_records(server_revision);
+CREATE INDEX idx_deck_matching_records_user_revision
+    ON deck_matching_records(user_id, server_revision);
 
 CREATE TABLE matching_attempts (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -302,6 +369,18 @@ CREATE TABLE matching_attempts (
 CREATE INDEX idx_matching_attempts_user_completed ON matching_attempts(user_id, completed_at);
 CREATE INDEX idx_matching_attempts_deck_completed ON matching_attempts(deck_id, completed_at);
 CREATE INDEX idx_matching_attempts_revision ON matching_attempts(server_revision);
+CREATE INDEX idx_matching_attempts_user_revision ON matching_attempts(user_id, server_revision);
+
+CREATE TABLE study_data_resets (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    deck_id uuid REFERENCES decks(id) ON DELETE CASCADE,
+    reset_at timestamptz NOT NULL DEFAULT now(),
+    server_revision bigint NOT NULL DEFAULT nextval('server_revision_seq')
+);
+
+CREATE INDEX idx_study_data_resets_user_revision
+    ON study_data_resets(user_id, server_revision);
 
 CREATE TABLE telegram_links (
     user_id uuid PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
