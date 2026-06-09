@@ -1624,7 +1624,7 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
       }
 
       for (const progress of validated.progressItems) {
-        const result = await client.query<{ sense_id: string }>(
+        await client.query<{ sense_id: string }>(
           `
           INSERT INTO sense_progress (
             user_id, sense_id, card_id, deck_id, fsrs_data, due_at, state, updated_at, modified_by_device_id
@@ -1663,9 +1663,11 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
             deviceId,
           ],
         );
-        if (result.rowCount) {
-          progressSenseIds.push(progress.senseId);
-        }
+        // Подтверждаем КАЖДЫЙ полученный progress, даже если апсерт был no-op
+        // (на сервере уже актуальная/более свежая версия). Иначе клиент не пометит
+        // событие синхронизированным и будет слать его бесконечно (while true в outbox).
+        // rowCount влияет только на server_revision (через nextval в SQL), а не на ack.
+        progressSenseIds.push(progress.senseId);
       }
 
       for (const record of validated.matchingRecords) {
