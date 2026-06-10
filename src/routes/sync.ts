@@ -275,7 +275,6 @@ async function assignedDeckRows(
 async function assignedContentRows(
   pool: Queryable,
   userId: string,
-  sinceRevision?: string,
   cachedDeckVersionIds: string[] = [],
 ): Promise<{
   cards: pg.QueryResult["rows"];
@@ -285,12 +284,11 @@ async function assignedContentRows(
   forms: pg.QueryResult["rows"];
   distractors: pg.QueryResult["rows"];
 }> {
+  // Content is synced by deck version (cachedDeckVersionIds), never by
+  // server_revision: a published version can have a revision below the
+  // client's cursor, so a revision filter would hide it permanently.
   const filters: string[] = [];
   const params: unknown[] = [userId];
-  if (sinceRevision) {
-    params.push(sinceRevision);
-    filters.push(`AND (deck_assignments.server_revision > $${params.length} OR deck_versions.server_revision > $${params.length})`);
-  }
   if (cachedDeckVersionIds.length) {
     params.push(cachedDeckVersionIds);
     filters.push(`AND NOT (deck_versions.id = ANY($${params.length}::uuid[]))`);
@@ -1283,7 +1281,7 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
       ] = userId
         ? [
             await assignedDeckRows(client, userId),
-            await assignedContentRows(client, userId, undefined, cachedVersions),
+            await assignedContentRows(client, userId, cachedVersions),
             { rows: await assignedMediaRows(client, userId, cachedVersions) },
             await client.query(
               `
@@ -1418,7 +1416,13 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
     ] = await Promise.all([
       allUserRows(pool),
       assignedDeckRows(pool, userId, sinceRevision, deviceId),
-      assignedContentRows(pool, userId, sinceRevision),
+      // Deck content syncs by version, not by revision: a deck version's
+      // server_revision can sit below the client's cursor (study events keep
+      // bumping the shared sequence), which made the revision filter hide a
+      // freshly published version forever. cachedDeckVersionIds is the correct
+      // criterion — send the current version of each assigned deck the client
+      // does not already have. This matches the bootstrap path.
+      assignedContentRows(pool, userId, cachedVersions),
       assignedMediaRows(pool, userId, cachedVersions),
       pool.query(
         `

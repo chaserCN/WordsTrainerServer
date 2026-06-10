@@ -2046,13 +2046,22 @@ test("learner deck preference syncs across devices without changing assignment",
   assert.equal(secondDeviceBootstrap.assignments[0].user_enabled, false);
   assert.equal(secondDeviceBootstrap.content.cards.length, 2);
 
-  const changes = await syncJson(
-    ctx,
-    "GET",
-    `/v1/sync/changes?sinceRevision=${firstDeviceBootstrap.serverRevision}`,
-    learner.token,
-    undefined,
-    learner.userId,
+  // The real client reports the deck versions it already has cached; content
+  // syncs by version, so an unchanged version is not re-sent even though the
+  // preference change bumped the revision.
+  const changesResponse = await ctx.app.inject({
+    method: "GET",
+    url: `/v1/sync/changes?sinceRevision=${firstDeviceBootstrap.serverRevision}`,
+    headers: {
+      authorization: `Bearer ${learner.token}`,
+      "x-flashgame-user-id": learner.userId,
+      "x-flashgame-cached-deck-version-ids": deck.versionId,
+    },
+  });
+  assert.equal(changesResponse.statusCode, 200, changesResponse.payload);
+  const changes = flattenSyncResponse(
+    "/v1/sync/changes",
+    JSON.parse(changesResponse.payload),
   );
   assert.equal(changes.assignments.length, 1);
   assert.equal(changes.assignments[0].assignment_status, "active");
