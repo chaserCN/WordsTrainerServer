@@ -214,9 +214,18 @@ async function assignedDeckRows(
   userId: string,
   sinceRevision?: string,
   excludingDeviceId?: string | null,
+  cachedDeckVersionIds: string[] = [],
 ): Promise<pg.QueryResult["rows"]> {
-  const revisionFilter = sinceRevision
-    ? `AND (
+  // The assignment must accompany the content it describes. Content is sent
+  // whenever the deck's current version is not cached by the client, so the
+  // assignment has to be sent under the same condition — otherwise the client
+  // receives content with no assignment to bind it to and discards it,
+  // re-downloading the same content on every sync.
+  const params: unknown[] = [userId];
+  const conditions: string[] = [];
+  if (sinceRevision) {
+    params.push(sinceRevision, excludingDeviceId ?? null);
+    conditions.push(`(
         deck_assignments.server_revision > $2
         OR deck_versions.server_revision > $2
         OR user_deck_groups.server_revision > $2
@@ -226,9 +235,13 @@ async function assignedDeckRows(
             OR user_deck_preferences.modified_by_device_id IS NULL
             OR user_deck_preferences.modified_by_device_id <> $3::uuid)
         )
-      )`
-    : "";
-  const params = sinceRevision ? [userId, sinceRevision, excludingDeviceId ?? null] : [userId];
+      )`);
+  }
+  if (cachedDeckVersionIds.length) {
+    params.push(cachedDeckVersionIds);
+    conditions.push(`(deck_versions.id IS NOT NULL AND NOT (deck_versions.id = ANY($${params.length}::uuid[])))`);
+  }
+  const revisionFilter = conditions.length ? `AND (${conditions.join("\n        OR ")})` : "";
   const result = await pool.query(
     `
     SELECT deck_assignments.user_id,
@@ -1415,7 +1428,7 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
       userSettings,
     ] = await Promise.all([
       allUserRows(pool),
-      assignedDeckRows(pool, userId, sinceRevision, deviceId),
+      assignedDeckRows(pool, userId, sinceRevision, deviceId, cachedVersions),
       // Deck content syncs by version, not by revision: a deck version's
       // server_revision can sit below the client's cursor (study events keep
       // bumping the shared sequence), which made the revision filter hide a

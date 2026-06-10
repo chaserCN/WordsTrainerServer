@@ -1851,6 +1851,7 @@ test("admin can edit published card content through a new version while preservi
   const deck = await createPublishedDeck(ctx, learner.userId, "Versioned edit deck");
   const editedCardId = deck.cardIds[0];
   const staleSenseId = deck.senseIds[0];
+  const originalVersionId = deck.versionId;
 
   await syncJson(ctx, "POST", "/v1/sync/events", learner.token, {
     progress: [
@@ -1956,6 +1957,28 @@ test("admin can edit published card content through a new version while preservi
     ],
   }, learner.userId);
   assert.deepEqual(progressUpdate.progressSenseIds, [deck.senseIds[0]]);
+
+  // Stuck-cursor scenario: the study event above pushed the cursor PAST v2's
+  // revision. A client that still has only the original version cached must
+  // still receive v2's content AND its assignment, even though the assignment's
+  // and version's revisions are now below the cursor — otherwise the content
+  // would arrive with no assignment to bind it to and be re-downloaded forever.
+  const cursorPastVersion = progressUpdate.serverRevision!;
+  const belowCursor = await ctx.app.inject({
+    method: "GET",
+    url: `/v1/sync/changes?sinceRevision=${cursorPastVersion}`,
+    headers: {
+      authorization: `Bearer ${learner.token}`,
+      "x-flashgame-user-id": learner.userId,
+      "x-flashgame-cached-deck-version-ids": originalVersionId,
+    },
+  });
+  assert.equal(belowCursor.statusCode, 200, belowCursor.payload);
+  const belowCursorChanges = flattenSyncResponse("/v1/sync/changes", JSON.parse(belowCursor.payload));
+  assert.equal(belowCursorChanges.assignments.length, 1);
+  assert.equal(belowCursorChanges.assignments[0].current_version_id, nextVersionId);
+  assert.equal(belowCursorChanges.content.cards.length, 1);
+  assert.equal(belowCursorChanges.content.cards[0].display_word, "pido actualizado");
 });
 
 test("admin can hide and restore a deck through assignment status without deleting history", async (t) => {
