@@ -131,6 +131,7 @@ function studyMode(value: unknown, field: string): string {
   case "matching_audio":
   case "cloze_multiple_choice":
   case "cloze_typing":
+  case "picture_choice":
     return mode;
   case "clozeMultipleChoice":
     return "cloze_multiple_choice";
@@ -138,6 +139,8 @@ function studyMode(value: unknown, field: string): string {
     return "cloze_typing";
   case "matchingAudio":
     return "matching_audio";
+  case "pictureChoice":
+    return "picture_choice";
   default:
     badRequest(`${field} must be a valid study mode`);
   }
@@ -153,8 +156,8 @@ function matchingAttemptMode(value: unknown, field: string): string {
 
 function practiceReviewMode(value: unknown, field: string): string {
   const mode = studyMode(value, field);
-  if (!["flashcards", "cloze_multiple_choice", "cloze_typing"].includes(mode)) {
-    badRequest(`${field} must be flashcards, cloze_multiple_choice, or cloze_typing`);
+  if (!["flashcards", "cloze_multiple_choice", "cloze_typing", "picture_choice"].includes(mode)) {
+    badRequest(`${field} must be flashcards, cloze_multiple_choice, cloze_typing, or picture_choice`);
   }
   return mode;
 }
