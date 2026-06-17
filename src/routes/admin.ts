@@ -1141,6 +1141,8 @@ export async function registerAdminRoutes(
           SELECT
             COUNT(*)::int AS total_count,
             COUNT(*) FILTER (WHERE outcome IN ('remembered', 'correct'))::int AS passed_count,
+            COUNT(*) FILTER (WHERE mode = 'picture_choice')::int AS picture_count,
+            COUNT(*) FILTER (WHERE mode = 'picture_choice' AND outcome IN ('remembered', 'correct'))::int AS picture_passed_count,
             COALESCE(SUM(duration_ms), 0)::bigint AS duration_ms,
             MIN(practiced_at) AS first_at,
             MAX(practiced_at) AS last_at
@@ -1186,6 +1188,8 @@ export async function registerAdminRoutes(
           study.duration_ms AS study_duration_ms,
           practice.total_count AS practice_review_count,
           practice.passed_count AS practice_passed_count,
+          practice.picture_count AS picture_choice_count,
+          practice.picture_passed_count AS picture_choice_passed_count,
           practice.duration_ms AS practice_duration_ms,
           matching.total_count AS matching_attempt_count,
           matching.columns_count AS matching_columns_count,
@@ -1241,6 +1245,10 @@ export async function registerAdminRoutes(
         columns: Number(row.matching_columns_count),
         audioColumns: Number(row.matching_audio_columns_count),
         pairsMatched: Number(row.matching_pair_count),
+      },
+      pictureChoices: {
+        total: Number(row.picture_choice_count),
+        passed: Number(row.picture_choice_passed_count),
       },
       studyTime: {
         totalSeconds: totalDurationSeconds,
