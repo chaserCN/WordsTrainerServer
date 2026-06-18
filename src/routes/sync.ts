@@ -120,6 +120,8 @@ type SyncTargetValidation = {
   rejectedMatchingRecordDeckIds: string[];
   rejectedMatchingAttemptIds: string[];
   rejectedDeckPreferenceDeckIds: string[];
+  rejectedReviewReasons: Record<string, string>;
+  rejectedPracticeReviewReasons: Record<string, string>;
 };
 
 function studyMode(value: unknown, field: string): string {
@@ -746,6 +748,21 @@ type ReviewTarget = {
   senseId: string;
 };
 
+type ReviewTargetValidation = {
+  deckVersionId: string | null;
+};
+
+type ReviewTargetDiagnostic = {
+  deck_id: string;
+  deck_version_id: string | null;
+  card_id: string;
+  sense_id: string;
+  active_assignment: boolean;
+  input_version_exists: boolean;
+  input_version_target_active: boolean;
+  current_target_active: boolean;
+};
+
 type ProgressTarget = {
   deckId: string;
   senseId: string;
@@ -796,6 +813,21 @@ function reviewTargetRows(
     card_id: target.cardId,
     sense_id: target.senseId,
   }));
+}
+
+function reviewTargetReason(row: ReviewTargetDiagnostic): string | null {
+  if (!row.active_assignment) {
+    return "inactive_or_unassigned_deck";
+  }
+  if (row.deck_version_id && row.input_version_exists) {
+    return row.input_version_target_active ? null : "card_or_sense_not_in_deck_version";
+  }
+  if (row.current_target_active) {
+    return null;
+  }
+  return row.deck_version_id
+    ? "deck_version_missing_and_card_or_sense_not_in_current_version"
+    : "card_or_sense_not_in_current_version";
 }
 
 function progressTargetRows(targets: ProgressTarget[]): Array<{ deck_id: string; card_id: string; sense_id: string }> {
@@ -859,21 +891,28 @@ async function validateSyncTargets(
   const rejectedMatchingRecordDeckIds: string[] = [];
   const rejectedMatchingAttemptIds: string[] = [];
   const rejectedDeckPreferenceDeckIds: string[] = [];
+  const rejectedReviewReasons: Record<string, string> = {};
+  const rejectedPracticeReviewReasons: Record<string, string> = {};
 
   for (const review of reviews) {
     const key = reviewTargetKey(review);
-    if (allowedReviewTargets.has(key)) {
-      acceptedReviews.push(review);
+    const validation = allowedReviewTargets.accepted.get(key);
+    if (validation) {
+      acceptedReviews.push({ ...review, deckVersionId: validation.deckVersionId });
     } else {
       rejectedReviewIds.push(review.clientEventId);
+      rejectedReviewReasons[review.clientEventId] = allowedReviewTargets.rejectedReasons.get(key) ?? "unknown_target";
     }
   }
   for (const review of practiceReviews) {
     const key = reviewTargetKey(review);
-    if (allowedPracticeReviewTargets.has(key)) {
-      acceptedPracticeReviews.push(review);
+    const validation = allowedPracticeReviewTargets.accepted.get(key);
+    if (validation) {
+      acceptedPracticeReviews.push({ ...review, deckVersionId: validation.deckVersionId });
     } else {
       rejectedPracticeReviewIds.push(review.clientEventId);
+      rejectedPracticeReviewReasons[review.clientEventId] =
+        allowedPracticeReviewTargets.rejectedReasons.get(key) ?? "unknown_target";
     }
   }
   for (const progress of progressItems) {
@@ -921,14 +960,119 @@ async function validateSyncTargets(
     rejectedMatchingRecordDeckIds,
     rejectedMatchingAttemptIds,
     rejectedDeckPreferenceDeckIds,
+    rejectedReviewReasons,
+    rejectedPracticeReviewReasons,
   };
+}
+
+async function reviewTargetValidation(
+  client: Queryable,
+  userId: string,
+  targets: ReviewTarget[],
+): Promise<{
+  accepted: Map<string, ReviewTargetValidation>;
+  rejectedReasons: Map<string, string>;
+}> {
+  const accepted = new Map<string, ReviewTargetValidation>();
+  const rejectedReasons = new Map<string, string>();
+  if (!targets.length) {
+    return { accepted, rejectedReasons };
+  }
+
+  const result = await client.query<ReviewTargetDiagnostic>(
+    `
+    WITH input_targets AS (
+      SELECT DISTINCT
+        deck_id::uuid AS deck_id,
+        deck_version_id::uuid AS deck_version_id,
+        card_id::uuid AS card_id,
+        sense_id::uuid AS sense_id
+      FROM jsonb_to_recordset($2::jsonb)
+        AS target(deck_id text, deck_version_id text, card_id text, sense_id text)
+    )
+    SELECT
+      input_targets.deck_id::text,
+      input_targets.deck_version_id::text,
+      input_targets.card_id::text,
+      input_targets.sense_id::text,
+      EXISTS (
+        SELECT 1
+        FROM deck_assignments
+        WHERE deck_assignments.user_id = $1
+          AND deck_assignments.deck_id = input_targets.deck_id
+          AND deck_assignments.status = 'active'
+      ) AS active_assignment,
+      EXISTS (
+        SELECT 1
+        FROM deck_versions
+        WHERE deck_versions.id = input_targets.deck_version_id
+          AND deck_versions.deck_id = input_targets.deck_id
+          AND deck_versions.status IN ('published', 'archived')
+      ) AS input_version_exists,
+      EXISTS (
+        SELECT 1
+        FROM deck_versions
+        JOIN deck_version_cards
+          ON deck_version_cards.deck_version_id = deck_versions.id
+          AND deck_version_cards.card_id = input_targets.card_id
+        JOIN deck_version_card_senses
+          ON deck_version_card_senses.deck_version_id = deck_versions.id
+          AND deck_version_card_senses.card_id = input_targets.card_id
+          AND deck_version_card_senses.sense_id = input_targets.sense_id
+          AND deck_version_card_senses.status = 'active'
+        WHERE deck_versions.id = input_targets.deck_version_id
+          AND deck_versions.deck_id = input_targets.deck_id
+          AND deck_versions.status IN ('published', 'archived')
+      ) AS input_version_target_active,
+      EXISTS (
+        SELECT 1
+        FROM decks
+        JOIN deck_versions
+          ON deck_versions.id = decks.current_version_id
+          AND deck_versions.status = 'published'
+        JOIN deck_version_cards
+          ON deck_version_cards.deck_version_id = deck_versions.id
+          AND deck_version_cards.card_id = input_targets.card_id
+        JOIN deck_version_card_senses
+          ON deck_version_card_senses.deck_version_id = deck_versions.id
+          AND deck_version_card_senses.card_id = input_targets.card_id
+          AND deck_version_card_senses.sense_id = input_targets.sense_id
+          AND deck_version_card_senses.status = 'active'
+        WHERE decks.id = input_targets.deck_id
+      ) AS current_target_active
+    FROM input_targets
+    `,
+    [userId, JSON.stringify(reviewTargetRows(targets))],
+  );
+
+  for (const row of result.rows) {
+    const key = reviewTargetKey({
+      deckId: row.deck_id,
+      deckVersionId: row.deck_version_id,
+      cardId: row.card_id,
+      senseId: row.sense_id,
+    });
+    const reason = reviewTargetReason(row);
+    if (reason) {
+      rejectedReasons.set(key, reason);
+      continue;
+    }
+    accepted.set(key, {
+      deckVersionId: row.deck_version_id && row.input_version_exists ? row.deck_version_id : null,
+    });
+  }
+
+  return { accepted, rejectedReasons };
 }
 
 async function allowedReviewTargetKeys(
   client: Queryable,
   userId: string,
   reviews: ReviewEventInput[],
-): Promise<Set<string>> {
+): Promise<{
+  accepted: Map<string, ReviewTargetValidation>;
+  rejectedReasons: Map<string, string>;
+}> {
   const targets = uniqueByKey(
     reviews.map((review) => ({
       deckId: review.deckId,
@@ -938,64 +1082,17 @@ async function allowedReviewTargetKeys(
     })),
     reviewTargetKey,
   );
-  if (!targets.length) {
-    return new Set();
-  }
-
-  const result = await client.query<{
-    deck_id: string;
-    deck_version_id: string | null;
-    card_id: string;
-    sense_id: string;
-  }>(
-    `
-    WITH input_targets AS (
-      SELECT DISTINCT
-        deck_id::uuid AS deck_id,
-        deck_version_id::uuid AS deck_version_id,
-        card_id::uuid AS card_id,
-        sense_id::uuid AS sense_id
-      FROM jsonb_to_recordset($2::jsonb)
-        AS target(deck_id text, deck_version_id text, card_id text, sense_id text)
-    )
-    SELECT input_targets.deck_id::text,
-           input_targets.deck_version_id::text,
-           input_targets.card_id::text,
-           input_targets.sense_id::text
-    FROM input_targets
-    JOIN deck_assignments
-      ON deck_assignments.user_id = $1
-      AND deck_assignments.deck_id = input_targets.deck_id
-      AND deck_assignments.status = 'active'
-    JOIN decks ON decks.id = deck_assignments.deck_id
-    JOIN deck_versions
-      ON deck_versions.id = decks.current_version_id
-      AND deck_versions.status = 'published'
-      AND (input_targets.deck_version_id IS NULL OR input_targets.deck_version_id = decks.current_version_id)
-    JOIN deck_version_cards
-      ON deck_version_cards.deck_version_id = deck_versions.id
-      AND deck_version_cards.card_id = input_targets.card_id
-    JOIN deck_version_card_senses
-      ON deck_version_card_senses.deck_version_id = deck_versions.id
-      AND deck_version_card_senses.card_id = input_targets.card_id
-      AND deck_version_card_senses.sense_id = input_targets.sense_id
-      AND deck_version_card_senses.status = 'active'
-    `,
-    [userId, JSON.stringify(reviewTargetRows(targets))],
-  );
-  return new Set(result.rows.map((row) => reviewTargetKey({
-    deckId: row.deck_id,
-    deckVersionId: row.deck_version_id,
-    cardId: row.card_id,
-    senseId: row.sense_id,
-  })));
+  return reviewTargetValidation(client, userId, targets);
 }
 
 async function allowedPracticeReviewTargetKeys(
   client: Queryable,
   userId: string,
   reviews: PracticeReviewInput[],
-): Promise<Set<string>> {
+): Promise<{
+  accepted: Map<string, ReviewTargetValidation>;
+  rejectedReasons: Map<string, string>;
+}> {
   const targets = uniqueByKey(
     reviews.map((review) => ({
       deckId: review.deckId,
@@ -1005,57 +1102,7 @@ async function allowedPracticeReviewTargetKeys(
     })),
     reviewTargetKey,
   );
-  if (!targets.length) {
-    return new Set();
-  }
-
-  const result = await client.query<{
-    deck_id: string;
-    deck_version_id: string | null;
-    card_id: string;
-    sense_id: string;
-  }>(
-    `
-    WITH input_targets AS (
-      SELECT DISTINCT
-        deck_id::uuid AS deck_id,
-        deck_version_id::uuid AS deck_version_id,
-        card_id::uuid AS card_id,
-        sense_id::uuid AS sense_id
-      FROM jsonb_to_recordset($2::jsonb)
-        AS target(deck_id text, deck_version_id text, card_id text, sense_id text)
-    )
-    SELECT input_targets.deck_id::text,
-           input_targets.deck_version_id::text,
-           input_targets.card_id::text,
-           input_targets.sense_id::text
-    FROM input_targets
-    JOIN deck_assignments
-      ON deck_assignments.user_id = $1
-      AND deck_assignments.deck_id = input_targets.deck_id
-      AND deck_assignments.status = 'active'
-    JOIN decks ON decks.id = deck_assignments.deck_id
-    JOIN deck_versions
-      ON deck_versions.id = decks.current_version_id
-      AND deck_versions.status = 'published'
-      AND (input_targets.deck_version_id IS NULL OR input_targets.deck_version_id = decks.current_version_id)
-    JOIN deck_version_cards
-      ON deck_version_cards.deck_version_id = deck_versions.id
-      AND deck_version_cards.card_id = input_targets.card_id
-    JOIN deck_version_card_senses
-      ON deck_version_card_senses.deck_version_id = deck_versions.id
-      AND deck_version_card_senses.card_id = input_targets.card_id
-      AND deck_version_card_senses.sense_id = input_targets.sense_id
-      AND deck_version_card_senses.status = 'active'
-    `,
-    [userId, JSON.stringify(reviewTargetRows(targets))],
-  );
-  return new Set(result.rows.map((row) => reviewTargetKey({
-    deckId: row.deck_id,
-    deckVersionId: row.deck_version_id,
-    cardId: row.card_id,
-    senseId: row.sense_id,
-  })));
+  return reviewTargetValidation(client, userId, targets);
 }
 
 async function allowedProgressTargetKeys(
@@ -1280,8 +1327,14 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
       const users = await allUserRows(client);
       const requestedUserId = selectedUserHeader(request);
       const requestedUserExists = requestedUserId && users.some((user) => user.id === requestedUserId);
-      const userId = requestedUserExists ? requestedUserId : users[0]?.id ?? null;
-      const cachedVersions = cachedDeckVersionIds(request);
+	      const userId = requestedUserExists ? requestedUserId : users[0]?.id ?? null;
+	      const cachedVersions = cachedDeckVersionIds(request);
+	      request.log.info({
+	        userId,
+	        requestedUserId: requestedUserId ?? null,
+	        requestedUserExists: Boolean(requestedUserExists),
+	        cachedDeckVersionCount: cachedVersions.length,
+	      }, "bootstrap sync requested");
 
       const [
         assignments,
@@ -1413,9 +1466,15 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
     if (consumeForceFullSync(userId)) {
       throw new HttpError(409, "full_sync_required", "Full sync is required for this user");
     }
-    const sinceRevision = parseRevision(request.query.sinceRevision).toString();
-    const deviceId = requestDeviceId(request.headers[clientDeviceIdHeader]);
-    const cachedVersions = cachedDeckVersionIds(request);
+	    const sinceRevision = parseRevision(request.query.sinceRevision).toString();
+	    const deviceId = requestDeviceId(request.headers[clientDeviceIdHeader]);
+	    const cachedVersions = cachedDeckVersionIds(request);
+	    request.log.info({
+	      userId,
+	      deviceId,
+	      sinceRevision,
+	      cachedDeckVersionCount: cachedVersions.length,
+	    }, "sync changes requested");
 
     const [
       users,
@@ -1806,6 +1865,8 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
         rejectedMatchingRecordCount: validated.rejectedMatchingRecordDeckIds.length,
         rejectedMatchingAttemptCount: validated.rejectedMatchingAttemptIds.length,
         rejectedDeckPreferenceCount: validated.rejectedDeckPreferenceDeckIds.length,
+        rejectedReviewReasons: validated.rejectedReviewReasons,
+        rejectedPracticeReviewReasons: validated.rejectedPracticeReviewReasons,
       }, "sync events accepted");
 
       return {
@@ -1830,6 +1891,8 @@ export async function registerSyncRoutes(app: FastifyInstance, pool: pg.Pool, co
           matchingRecordDeckIds: validated.rejectedMatchingRecordDeckIds,
           matchingAttemptIds: validated.rejectedMatchingAttemptIds,
           deckPreferenceDeckIds: validated.rejectedDeckPreferenceDeckIds,
+          reviewReasons: validated.rejectedReviewReasons,
+          practiceReviewReasons: validated.rejectedPracticeReviewReasons,
         },
         toRevision: await latestRevision(pool),
       };

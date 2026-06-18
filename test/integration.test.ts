@@ -391,6 +391,8 @@ function flattenSyncResponse(url: string, payload: any): any {
       rejectedMatchingRecordDeckIds: payload.rejected?.matchingRecordDeckIds ?? [],
       rejectedMatchingAttemptIds: payload.rejected?.matchingAttemptIds ?? [],
       rejectedDeckPreferenceDeckIds: payload.rejected?.deckPreferenceDeckIds ?? [],
+      rejectedReviewReasons: payload.rejected?.reviewReasons ?? {},
+      rejectedPracticeReviewReasons: payload.rejected?.practiceReviewReasons ?? {},
       serverRevision: payload.toRevision,
     };
   }
@@ -2454,7 +2456,7 @@ test("mobile sync supports user switching, idempotent reviews, progress updates,
   assert.deepEqual(duplicateSync.duplicateReviewIds, [clientEventId]);
   assert.deepEqual(duplicateSync.acceptedPracticeReviewIds, []);
   assert.deepEqual(duplicateSync.duplicatePracticeReviewIds, [practiceReviewId]);
-  assert.deepEqual(duplicateSync.progressSenseIds, []);
+  assert.deepEqual(duplicateSync.progressSenseIds, [deck.senseIds[0]]);
   assert.deepEqual(duplicateSync.matchingRecordDeckIds, []);
   assert.deepEqual(duplicateSync.acceptedMatchingAttemptIds, []);
   assert.deepEqual(duplicateSync.duplicateMatchingAttemptIds, [matchingAttemptId]);
@@ -3004,12 +3006,24 @@ test("sync rejects reviews, progress, and matching records for unassigned target
     reviews: [invalidCardReview],
   }, assignedLearner.userId);
   assert.deepEqual(rejectedInvalidCardReview.rejectedReviewIds, [invalidCardReview.clientEventId]);
+  assert.equal(
+    rejectedInvalidCardReview.rejectedReviewReasons[invalidCardReview.clientEventId],
+    "card_or_sense_not_in_deck_version",
+  );
 
-  const invalidVersionReview = reviewEvent(deck, { deckVersionId: randomUUID() });
+  const invalidVersionReview = reviewEvent(deck, {
+    deckVersionId: randomUUID(),
+    cardId: randomUUID(),
+    senseId: randomUUID(),
+  });
   const rejectedInvalidVersionReview = await syncJson(ctx, "POST", "/v1/sync/events", assignedLearner.token, {
     reviews: [invalidVersionReview],
   }, assignedLearner.userId);
   assert.deepEqual(rejectedInvalidVersionReview.rejectedReviewIds, [invalidVersionReview.clientEventId]);
+  assert.equal(
+    rejectedInvalidVersionReview.rejectedReviewReasons[invalidVersionReview.clientEventId],
+    "deck_version_missing_and_card_or_sense_not_in_current_version",
+  );
 
   const rejectedInvalidMatchingVersion = await syncJson(ctx, "POST", "/v1/sync/events", assignedLearner.token, {
     matchingRecords: [matchingRecord(deck, { deckVersionId: randomUUID() })],
@@ -3027,6 +3041,144 @@ test("sync rejects reviews, progress, and matching records for unassigned target
   assert.equal(Number(persistedStats.rows[0].review_count), 0);
   assert.equal(Number(persistedStats.rows[0].progress_count), 0);
   assert.equal(Number(persistedStats.rows[0].matching_count), 0);
+});
+
+test("sync accepts review history from previous or pruned deck versions when card ids are still current", async (t) => {
+  const ctx = await createTestApp(t);
+  if (!ctx) return;
+
+  const learner = await createUser(ctx, "Old Version Review Learner");
+  const deck = await createPublishedDeck(ctx, learner.userId, "Old version review deck");
+  const cardId = deck.cardIds[0];
+  const senseId = deck.senseIds[0];
+  const originalVersionId = deck.versionId;
+
+  const nextVersion = await adminJson(ctx, "POST", `/v1/admin/decks/${deck.deckId}/versions`, {
+    manifest: { source: "old-version-review-test" },
+  }, 201);
+  const nextVersionId = nextVersion.version.id;
+  await adminJson(ctx, "PUT", `/v1/admin/decks/${deck.deckId}/versions/${nextVersionId}/cards/${cardId}`, {
+    status: "active",
+    lemma: "pedir",
+    displayWord: "pido actualizado",
+    partOfSpeech: "verb",
+    primarySenseId: senseId,
+    sortOrder: 1,
+  });
+  await adminJson(ctx, "PUT", `/v1/admin/decks/${deck.deckId}/versions/${nextVersionId}/cards/${cardId}/senses/${senseId}`, {
+    status: "active",
+    translation: "I order, updated",
+    sortOrder: 1,
+  });
+  await adminJson(
+    ctx,
+    "PUT",
+    `/v1/admin/decks/${deck.deckId}/versions/${nextVersionId}/cards/${cardId}/senses/${senseId}/example`,
+    {
+      text: "Yo pido una limonada.",
+      translation: "I order a lemonade.",
+      sortOrder: 1,
+    },
+  );
+  await adminJson(
+    ctx,
+    "PUT",
+    `/v1/admin/decks/${deck.deckId}/versions/${nextVersionId}/cards/${cardId}/senses/${senseId}/sentence-question`,
+    {
+      template: "Yo {{blank}} una limonada.",
+      answer: "pido",
+      translation: "I <b>order</b> a lemonade.",
+      sortOrder: 1,
+    },
+  );
+  await adminJson(ctx, "POST", `/v1/admin/decks/${deck.deckId}/publish`, {
+    versionId: nextVersionId,
+  });
+
+  const oldReviewId = randomUUID();
+  const oldPracticeId = randomUUID();
+  const oldVersionSync = await syncJson(ctx, "POST", "/v1/sync/events", learner.token, {
+    reviews: [
+      reviewEvent(deck, {
+        clientEventId: oldReviewId,
+        deckVersionId: originalVersionId,
+        cardId,
+        senseId,
+      }),
+    ],
+    practiceReviews: [
+      practiceReviewEvent(deck, {
+        clientEventId: oldPracticeId,
+        deckVersionId: originalVersionId,
+        cardId,
+        senseId,
+      }),
+    ],
+  }, learner.userId);
+  assert.deepEqual(oldVersionSync.acceptedReviewIds, [oldReviewId]);
+  assert.deepEqual(oldVersionSync.acceptedPracticeReviewIds, [oldPracticeId]);
+  assert.deepEqual(oldVersionSync.rejectedReviewIds, []);
+  assert.deepEqual(oldVersionSync.rejectedPracticeReviewIds, []);
+
+  const storedBeforePrune = await ctx.pool.query(
+    `
+    SELECT
+      (SELECT deck_version_id FROM study_reviews WHERE client_event_id = $1) AS review_version_id,
+      (SELECT deck_version_id FROM practice_reviews WHERE client_event_id = $2) AS practice_version_id
+    `,
+    [oldReviewId, oldPracticeId],
+  );
+  assert.equal(storedBeforePrune.rows[0].review_version_id, originalVersionId);
+  assert.equal(storedBeforePrune.rows[0].practice_version_id, originalVersionId);
+
+  const pruned = await adminJson(ctx, "POST", `/v1/admin/decks/${deck.deckId}/prune-versions`, {
+    dryRun: false,
+    keepPublishedVersions: 1,
+    deleteDrafts: true,
+    deleteOrphanMedia: false,
+  });
+  assert.equal(pruned.dryRun, false);
+  assert.deepEqual(pruned.versions.map((version: any) => version.id), [originalVersionId]);
+
+  const prunedReviewId = randomUUID();
+  const prunedPracticeId = randomUUID();
+  const prunedVersionSync = await syncJson(ctx, "POST", "/v1/sync/events", learner.token, {
+    reviews: [
+      reviewEvent(deck, {
+        clientEventId: prunedReviewId,
+        deckVersionId: originalVersionId,
+        cardId,
+        senseId,
+      }),
+    ],
+    practiceReviews: [
+      practiceReviewEvent(deck, {
+        clientEventId: prunedPracticeId,
+        deckVersionId: originalVersionId,
+        cardId,
+        senseId,
+      }),
+    ],
+  }, learner.userId);
+  assert.deepEqual(prunedVersionSync.acceptedReviewIds, [prunedReviewId]);
+  assert.deepEqual(prunedVersionSync.acceptedPracticeReviewIds, [prunedPracticeId]);
+  assert.deepEqual(prunedVersionSync.rejectedReviewIds, []);
+  assert.deepEqual(prunedVersionSync.rejectedPracticeReviewIds, []);
+
+  const storedAfterPrune = await ctx.pool.query(
+    `
+    SELECT
+      (SELECT COUNT(*) FROM study_reviews WHERE user_id = $1) AS review_count,
+      (SELECT COUNT(*) FROM practice_reviews WHERE user_id = $1) AS practice_review_count,
+      (SELECT deck_version_id FROM study_reviews WHERE client_event_id = $2) AS pruned_review_version_id,
+      (SELECT deck_version_id FROM practice_reviews WHERE client_event_id = $3) AS pruned_practice_version_id
+    `,
+    [learner.userId, prunedReviewId, prunedPracticeId],
+  );
+  assert.equal(Number(storedAfterPrune.rows[0].review_count), 2);
+  assert.equal(Number(storedAfterPrune.rows[0].practice_review_count), 2);
+  assert.equal(storedAfterPrune.rows[0].pruned_review_version_id, null);
+  assert.equal(storedAfterPrune.rows[0].pruned_practice_version_id, null);
 });
 
 test("sync target validation partially accepts a mixed batch with explicit rejected ids", async (t) => {
@@ -3238,7 +3390,7 @@ test("sync ignores stale progress updates for the same user and card", async (t)
       }),
     ],
   }, learner.userId);
-  assert.deepEqual(stale.progressSenseIds, []);
+  assert.deepEqual(stale.progressSenseIds, [deck.senseIds[0]]);
   assert.equal(stale.serverRevision, first.serverRevision);
 
   const progress = await ctx.pool.query(
