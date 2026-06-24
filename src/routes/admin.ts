@@ -1151,12 +1151,12 @@ export async function registerAdminRoutes(
             AND to_char((practiced_at AT TIME ZONE $2) - interval '4 hours', 'YYYY-MM-DD') = $3
         ),
         card_reviews AS (
-          SELECT card_id, outcome
+          SELECT card_id, mode, outcome
           FROM study_reviews
           WHERE user_id = $1
             AND to_char((reviewed_at AT TIME ZONE $2) - interval '4 hours', 'YYYY-MM-DD') = $3
           UNION ALL
-          SELECT card_id, outcome
+          SELECT card_id, mode, outcome
           FROM practice_reviews
           WHERE user_id = $1
             AND to_char((practiced_at AT TIME ZONE $2) - interval '4 hours', 'YYYY-MM-DD') = $3
@@ -1165,6 +1165,12 @@ export async function registerAdminRoutes(
           SELECT
             COUNT(DISTINCT card_id)::int AS total_count,
             COUNT(DISTINCT card_id) FILTER (WHERE outcome IN ('remembered', 'correct'))::int AS passed_count
+          FROM card_reviews
+        ),
+        writing AS (
+          SELECT
+            COUNT(*) FILTER (WHERE mode IN ('cloze_typing', 'translation_typing'))::int AS total_count,
+            COUNT(*) FILTER (WHERE mode IN ('cloze_typing', 'translation_typing') AND outcome IN ('remembered', 'correct'))::int AS passed_count
           FROM card_reviews
         ),
         matching AS (
@@ -1188,6 +1194,8 @@ export async function registerAdminRoutes(
           study.duration_ms AS study_duration_ms,
           practice.total_count AS practice_review_count,
           practice.passed_count AS practice_passed_count,
+          writing.total_count AS writing_exercise_count,
+          writing.passed_count AS writing_exercise_passed_count,
           practice.picture_count AS picture_choice_count,
           practice.picture_passed_count AS picture_choice_passed_count,
           practice.duration_ms AS practice_duration_ms,
@@ -1206,7 +1214,7 @@ export async function registerAdminRoutes(
             COALESCE(practice.last_at, '-infinity'::timestamptz),
             COALESCE(matching.last_at, '-infinity'::timestamptz)
           ) AS last_activity_at
-        FROM study, practice, unique_cards, matching
+        FROM study, practice, unique_cards, writing, matching
         `,
         [userId, timeZone, dayKey],
       ),
@@ -1249,6 +1257,10 @@ export async function registerAdminRoutes(
       pictureChoices: {
         total: Number(row.picture_choice_count),
         passed: Number(row.picture_choice_passed_count),
+      },
+      writingExercises: {
+        total: Number(row.writing_exercise_count),
+        passed: Number(row.writing_exercise_passed_count),
       },
       studyTime: {
         totalSeconds: totalDurationSeconds,

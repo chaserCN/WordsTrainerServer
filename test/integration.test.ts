@@ -2640,6 +2640,16 @@ test("admin daily activity separates study, practice, and matching attempts", as
         previousState: "review",
         newState: "review",
       }),
+      reviewEvent(deck, {
+        clientEventId: randomUUID(),
+        cardId: deck.cardIds[1],
+        senseId: deck.senseIds[1],
+        mode: "clozeTyping",
+        outcome: "correct",
+        source: "today_queue",
+        reviewedAt: "2026-06-01T09:40:00.000Z",
+        durationMs: 1600,
+      }),
     ],
     practiceReviews: [
       {
@@ -2653,6 +2663,18 @@ test("admin daily activity separates study, practice, and matching attempts", as
         source: "today_practice",
         practicedAt: "2026-06-01T10:00:00.000Z",
         durationMs: 900,
+      },
+      {
+        clientEventId: randomUUID(),
+        deckId: deck.deckId,
+        deckVersionId: deck.versionId,
+        cardId: deck.cardIds[1],
+        senseId: deck.senseIds[1],
+        mode: "translationTyping",
+        outcome: "incorrect",
+        source: "today_practice",
+        practicedAt: "2026-06-01T10:01:00.000Z",
+        durationMs: 1100,
       },
     ],
     matchingAttempts: [
@@ -2677,12 +2699,13 @@ test("admin daily activity separates study, practice, and matching attempts", as
   assert.equal(activity.active, true);
   assert.equal(activity.user.display_name_localized, "Даша");
   assert.equal(activity.user.grammatical_gender, "female");
-  assert.deepEqual(activity.uniqueCards, { total: 1, passed: 1 });
-  assert.deepEqual(activity.cardReviews, { total: 3, passed: 2 });
+  assert.deepEqual(activity.uniqueCards, { total: 2, passed: 2 });
+  assert.deepEqual(activity.cardReviews, { total: 5, passed: 3 });
   assert.equal(activity.studyReviews, undefined);
   assert.equal(activity.practiceReviews, undefined);
   assert.deepEqual(activity.matchingAttempts, { total: 1, columns: 0, audioColumns: 1, pairsMatched: 2 });
-  assert.deepEqual(activity.studyTime, { totalSeconds: 28, text: "28 сек" });
+  assert.deepEqual(activity.writingExercises, { total: 2, passed: 1 });
+  assert.deepEqual(activity.studyTime, { totalSeconds: 30, text: "30 сек" });
   assert.equal(activity.firstActivityAt, "2026-06-01T09:30:00.000Z");
   assert.equal(activity.lastActivityAt, "2026-06-01T10:05:00.000Z");
 
@@ -2697,6 +2720,7 @@ test("admin daily activity separates study, practice, and matching attempts", as
   assert.equal(emptyActivity.studyReviews, undefined);
   assert.equal(emptyActivity.practiceReviews, undefined);
   assert.deepEqual(emptyActivity.matchingAttempts, { total: 0, columns: 0, audioColumns: 0, pairsMatched: 0 });
+  assert.deepEqual(emptyActivity.writingExercises, { total: 0, passed: 0 });
   assert.deepEqual(emptyActivity.studyTime, { totalSeconds: 0, text: "0 сек" });
 });
 
@@ -3419,6 +3443,7 @@ test("sync accepts iOS study mode names and stores canonical review modes", asyn
   const deck = await createPublishedDeck(ctx, learner.userId, "Mode compatibility deck");
   const firstEventId = randomUUID();
   const secondEventId = randomUUID();
+  const thirdEventId = randomUUID();
 
   const result = await syncJson(ctx, "POST", "/v1/sync/events", learner.token, {
     reviews: [
@@ -3434,9 +3459,14 @@ test("sync accepts iOS study mode names and stores canonical review modes", asyn
         mode: "clozeTyping",
         outcome: "incorrect",
       }),
+      reviewEvent(deck, {
+        clientEventId: thirdEventId,
+        mode: "translationTyping",
+        outcome: "correct",
+      }),
     ],
   }, learner.userId);
-  assert.deepEqual(result.acceptedReviewIds.sort(), [firstEventId, secondEventId].sort());
+  assert.deepEqual(result.acceptedReviewIds.sort(), [firstEventId, secondEventId, thirdEventId].sort());
 
   const stored = await ctx.pool.query(
     `
@@ -3454,6 +3484,7 @@ test("sync accepts iOS study mode names and stores canonical review modes", asyn
     [
       { id: firstEventId, mode: "cloze_multiple_choice", outcome: "correct" },
       { id: secondEventId, mode: "cloze_typing", outcome: "incorrect" },
+      { id: thirdEventId, mode: "translation_typing", outcome: "correct" },
     ].sort((left, right) => left.id.localeCompare(right.id)),
   );
 });
