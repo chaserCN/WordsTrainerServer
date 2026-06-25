@@ -2703,6 +2703,8 @@ test("admin daily activity separates study, practice, and matching attempts", as
   assert.deepEqual(activity.cardReviews, { total: 5, passed: 3 });
   assert.equal(activity.studyReviews, undefined);
   assert.equal(activity.practiceReviews, undefined);
+  assert.deepEqual(activity.flashcards, { total: 2, passed: 1 });
+  assert.deepEqual(activity.sentences, { total: 1, passed: 1 });
   assert.deepEqual(activity.matchingAttempts, { total: 1, columns: 0, audioColumns: 1, pairsMatched: 2 });
   assert.deepEqual(activity.writingExercises, { total: 2, passed: 1 });
   assert.deepEqual(activity.studyTime, { totalSeconds: 30, text: "30 сек" });
@@ -2719,6 +2721,8 @@ test("admin daily activity separates study, practice, and matching attempts", as
   assert.deepEqual(emptyActivity.cardReviews, { total: 0, passed: 0 });
   assert.equal(emptyActivity.studyReviews, undefined);
   assert.equal(emptyActivity.practiceReviews, undefined);
+  assert.deepEqual(emptyActivity.flashcards, { total: 0, passed: 0 });
+  assert.deepEqual(emptyActivity.sentences, { total: 0, passed: 0 });
   assert.deepEqual(emptyActivity.matchingAttempts, { total: 0, columns: 0, audioColumns: 0, pairsMatched: 0 });
   assert.deepEqual(emptyActivity.writingExercises, { total: 0, passed: 0 });
   assert.deepEqual(emptyActivity.studyTime, { totalSeconds: 0, text: "0 сек" });

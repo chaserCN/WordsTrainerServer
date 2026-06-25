@@ -1167,6 +1167,18 @@ export async function registerAdminRoutes(
             COUNT(DISTINCT card_id) FILTER (WHERE outcome IN ('remembered', 'correct'))::int AS passed_count
           FROM card_reviews
         ),
+        flashcards AS (
+          SELECT
+            COUNT(*) FILTER (WHERE mode IN ('flashcards', 'flashcards_reverse'))::int AS total_count,
+            COUNT(*) FILTER (WHERE mode IN ('flashcards', 'flashcards_reverse') AND outcome IN ('remembered', 'correct'))::int AS passed_count
+          FROM card_reviews
+        ),
+        sentences AS (
+          SELECT
+            COUNT(*) FILTER (WHERE mode IN ('cloze_multiple_choice', 'cloze_multiple_choice_reverse'))::int AS total_count,
+            COUNT(*) FILTER (WHERE mode IN ('cloze_multiple_choice', 'cloze_multiple_choice_reverse') AND outcome IN ('remembered', 'correct'))::int AS passed_count
+          FROM card_reviews
+        ),
         writing AS (
           SELECT
             COUNT(*) FILTER (WHERE mode IN ('cloze_typing', 'translation_typing'))::int AS total_count,
@@ -1194,6 +1206,10 @@ export async function registerAdminRoutes(
           study.duration_ms AS study_duration_ms,
           practice.total_count AS practice_review_count,
           practice.passed_count AS practice_passed_count,
+          flashcards.total_count AS flashcard_count,
+          flashcards.passed_count AS flashcard_passed_count,
+          sentences.total_count AS sentence_count,
+          sentences.passed_count AS sentence_passed_count,
           writing.total_count AS writing_exercise_count,
           writing.passed_count AS writing_exercise_passed_count,
           practice.picture_count AS picture_choice_count,
@@ -1214,7 +1230,7 @@ export async function registerAdminRoutes(
             COALESCE(practice.last_at, '-infinity'::timestamptz),
             COALESCE(matching.last_at, '-infinity'::timestamptz)
           ) AS last_activity_at
-        FROM study, practice, unique_cards, writing, matching
+        FROM study, practice, unique_cards, flashcards, sentences, writing, matching
         `,
         [userId, timeZone, dayKey],
       ),
@@ -1247,6 +1263,14 @@ export async function registerAdminRoutes(
       cardReviews: {
         total: cardReviewCount,
         passed: studyPassedCount + practicePassedCount,
+      },
+      flashcards: {
+        total: Number(row.flashcard_count),
+        passed: Number(row.flashcard_passed_count),
+      },
+      sentences: {
+        total: Number(row.sentence_count),
+        passed: Number(row.sentence_passed_count),
       },
       matchingAttempts: {
         total: matchingAttemptCount,
