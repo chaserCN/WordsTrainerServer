@@ -128,16 +128,22 @@ function studyMode(value: unknown, field: string): string {
   const mode = requiredString(value, field);
   switch (mode) {
   case "flashcards":
+  case "flashcards_reverse":
   case "recall":
   case "matching":
   case "matching_audio":
   case "cloze_multiple_choice":
+  case "cloze_multiple_choice_reverse":
   case "cloze_typing":
   case "translation_typing":
   case "picture_choice":
     return mode;
+  case "flashcardsReverse":
+    return "flashcards_reverse";
   case "clozeMultipleChoice":
     return "cloze_multiple_choice";
+  case "clozeMultipleChoiceReverse":
+    return "cloze_multiple_choice_reverse";
   case "clozeTyping":
     return "cloze_typing";
   case "translationTyping":
@@ -161,8 +167,20 @@ function matchingAttemptMode(value: unknown, field: string): string {
 
 function practiceReviewMode(value: unknown, field: string): string {
   const mode = studyMode(value, field);
-  if (!["flashcards", "cloze_multiple_choice", "cloze_typing", "translation_typing", "picture_choice"].includes(mode)) {
-    badRequest(`${field} must be flashcards, cloze_multiple_choice, cloze_typing, translation_typing, or picture_choice`);
+  if (
+    ![
+      "flashcards",
+      "flashcards_reverse",
+      "cloze_multiple_choice",
+      "cloze_multiple_choice_reverse",
+      "cloze_typing",
+      "translation_typing",
+      "picture_choice",
+    ].includes(mode)
+  ) {
+    badRequest(
+      `${field} must be flashcards, flashcards_reverse, cloze_multiple_choice, cloze_multiple_choice_reverse, cloze_typing, translation_typing, or picture_choice`,
+    );
   }
   return mode;
 }

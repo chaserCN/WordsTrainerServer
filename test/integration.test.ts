@@ -3444,6 +3444,8 @@ test("sync accepts iOS study mode names and stores canonical review modes", asyn
   const firstEventId = randomUUID();
   const secondEventId = randomUUID();
   const thirdEventId = randomUUID();
+  const fourthEventId = randomUUID();
+  const fifthEventId = randomUUID();
 
   const result = await syncJson(ctx, "POST", "/v1/sync/events", learner.token, {
     reviews: [
@@ -3464,9 +3466,24 @@ test("sync accepts iOS study mode names and stores canonical review modes", asyn
         mode: "translationTyping",
         outcome: "correct",
       }),
+      reviewEvent(deck, {
+        clientEventId: fourthEventId,
+        mode: "flashcardsReverse",
+        outcome: "remembered",
+      }),
+      reviewEvent(deck, {
+        clientEventId: fifthEventId,
+        cardId: deck.cardIds[1],
+        senseId: deck.senseIds[1],
+        mode: "clozeMultipleChoiceReverse",
+        outcome: "correct",
+      }),
     ],
   }, learner.userId);
-  assert.deepEqual(result.acceptedReviewIds.sort(), [firstEventId, secondEventId, thirdEventId].sort());
+  assert.deepEqual(
+    result.acceptedReviewIds.sort(),
+    [firstEventId, secondEventId, thirdEventId, fourthEventId, fifthEventId].sort(),
+  );
 
   const stored = await ctx.pool.query(
     `
@@ -3485,6 +3502,8 @@ test("sync accepts iOS study mode names and stores canonical review modes", asyn
       { id: firstEventId, mode: "cloze_multiple_choice", outcome: "correct" },
       { id: secondEventId, mode: "cloze_typing", outcome: "incorrect" },
       { id: thirdEventId, mode: "translation_typing", outcome: "correct" },
+      { id: fourthEventId, mode: "flashcards_reverse", outcome: "remembered" },
+      { id: fifthEventId, mode: "cloze_multiple_choice_reverse", outcome: "correct" },
     ].sort((left, right) => left.id.localeCompare(right.id)),
   );
 });
