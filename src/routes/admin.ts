@@ -1386,6 +1386,13 @@ export async function registerAdminRoutes(
     const data = body(request.body ?? {});
     const deckId = optionalUUID(data.deckId, "deckId");
     const dryRun = optionalBoolean(data.dryRun, "dryRun", false);
+    // dayKey scopes the reset to a single study day (same boundary the stats use:
+    // local midnight shifted back 4h). When set, we only clear the dated event
+    // logs for that day, leave FSRS scheduling and best-time records alone, and
+    // skip the study_data_resets signal — that would tell the client to wipe ALL
+    // local study data, which is wrong for a one-day delete.
+    const dayKey = data.dayKey == null ? null : requestedDayKey(data.dayKey, "Europe/Kyiv");
+    const timeZone = dayKey ? adminTimeZone(data.timeZone) : "Europe/Kyiv";
 
     const client = await pool.connect();
     try {
@@ -1393,6 +1400,46 @@ export async function registerAdminRoutes(
       await requireUser(client, userId);
       if (deckId) {
         await requireDeck(client, deckId);
+      }
+      if (dayKey) {
+        // Predicate matches the daily-activity query in this file.
+        const dayFilter = (column: string) =>
+          `to_char((${column} AT TIME ZONE $3) - interval '4 hours', 'YYYY-MM-DD') = $4`;
+        const params = [userId, deckId, timeZone, dayKey];
+        const counts = await client.query(
+          `
+          SELECT
+            (SELECT COUNT(*) FROM study_reviews WHERE user_id = $1 AND ($2::uuid IS NULL OR deck_id = $2) AND ${dayFilter("reviewed_at")}) AS review_count,
+            (SELECT COUNT(*) FROM practice_reviews WHERE user_id = $1 AND ($2::uuid IS NULL OR deck_id = $2) AND ${dayFilter("practiced_at")}) AS practice_review_count,
+            (SELECT COUNT(*) FROM matching_attempts WHERE user_id = $1 AND ($2::uuid IS NULL OR deck_id = $2) AND ${dayFilter("completed_at")}) AS matching_attempt_count
+          `,
+          params,
+        );
+        if (!dryRun) {
+          await client.query(
+            `DELETE FROM study_reviews WHERE user_id = $1 AND ($2::uuid IS NULL OR deck_id = $2) AND ${dayFilter("reviewed_at")}`,
+            params,
+          );
+          await client.query(
+            `DELETE FROM practice_reviews WHERE user_id = $1 AND ($2::uuid IS NULL OR deck_id = $2) AND ${dayFilter("practiced_at")}`,
+            params,
+          );
+          await client.query(
+            `DELETE FROM matching_attempts WHERE user_id = $1 AND ($2::uuid IS NULL OR deck_id = $2) AND ${dayFilter("completed_at")}`,
+            params,
+          );
+        }
+        await client.query("COMMIT");
+        return {
+          dryRun,
+          dayKey,
+          timeZone,
+          deleted: {
+            reviews: Number(counts.rows[0].review_count),
+            practiceReviews: Number(counts.rows[0].practice_review_count),
+            matchingAttempts: Number(counts.rows[0].matching_attempt_count),
+          },
+        };
       }
       const params = [userId, deckId];
       const counts = await client.query(
