@@ -2269,6 +2269,7 @@ export async function registerAdminRoutes(
       const displayWord = requiredString(data.displayWord, "displayWord");
       const partOfSpeech = optionalString(data.partOfSpeech, "partOfSpeech");
       const etymology = optionalString(data.etymology, "etymology");
+      const relatedWords = optionalString(data.relatedWords, "relatedWords");
       const notes = optionalString(data.notes, "notes");
       const primarySenseId = optionalUUID(data.primarySenseId, "primarySenseId");
       const audioWordMediaId = optionalUUID(data.audioWordMediaId, "audioWordMediaId");
@@ -2285,18 +2286,20 @@ export async function registerAdminRoutes(
           display_word,
           part_of_speech,
           etymology,
+          related_words,
           notes,
           primary_sense_id,
           audio_word_media_id,
           sort_order
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
         ON CONFLICT (deck_version_id, card_id) DO UPDATE SET
           status = excluded.status,
           lemma = excluded.lemma,
           display_word = excluded.display_word,
           part_of_speech = excluded.part_of_speech,
           etymology = excluded.etymology,
+          related_words = excluded.related_words,
           notes = excluded.notes,
           primary_sense_id = excluded.primary_sense_id,
           audio_word_media_id = excluded.audio_word_media_id,
@@ -2311,6 +2314,7 @@ export async function registerAdminRoutes(
           displayWord,
           partOfSpeech,
           etymology,
+          relatedWords,
           notes,
           primarySenseId,
           audioWordMediaId,
@@ -2333,6 +2337,7 @@ export async function registerAdminRoutes(
       const displayPattern = optionalString(data.displayPattern, "displayPattern");
       const translation = requiredString(data.translation, "translation");
       const note = optionalString(data.note, "note");
+      const relatedWords = optionalString(data.relatedWords, "relatedWords");
       const imageMediaId = optionalUUID(data.imageMediaId, "imageMediaId");
       const sortOrder = optionalInteger(data.sortOrder, "sortOrder", 0);
 
@@ -2348,21 +2353,34 @@ export async function registerAdminRoutes(
           display_pattern,
           translation,
           note,
+          related_words,
           image_media_id,
           sort_order
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         ON CONFLICT (deck_version_id, sense_id) DO UPDATE SET
           card_id = excluded.card_id,
           status = excluded.status,
           display_pattern = excluded.display_pattern,
           translation = excluded.translation,
           note = excluded.note,
+          related_words = excluded.related_words,
           image_media_id = excluded.image_media_id,
           sort_order = excluded.sort_order
         RETURNING *
         `,
-        [versionId, senseId, cardId, status, displayPattern, translation, note, imageMediaId, sortOrder],
+        [
+          versionId,
+          senseId,
+          cardId,
+          status,
+          displayPattern,
+          translation,
+          note,
+          relatedWords,
+          imageMediaId,
+          sortOrder,
+        ],
       );
       return { sense: result.rows[0] };
     },

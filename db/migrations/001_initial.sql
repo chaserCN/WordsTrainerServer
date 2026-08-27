@@ -163,6 +163,7 @@ CREATE TABLE deck_version_cards (
     display_word text NOT NULL,
     part_of_speech text,
     etymology text,
+    related_words text,
     notes text,
     primary_sense_id uuid,
     audio_word_media_id uuid REFERENCES media_objects(id),

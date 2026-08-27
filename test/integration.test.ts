@@ -535,6 +535,7 @@ async function createPublishedDeck(ctx: TestApp, userId: string, title = "Spanis
     displayWord: "pedir",
     partOfSpeech: "verb",
     primarySenseId: senseIds[0],
+    relatedWords: "pedir and petición share a root",
     notes: "Initial draft note",
     sortOrder: 1,
   });
@@ -544,6 +545,7 @@ async function createPublishedDeck(ctx: TestApp, userId: string, title = "Spanis
     displayWord: "pido",
     partOfSpeech: "verb",
     primarySenseId: senseIds[0],
+    relatedWords: "pedir, petición, pedido",
     notes: "Edited before publish",
     sortOrder: 1,
   });
@@ -555,6 +557,7 @@ async function createPublishedDeck(ctx: TestApp, userId: string, title = "Spanis
       status: "active",
       translation: "I order",
       note: "Pido is the form the learner will say.",
+      relatedWords: "pedido shares this sense's root",
       imageMediaId: cardImageMediaId,
       sortOrder: 1,
     },
@@ -1118,6 +1121,11 @@ test("admin/editor can create, edit, publish, and assign usable deck content", a
   assert.equal(bootstrap.assignments[0].title, "Spanish cafe basics");
   assert.equal(bootstrap.assignments[0].version_status, "published");
   assert.equal(bootstrap.content.cards.length, 2);
+  assert.equal(bootstrap.content.cards[0].related_words, "pedir, petición, pedido");
+  const senseWithRelatives = bootstrap.content.senses.find((sense: any) => sense.sense_id === deck.senseIds[0]);
+  const senseWithoutRelatives = bootstrap.content.senses.find((sense: any) => sense.sense_id === deck.senseIds[1]);
+  assert.equal(senseWithRelatives.related_words, "pedido shares this sense's root");
+  assert.equal(senseWithoutRelatives.related_words, null);
   assert.equal(bootstrap.content.examples.length, 2);
   assert.equal(bootstrap.content.sentenceQuestions.length, 2);
   assert.equal(bootstrap.content.forms.length, 2);
